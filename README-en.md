@@ -30,12 +30,13 @@
 </p>
 
 ## Description
+
 With only one domain, you can create multiple different email addresses, similar to major email platforms. This project can be deployed on Cloudflare Workers to reduce server costs and build your own email service.
+
 ## Project Showcase
 
 - [Live Demo](https://skymail.ink)<br>
 - [Deployment Guide](https://doc.skymail.ink/en/)<br>
-
 
 | ![](/doc/demo/demo1.png) | ![](/doc/demo/demo2.png) |
 |--------------------------|--------------------------|
@@ -44,69 +45,48 @@ With only one domain, you can create multiple different email addresses, similar
 ## Features
 
 - **💰 Low-Cost Usage**: No server required — deploy to Cloudflare Workers to reduce costs.
-
 - **💻 Responsive Design**: Automatically adapts to both desktop and most mobile browsers.
-
 - **📧 Email Sending**: Integrated with Resend, supporting bulk email sending and attachments.
-
 - **🛡️ Admin Features**: Admin controls for user and email management with RBAC-based access control.
-
 - **📦 Attachment Support**: Send and receive attachments, stored and downloaded via R2 object storage.
-
 - **🔔 Email Push**: Forward received emails to Telegram bots or other email providers.
-
 - **📡 Open API**: Supports batch user creation via API and multi-condition email queries
-
 - **🔢 Verification Code Recognition**: Auto-detect codes via Workers AI
-
 - **📈 Data Visualization**: Use ECharts to visualize system data, including user email growth.
-
 - **🎨 Personalization**: Customize website title, login background, and transparency.
-
 - **🤖 CAPTCHA**: Integrated with Turnstile CAPTCHA to prevent automated registration.
-
 - **📜 More Features**: Under development...
 
 ## New Features (Fork Enhancements)
 
+### This is an enhancement written by AI. I'm just a beginner, and I had AI write it based on my own ideas and the features I actually use.
+
 This fork adds the following custom features on top of the upstream:
 
 - **🔐 Attachment Signature Anti-Forgery**: Attachments are stored in a private COS/S3 bucket and served through short-lived HMAC-signed URLs (15 min by default) with Referer/Sec-Fetch validation, preventing hotlinking and forgery; Cloudflare edge caching reduces origin traffic.
-
 - **📁 Attachment Manager**: A dedicated attachment management page:
+  
   - "All / Trash" tabs
   - Auto-detected type labels (`Attachment-Image` / `Attachment-Word` / `Attachment-PDF` / `Attachment-Archive` / `Attachment-oc` etc., by extension)
   - Select and act: preview / download / locate email / delete / restore
   - Admins can filter by user and see the owner's email and role group
   - Click the filename to preview directly (mobile-friendly)
   - Responsive layout; table scrolls inside its container
-
 - **🗑️ Trash Mechanism**: Deleting moves attachments to trash (soft delete, original files untouched); the system auto-purges after 7 days; users can restore their own attachments; **only the super admin can permanently delete**.
-
 - **👥 Role Group (Security Group)**: Roles granted `all-email:query` can view all users' emails and attachments and manage (soft-delete / restore) any attachment, but **cannot permanently delete from trash** (super admin only).
-
 - **✍️ HTML Signature**: Configure an HTML signature (e.g., QQ Mail style card) in personal settings; it is auto-inserted when composing a new email.
-
 - **📏 Attachment Size Limit**: The frontend warns when an attachment exceeds 28MB (adapted to Resend's 40MB post-base64 total limit).
 
 ## Tech Stack
 
 - **Platform**: [Cloudflare Workers](https://developers.cloudflare.com/workers/)
-
 - **Web Framework**: [Hono](https://hono.dev/)
-
 - **ORM**: [Drizzle](https://orm.drizzle.team/)
-
 - **Frontend Framework**: [Vue3](https://vuejs.org/)
-
 - **UI Framework**: [Element Plus](https://element-plus.org/)
-
 - **Email Service**: [Resend](https://resend.com/)
-
 - **Cache**: [Cloudflare KV](https://developers.cloudflare.com/kv/)
-
 - **Database**: [Cloudflare D1](https://developers.cloudflare.com/d1/)
-
 - **File Storage**: [Cloudflare R2](https://developers.cloudflare.com/r2/)
 
 ## Project Structure
@@ -152,10 +132,9 @@ cloud-mail
 │   │   └── style.css			# Global styles
 │   ├── package.json			# Project dependencies
 └── └── env.release				# Environment configuration
-
 ```
 
-## Sponsor
+## Sponsor（Give him some support maillab/cloud-mail）
 
 <a href="https://doc.skymail.ink/support.html">
 <img width="170px" src="./doc/images/support.png" alt="">
