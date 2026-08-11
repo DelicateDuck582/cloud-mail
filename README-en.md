@@ -67,6 +67,28 @@ With only one domain, you can create multiple different email addresses, similar
 
 - **📜 More Features**: Under development...
 
+## New Features (Fork Enhancements)
+
+This fork adds the following custom features on top of the upstream:
+
+- **🔐 Attachment Signature Anti-Forgery**: Attachments are stored in a private COS/S3 bucket and served through short-lived HMAC-signed URLs (15 min by default) with Referer/Sec-Fetch validation, preventing hotlinking and forgery; Cloudflare edge caching reduces origin traffic.
+
+- **📁 Attachment Manager**: A dedicated attachment management page:
+  - "All / Trash" tabs
+  - Auto-detected type labels (`Attachment-Image` / `Attachment-Word` / `Attachment-PDF` / `Attachment-Archive` / `Attachment-oc` etc., by extension)
+  - Select and act: preview / download / locate email / delete / restore
+  - Admins can filter by user and see the owner's email and role group
+  - Click the filename to preview directly (mobile-friendly)
+  - Responsive layout; table scrolls inside its container
+
+- **🗑️ Trash Mechanism**: Deleting moves attachments to trash (soft delete, original files untouched); the system auto-purges after 7 days; users can restore their own attachments; **only the super admin can permanently delete**.
+
+- **👥 Role Group (Security Group)**: Roles granted `all-email:query` can view all users' emails and attachments and manage (soft-delete / restore) any attachment, but **cannot permanently delete from trash** (super admin only).
+
+- **✍️ HTML Signature**: Configure an HTML signature (e.g., QQ Mail style card) in personal settings; it is auto-inserted when composing a new email.
+
+- **📏 Attachment Size Limit**: The frontend warns when an attachment exceeds 28MB (adapted to Resend's 40MB post-base64 total limit).
+
 ## Tech Stack
 
 - **Platform**: [Cloudflare Workers](https://developers.cloudflare.com/workers/)

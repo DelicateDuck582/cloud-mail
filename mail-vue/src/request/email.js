@@ -24,3 +24,7 @@ export function emailSend(form,progress) {
         noMsg: true
     })
 }
+
+export function emailDetail(emailId) {
+    return http.get('/email/detail', {params: {emailId}, noMsg: true})
+}

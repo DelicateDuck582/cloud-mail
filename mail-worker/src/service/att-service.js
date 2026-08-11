@@ -1,8 +1,9 @@
 import orm from '../entity/orm';
 import { att } from '../entity/att';
-import { and, eq, isNull, inArray, desc, or, count, sql } from 'drizzle-orm';
+import { and, eq, isNull, inArray, desc, or, count, sql, lt } from 'drizzle-orm';
 import user from '../entity/user';
 import email from '../entity/email';
+import role from '../entity/role';
 import r2Service from './r2-service';
 import constant from '../const/constant';
 import fileUtils from '../utils/file-utils';
@@ -12,6 +13,9 @@ import { v4 as uuidv4 } from 'uuid';
 import domainUtils from '../utils/domain-uitls';
 import settingService from "./setting-service";
 import signUtils from '../utils/sign-utils';
+import BizError from '../error/biz-error';
+import { t } from '../i18n/i18n';
+import dayjs from 'dayjs';
 
 const attService = {
 
@@ -282,9 +286,11 @@ const attService = {
 	// 附件管理列表：管理员可看全部/按用户筛选，普通用户只能看自己的
 	async manageList(c, params, currentUserId, isAdmin) {
 
-		const { userId: filterUserId, emailId, keyword, size = 20, num = 1 } = params;
+		const { userId: filterUserId, emailId, keyword, size = 20, num = 1, trash = 0 } = params;
 
-		const conditions = [];
+		const conditions = [
+			eq(att.trash, Number(trash) === 1 ? 1 : 0)
+		];
 
 		// 非管理员只能看自己的附件
 		if (!isAdmin) {
@@ -308,7 +314,7 @@ const attService = {
 
 		const pageSize = Math.min(Number(size) || 20, 50);
 		const pageNum = Math.max(Number(num) || 1, 1);
-		const where = conditions.length > 0 ? and(...conditions) : undefined;
+		const where = and(...conditions);
 
 		const list = await orm(c).select({
 			attId: att.attId,
@@ -322,11 +328,15 @@ const attService = {
 			type: att.type,
 			disposition: att.disposition,
 			createTime: att.createTime,
+			trash: att.trash,
+			trashTime: att.trashTime,
 			userEmail: user.email,
+			userRole: role.name,
 			subject: email.subject,
 			sendEmail: email.sendEmail
 		}).from(att)
 			.leftJoin(user, eq(user.userId, att.userId))
+			.leftJoin(role, eq(role.roleId, user.type))
 			.leftJoin(email, eq(email.emailId, att.emailId))
 			.where(where)
 			.orderBy(desc(att.attId))
@@ -336,17 +346,26 @@ const attService = {
 
 		const totalRow = await orm(c).select({ total: count() }).from(att)
 			.leftJoin(user, eq(user.userId, att.userId))
+			.leftJoin(role, eq(role.roleId, user.type))
 			.leftJoin(email, eq(email.emailId, att.emailId))
 			.where(where)
 			.get();
 
 		const { r2Domain } = await settingService.query(c);
+
+		// admin 用户的权限组显示为"超级管理员"（其角色记录在 DB 里仍是普通角色）
+		list.forEach(row => {
+			if (row.userEmail && row.userEmail === c.env.admin) {
+				row.userRole = '超级管理员';
+			}
+		});
+
 		await signUtils.addAttUrl(c, list, r2Domain);
 
 		return { list, total: totalRow.total };
 	},
 
-	// 删除附件：管理员可删任意，普通用户只能删自己的
+	// 删除附件（软删除）：移入垃圾桶，不删数据库记录、不删 COS 文件
 	async manageDelete(c, params, currentUserId, isAdmin) {
 
 		const { attIds } = params;
@@ -355,19 +374,45 @@ const attService = {
 			return;
 		}
 
-		// 查出要删的记录
 		const rows = await orm(c).select().from(att).where(inArray(att.attId, idList)).all();
 
-		// 权限过滤：非管理员只能删自己的
+		// 权限：管理员可删任意，普通用户只能删自己的
 		const allowed = isAdmin ? rows : rows.filter(r => r.userId === currentUserId);
 		if (allowed.length === 0) {
 			return;
 		}
 
 		const ids = allowed.map(r => r.attId);
-		const keys = [...new Set(allowed.map(r => r.key).filter(Boolean))];
+		const now = dayjs().format('YYYY-MM-DD HH:mm:ss');
 
-		// 删除 COS 文件：只有引用计数归零的 key 才真正删除文件
+		await orm(c).update(att).set({ trash: 1, trashTime: now }).where(inArray(att.attId, ids)).run();
+	},
+
+	// 彻底删除垃圾桶附件（仅超级管理员）：删 DB 记录 + 删 COS 文件
+	async manageTrashDelete(c, params, currentUserId, isAdmin) {
+
+		if (!isAdmin) {
+			throw new BizError(t('unauthorized'), 403);
+		}
+
+		const { attIds } = params;
+		const idList = String(attIds || '').split(',').map(Number).filter(Boolean);
+		if (idList.length === 0) {
+			return;
+		}
+
+		const rows = await orm(c).select().from(att)
+			.where(and(inArray(att.attId, idList), eq(att.trash, 1)))
+			.all();
+
+		if (rows.length === 0) {
+			return;
+		}
+
+		const ids = rows.map(r => r.attId);
+		const keys = [...new Set(rows.map(r => r.key).filter(Boolean))];
+
+		// 删 COS 文件：只有引用计数归零的 key 才真正删除文件
 		if (keys.length > 0) {
 			const refRows = await orm(c).select({ key: att.key, cnt: count(att.attId) }).from(att)
 				.where(inArray(att.key, keys))
@@ -379,9 +424,8 @@ const attService = {
 
 			const delKeys = [];
 			for (const k of keys) {
-				const refCnt = refMap[k] || 0;
-				const delCnt = allowed.filter(r => r.key === k).length;
-				if (refCnt <= delCnt) {
+				const delCnt = rows.filter(r => r.key === k).length;
+				if ((refMap[k] || 0) <= delCnt) {
 					delKeys.push(k);
 				}
 			}
@@ -392,6 +436,70 @@ const attService = {
 		}
 
 		await orm(c).delete(att).where(inArray(att.attId, ids)).run();
+	},
+
+	// 定时清理：垃圾桶中超过 7 天的附件彻底删除
+	async clearTrash(c) {
+
+		const sevenDaysAgo = dayjs().subtract(7, 'day').format('YYYY-MM-DD HH:mm:ss');
+
+		const rows = await orm(c).select().from(att)
+			.where(and(eq(att.trash, 1), lt(att.trashTime, sevenDaysAgo)))
+			.all();
+
+		if (rows.length === 0) {
+			return;
+		}
+
+		const ids = rows.map(r => r.attId);
+		const keys = [...new Set(rows.map(r => r.key).filter(Boolean))];
+
+		if (keys.length > 0) {
+			const refRows = await orm(c).select({ key: att.key, cnt: count(att.attId) }).from(att)
+				.where(inArray(att.key, keys))
+				.groupBy(att.key)
+				.all();
+
+			const refMap = {};
+			refRows.forEach(r => { refMap[r.key] = r.cnt; });
+
+			const delKeys = [];
+			for (const k of keys) {
+				const delCnt = rows.filter(r => r.key === k).length;
+				if ((refMap[k] || 0) <= delCnt) {
+					delKeys.push(k);
+				}
+			}
+
+			if (delKeys.length > 0) {
+				await this.batchDelete(c, delKeys);
+			}
+		}
+
+		await orm(c).delete(att).where(inArray(att.attId, ids)).run();
+	},
+
+	// 恢复垃圾桶附件：普通用户只能恢复自己的，管理员可恢复任意用户的
+	async manageRestore(c, params, currentUserId, isAdmin) {
+
+		const { attIds } = params;
+		const idList = Array.isArray(attIds) ? attIds : String(attIds || '').split(',').map(Number);
+		const validIds = idList.map(Number).filter(Boolean);
+		if (validIds.length === 0) {
+			return;
+		}
+
+		const rows = await orm(c).select().from(att)
+			.where(and(inArray(att.attId, validIds), eq(att.trash, 1)))
+			.all();
+
+		const allowed = isAdmin ? rows : rows.filter(r => r.userId === currentUserId);
+		if (allowed.length === 0) {
+			return;
+		}
+
+		const ids = allowed.map(r => r.attId);
+		await orm(c).update(att).set({ trash: 0, trashTime: null }).where(inArray(att.attId, ids)).run();
 	}
 };
 

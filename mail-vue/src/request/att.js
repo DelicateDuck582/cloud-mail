@@ -7,3 +7,11 @@ export function attList(params) {
 export function attDelete(attIds) {
     return http.delete('/att/delete', {params: {attIds: attIds.join(',')}})
 }
+
+export function attTrashDelete(attIds) {
+    return http.delete('/att/trash', {params: {attIds: attIds.join(',')}})
+}
+
+export function attRestore(attIds) {
+    return http.post('/att/restore', {attIds})
+}

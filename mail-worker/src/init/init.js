@@ -31,8 +31,20 @@ const dbInit = {
 		await this.v3_0DB(c);
 		await this.v3_1DB(c);
 		await this.v3_2DB(c);
+		await this.v3_3DB(c);
 		await settingService.refresh(c);
 		return c.text('success');
+	},
+
+	async v3_3DB(c) {
+		try {
+			await c.env.db.batch([
+				c.env.db.prepare(`ALTER TABLE attachments ADD COLUMN trash INTEGER NOT NULL DEFAULT 0;`),
+				c.env.db.prepare(`ALTER TABLE attachments ADD COLUMN trash_time TEXT;`)
+			]);
+		} catch (e) {
+			console.warn(`跳过字段：${e.message}`);
+		}
 	},
 
 	async v3_2DB(c) {
