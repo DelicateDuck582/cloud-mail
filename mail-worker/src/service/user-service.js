@@ -39,6 +39,7 @@ const userService = {
 		user.userId = userRow.userId;
 		user.sendCount = userRow.sendCount;
 		user.email = userRow.email;
+		user.htmlSignature = userRow.htmlSignature || '';
 		user.account = account;
 		user.name = account.name;
 		user.permKeys = permKeys;
@@ -251,6 +252,15 @@ const userService = {
 		const { password, userId } = params;
 		await this.resetPassword(c, { password }, userId);
 		await c.env.kv.delete(KvConst.AUTH_INFO + userId);
+	},
+
+	// 保存当前用户的自定义 HTML 签名
+	async setHtmlSignature(c, htmlSignature, userId) {
+		await orm(c)
+			.update(user)
+			.set({ htmlSignature: String(htmlSignature || '') })
+			.where(eq(user.userId, userId))
+			.run();
 	},
 
 	async setStatus(c, params) {

@@ -9,6 +9,7 @@ import { parseHTML } from 'linkedom';
 import { v4 as uuidv4 } from 'uuid';
 import domainUtils from '../utils/domain-uitls';
 import settingService from "./setting-service";
+import signUtils from '../utils/sign-utils';
 
 const attService = {
 
@@ -34,10 +35,10 @@ const attService = {
 		await orm(c).insert(att).values(attachments).run();
 	},
 
-	list(c, params, userId) {
+	async list(c, params, userId) {
 		const { emailId } = params;
 
-		return orm(c).select().from(att).where(
+		const attList = await orm(c).select().from(att).where(
 			and(
 				eq(att.emailId, emailId),
 				eq(att.userId, userId),
@@ -45,6 +46,11 @@ const attService = {
 				isNull(att.contentId)
 			)
 		).all();
+
+		const { r2Domain } = await settingService.query(c);
+		await signUtils.addAttUrl(c, attList, r2Domain);
+
+		return attList;
 	},
 
 	async toImageUrlHtml(c, content) {
@@ -81,20 +87,22 @@ const attService = {
 				imageDataList.push(attData);
 			}
 
-			//邮件正文站内图片转cid附件
-			if (src && (src.startsWith(domainUtils.toOssDomain(r2Domain)) || src.startsWith('attachments/'))) {
+			//邮件正文站内图片转cid附件（去掉签名参数，防止 key 被 ?expires=&sign= 污染）
+			const cleanSrc = (src || '').split('?')[0];
+
+			if (cleanSrc && (cleanSrc.startsWith(domainUtils.toOssDomain(r2Domain)) || cleanSrc.startsWith('attachments/'))) {
 
 				const cid = uuidv4().replace(/-/g, '')
 				img.setAttribute('src', 'cid:' + cid);
 
 				const attData = {};
 
-				if (src.startsWith(domainUtils.toOssDomain(r2Domain))) {
-					attData.key = src.replace(domainUtils.toOssDomain(r2Domain) + '/','');
+				if (cleanSrc.startsWith(domainUtils.toOssDomain(r2Domain))) {
+					attData.key = cleanSrc.replace(domainUtils.toOssDomain(r2Domain) + '/','');
 				}
 
-				if (src.startsWith('attachments/')) {
-					attData.key = src;
+				if (cleanSrc.startsWith('attachments/')) {
+					attData.key = cleanSrc;
 				}
 
 				attData.contentId = cid;

@@ -22,6 +22,7 @@ import domainUtils from '../utils/domain-uitls';
 import account from "../entity/account";
 import { att } from '../entity/att';
 import telegramService from './telegram-service';
+import signUtils from '../utils/sign-utils';
 
 const emailService = {
 
@@ -122,6 +123,7 @@ const emailService = {
 
 
 		await this.emailAddAtt(c, list);
+		await this.signEmailList(c, list);
 
 		if (!latestEmail) {
 			latestEmail = {
@@ -360,6 +362,9 @@ const emailService = {
 		if (allInternal) {
 			await this.HandleOnSiteEmail(c, receiveEmail, emailResult, attList);
 		}
+
+		//返回前端前给附件列表和正文图片追加短期签名（不影响库内数据）
+		await this.signEmailList(c, [emailResult]);
 
 		const dateStr = dayjs().format('YYYY-MM-DD');
 		let daySendTotal = await c.env.kv.get(kvConst.SEND_DAY_COUNT + dateStr);
@@ -680,8 +685,11 @@ const emailService = {
 
 			r2domain = domainUtils.toOssDomain(r2domain)
 
-			if (src && src.startsWith(r2domain + '/')) {
-				img.setAttribute('src', src.replace(r2domain + '/', '{{domain}}'));
+			//去掉签名参数（?expires=&sign=），防止把过期签名写回库内正文
+			const cleanSrc = (src || '').split('?')[0];
+
+			if (cleanSrc && cleanSrc.startsWith(r2domain + '/')) {
+				img.setAttribute('src', cleanSrc.replace(r2domain + '/', '{{domain}}'));
 			}
 
 		}
@@ -727,6 +735,7 @@ const emailService = {
 			.limit(20);
 
 		await this.emailAddAtt(c, list);
+		await this.signEmailList(c, list);
 
 		return list;
 	},
@@ -878,6 +887,8 @@ const emailService = {
 			}
 		}
 
+		await this.signEmailList(c, list);
+
 		return { list: list, total: totalRow.total, latestEmail };
 	},
 
@@ -897,6 +908,7 @@ const emailService = {
 			.limit(20);
 
 		await this.emailAddAtt(c, list);
+		await this.signEmailList(c, list);
 
 		return list;
 	},
@@ -914,6 +926,28 @@ const emailService = {
 				emailRow.attList = atts;
 			});
 		}
+	},
+
+	//读邮件时给正文内嵌图片和附件列表统一追加短期签名
+	async signEmailList(c, list) {
+
+		if (!list || list.length === 0) {
+			return;
+		}
+
+		const { r2Domain } = await settingService.query(c);
+
+		await Promise.all(list.map(async emailRow => {
+
+			if (emailRow.content) {
+				emailRow.content = await signUtils.signContent(c, emailRow.content, r2Domain);
+			}
+
+			if (emailRow.attList && emailRow.attList.length > 0) {
+				await signUtils.addAttUrl(c, emailRow.attList, r2Domain);
+			}
+
+		}));
 	},
 
 	async restoreByUserId(c, userId) {

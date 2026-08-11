@@ -134,6 +134,8 @@ const show = ref(false);
 const percent = ref(0)
 let percentMessage = null
 let sending = false
+// 附件发送上限：Resend 整封邮件 40MB（base64 后）的稳妥原始文件上限
+const MAX_ATT_SIZE = 28 * 1024 * 1024 // 28MB
 const defValue = ref('')
 const contactsTabRef = ref({})
 const showContacts = ref(false)
@@ -280,6 +282,16 @@ function chooseFile() {
       const filename = file.name
       const contentType = file.type
 
+      // 附件超过 28MB（Resend 40MB base64 后的稳妥上限）无法发送，直接提示并跳过
+      if (size > MAX_ATT_SIZE) {
+        ElMessage({
+          message: t('attTooLargeMsg', { name: filename, size: '28MB' }),
+          type: 'warning',
+          plain: true,
+        })
+        continue
+      }
+
       const content = await fileToBase64(file)
       form.attachments.push({content, filename, size, contentType})
 
@@ -289,6 +301,17 @@ function chooseFile() {
 }
 
 async function sendEmail() {
+
+  // 兜底检查：防止草稿恢复等绕过选择时的校验（单个附件超 28MB 直接拦截）
+  const overSizedAtt = form.attachments.find(att => att.size > MAX_ATT_SIZE)
+  if (overSizedAtt) {
+    ElMessage({
+      message: t('attTooLargeMsg', { name: overSizedAtt.filename, size: '28MB' }),
+      type: 'warning',
+      plain: true,
+    })
+    return
+  }
 
   if (form.receiveEmail.length === 0) {
     ElMessage({
@@ -516,6 +539,17 @@ function open() {
     form.accountId = accountStore.currentAccount.accountId;
     form.name = accountStore.currentAccount.name;
   }
+
+  // 新建邮件（非回复/转发/草稿）时自动插入个人设置里的 HTML 签名
+  if (!form.sendType) {
+    defValue.value = ''
+    if (userStore.user.htmlSignature) {
+      setTimeout(() => {
+        defValue.value = userStore.user.htmlSignature
+      })
+    }
+  }
+
   show.value = true;
   editor.value.focus()
 }

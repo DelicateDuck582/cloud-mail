@@ -73,6 +73,8 @@ const starService = {
 			emailRow.attList = atts;
 		});
 
+		await emailService.signEmailList(c, list);
+
 		return { list };
 	},
 	async removeByEmailIds(c, emailIds) {

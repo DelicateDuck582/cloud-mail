@@ -42,6 +42,24 @@
         <el-option label="English" value="en" @pointerdown.prevent.stop="changeLang('en')"/>
       </el-select>
     </div>
+    <div class="signature">
+      <div class="title">{{$t('htmlSignature')}}</div>
+      <div class="signature-box">
+        <el-input
+            type="textarea"
+            v-model="htmlSignature"
+            :rows="6"
+            :placeholder="$t('htmlSignaturePlaceholder')"
+        />
+        <div class="signature-actions">
+          <el-button size="small" type="primary" @click="previewSignature">{{$t('signaturePreview')}}</el-button>
+          <el-button size="small" @click="saveSignature">{{$t('save')}}</el-button>
+          <el-button size="small" @click="clearSignature">{{$t('clearSignature')}}</el-button>
+        </div>
+        <div class="signature-desc">{{$t('htmlSignatureDesc')}}</div>
+        <div v-if="previewShow" class="signature-preview" v-html="htmlSignature"></div>
+      </div>
+    </div>
     <div class="del-email" v-perm="'my:delete'">
       <div class="title">{{$t('deleteUser')}}</div>
       <div style="color: var(--regular-text-color);">
@@ -62,7 +80,7 @@
 </template>
 <script setup>
 import {reactive, ref, defineOptions} from 'vue'
-import {resetPassword, userDelete} from "@/request/my.js";
+import {resetPassword, userDelete, setHtmlSignature} from "@/request/my.js";
 import {useUserStore} from "@/store/user.js";
 import router from "@/router/index.js";
 import {accountSetName} from "@/request/account.js";
@@ -78,6 +96,8 @@ const setPwdLoading = ref(false)
 const setNameShow = ref(false)
 const accountName = ref(null)
 const langSelect = ref(settingStore.lang)
+const htmlSignature = ref(userStore.user.htmlSignature || '')
+const previewShow = ref(false)
 
 defineOptions({
   name: 'setting'
@@ -131,6 +151,35 @@ function changeLang(lang) {
   }
   localStorage.setItem('setting', JSON.stringify({...setting, lang}))
   window.location.reload()
+}
+
+function previewSignature() {
+  previewShow.value = !previewShow.value
+}
+
+function saveSignature() {
+  setHtmlSignature(htmlSignature.value).then(() => {
+    userStore.user.htmlSignature = htmlSignature.value
+    previewShow.value = false
+    ElMessage({
+      message: t('saveSuccessMsg'),
+      type: 'success',
+      plain: true,
+    })
+  })
+}
+
+function clearSignature() {
+  htmlSignature.value = ''
+  setHtmlSignature('').then(() => {
+    userStore.user.htmlSignature = ''
+    previewShow.value = false
+    ElMessage({
+      message: t('saveSuccessMsg'),
+      type: 'success',
+      plain: true,
+    })
+  })
 }
 
 const pwdShow = ref(false)
@@ -283,6 +332,40 @@ function submitPwd() {
 
     .language-select {
       width: 100px;
+    }
+  }
+
+  .signature {
+    font-size: 14px;
+    display: flex;
+    flex-direction: column;
+    gap: 20px;
+    margin-bottom: 40px;
+
+    .signature-box {
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+      max-width: 560px;
+
+      .signature-actions {
+        display: flex;
+        gap: 10px;
+      }
+
+      .signature-desc {
+        color: var(--regular-text-color);
+        font-size: 12px;
+        line-height: 1.6;
+      }
+
+      .signature-preview {
+        border: 1px solid var(--el-border-color);
+        border-radius: 6px;
+        padding: 12px;
+        overflow-x: auto;
+        background: var(--el-bg-color);
+      }
     }
   }
 

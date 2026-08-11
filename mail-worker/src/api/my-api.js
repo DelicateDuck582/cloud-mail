@@ -13,6 +13,12 @@ app.put('/my/resetPassword', async (c) => {
 	return c.json(result.ok());
 });
 
+app.put('/my/htmlSignature', async (c) => {
+	const { htmlSignature } = await c.req.json();
+	await userService.setHtmlSignature(c, htmlSignature, userContext.getUserId(c));
+	return c.json(result.ok());
+});
+
 app.delete('/my/delete', async (c) => {
 	await userService.delete(c, userContext.getUserId(c));
 	return c.json(result.ok());

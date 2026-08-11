@@ -8,6 +8,10 @@ export function resetPassword(password) {
     return http.put('/my/resetPassword', {password})
 }
 
+export function setHtmlSignature(htmlSignature) {
+    return http.put('/my/htmlSignature', {htmlSignature})
+}
+
 export function userDelete() {
     return http.delete('/my/delete')
 }
