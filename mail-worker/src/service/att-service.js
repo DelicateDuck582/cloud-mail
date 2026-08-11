@@ -1,6 +1,8 @@
 import orm from '../entity/orm';
 import { att } from '../entity/att';
-import { and, eq, isNull, inArray, desc } from 'drizzle-orm';
+import { and, eq, isNull, inArray, desc, or, count, sql } from 'drizzle-orm';
+import user from '../entity/user';
+import email from '../entity/email';
 import r2Service from './r2-service';
 import constant from '../const/constant';
 import fileUtils from '../utils/file-utils';
@@ -275,6 +277,121 @@ const attService = {
 			return []
 		}
 		return orm(c).select().from(att).where(inArray(att.key, keys)).orderBy(desc(att.attId)).groupBy(att.key).all();
+	},
+
+	// 附件管理列表：管理员可看全部/按用户筛选，普通用户只能看自己的
+	async manageList(c, params, currentUserId, isAdmin) {
+
+		const { userId: filterUserId, emailId, keyword, size = 20, num = 1 } = params;
+
+		const conditions = [];
+
+		// 非管理员只能看自己的附件
+		if (!isAdmin) {
+			conditions.push(eq(att.userId, currentUserId));
+		} else if (filterUserId) {
+			conditions.push(eq(att.userId, Number(filterUserId)));
+		}
+
+		if (emailId) {
+			conditions.push(eq(att.emailId, Number(emailId)));
+		}
+
+		// 关键字：文件名 / 用户邮箱 / 邮件主题
+		if (keyword) {
+			conditions.push(or(
+				sql`${att.filename} LIKE ${'%' + keyword + '%'}`,
+				sql`${user.email} LIKE ${'%' + keyword + '%'}`,
+				sql`${email.subject} LIKE ${'%' + keyword + '%'}`
+			));
+		}
+
+		const pageSize = Math.min(Number(size) || 20, 50);
+		const pageNum = Math.max(Number(num) || 1, 1);
+		const where = conditions.length > 0 ? and(...conditions) : undefined;
+
+		const list = await orm(c).select({
+			attId: att.attId,
+			userId: att.userId,
+			emailId: att.emailId,
+			accountId: att.accountId,
+			key: att.key,
+			filename: att.filename,
+			mimeType: att.mimeType,
+			size: att.size,
+			type: att.type,
+			disposition: att.disposition,
+			createTime: att.createTime,
+			userEmail: user.email,
+			subject: email.subject,
+			sendEmail: email.sendEmail
+		}).from(att)
+			.leftJoin(user, eq(user.userId, att.userId))
+			.leftJoin(email, eq(email.emailId, att.emailId))
+			.where(where)
+			.orderBy(desc(att.attId))
+			.limit(pageSize)
+			.offset((pageNum - 1) * pageSize)
+			.all();
+
+		const totalRow = await orm(c).select({ total: count() }).from(att)
+			.leftJoin(user, eq(user.userId, att.userId))
+			.leftJoin(email, eq(email.emailId, att.emailId))
+			.where(where)
+			.get();
+
+		const { r2Domain } = await settingService.query(c);
+		await signUtils.addAttUrl(c, list, r2Domain);
+
+		return { list, total: totalRow.total };
+	},
+
+	// 删除附件：管理员可删任意，普通用户只能删自己的
+	async manageDelete(c, params, currentUserId, isAdmin) {
+
+		const { attIds } = params;
+		const idList = String(attIds || '').split(',').map(Number).filter(Boolean);
+		if (idList.length === 0) {
+			return;
+		}
+
+		// 查出要删的记录
+		const rows = await orm(c).select().from(att).where(inArray(att.attId, idList)).all();
+
+		// 权限过滤：非管理员只能删自己的
+		const allowed = isAdmin ? rows : rows.filter(r => r.userId === currentUserId);
+		if (allowed.length === 0) {
+			return;
+		}
+
+		const ids = allowed.map(r => r.attId);
+		const keys = [...new Set(allowed.map(r => r.key).filter(Boolean))];
+
+		// 删除 COS 文件：只有引用计数归零的 key 才真正删除文件
+		if (keys.length > 0) {
+			const refRows = await orm(c).select({ key: att.key, cnt: count(att.attId) }).from(att)
+				.where(inArray(att.key, keys))
+				.groupBy(att.key)
+				.all();
+
+			const refMap = {};
+			refRows.forEach(r => { refMap[r.key] = r.cnt; });
+
+			const delKeys = [];
+			for (const k of keys) {
+				const refCnt = refMap[k] || 0;
+				const delCnt = allowed.filter(r => r.key === k).length;
+				if (refCnt <= delCnt) {
+					delKeys.push(k);
+				}
+			}
+
+			if (delKeys.length > 0) {
+				await this.batchDelete(c, delKeys);
+			}
+		}
+
+		await orm(c).delete(att).where(inArray(att.attId, ids)).run();
 	}
 };
 

@@ -109,6 +109,16 @@ const routers = {
             menu: true
         }
     }],
+    'att:query': [{
+        path: '/att-manage',
+        name: 'att',
+        component: () => import('@/views/att/index.vue'),
+        meta: {
+            title: 'attManage',
+            name: 'att',
+            menu: true
+        }
+    }],
     'analysis:query': [{
         path: '/analysis',
         name: 'analysis',

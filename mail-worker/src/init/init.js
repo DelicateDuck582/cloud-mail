@@ -30,8 +30,22 @@ const dbInit = {
 		await this.v2_9DB(c);
 		await this.v3_0DB(c);
 		await this.v3_1DB(c);
+		await this.v3_2DB(c);
 		await settingService.refresh(c);
 		return c.text('success');
+	},
+
+	async v3_2DB(c) {
+		try {
+			await c.env.db.prepare(`
+				INSERT OR IGNORE INTO perm (perm_id, name, perm_key, pid, type, sort) VALUES
+				(37, '附件管理', '', 0, 1, 6),
+				(38, '附件查看', 'att:query', 37, 2, 0),
+				(39, '附件删除', 'att:delete', 37, 2, 1)
+			`).run();
+		} catch (e) {
+			console.warn(`跳过字段：${e.message}`);
+		}
 	},
 
 	async v3_1DB(c) {
