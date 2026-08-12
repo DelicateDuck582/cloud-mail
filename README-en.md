@@ -63,7 +63,7 @@ With only one domain, you can create multiple different email addresses, similar
 
 This fork adds the following custom features on top of the upstream:
 
-- **🔐 Attachment Signature Anti-Forgery**: Attachments are stored in a private COS/S3 bucket and served through short-lived HMAC-signed URLs (15 min by default) with Referer/Sec-Fetch validation, preventing hotlinking and forgery; Cloudflare edge caching reduces origin traffic.
+- **🔐 Attachment Signature Anti-Forgery**: Attachments are stored in a private COS/S3 bucket and served through short-lived HMAC-signed URLs (15 min by default) with Referer/Sec-Fetch validation, preventing hotlinking and forgery. The cos-exchange proxy Worker verifies signatures and caches by file path via the Workers Cache API (attachment keys are content hashes, so an unchanged file never needs re-fetching — each file is fetched from COS only once globally).
 - **📁 Attachment Manager**: A dedicated attachment management page:
   
   - "All / Trash" tabs
