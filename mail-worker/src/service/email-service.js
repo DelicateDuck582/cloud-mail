@@ -78,6 +78,7 @@ const emailService = {
 					timeSort ? gt(email.emailId, emailId) : lt(email.emailId, emailId),
 					eq(email.type, type),
 					eq(email.isDel, isDel.NORMAL),
+					eq(email.trash, 0),
 					eq(account.isDel, isDel.NORMAL)
 				)
 			);
@@ -101,6 +102,7 @@ const emailService = {
 					eq(email.userId, userId),
 					eq(email.type, type),
 					eq(email.isDel, isDel.NORMAL),
+					eq(email.trash, 0),
 					eq(account.isDel, isDel.NORMAL)
 				)
 		).get();
@@ -110,7 +112,8 @@ const emailService = {
 				allReceive ? eq(1,1) : eq(email.accountId, accountId),
 				eq(email.userId, userId),
 				eq(email.type, type),
-				eq(email.isDel, isDel.NORMAL)
+				eq(email.isDel, isDel.NORMAL),
+				eq(email.trash, 0)
 			))
 			.orderBy(desc(email.emailId)).limit(1).get();
 
@@ -138,12 +141,40 @@ const emailService = {
 
 	async delete(c, params, userId) {
 		const { emailIds } = params;
+		if (!emailIds) {
+			return;
+		}
 		const emailIdList = emailIds.split(',').map(Number);
-		await orm(c).update(email).set({ isDel: isDel.DELETE }).where(
+		const now = dayjs().format('YYYY-MM-DD HH:mm:ss');
+
+		// 邮件软删除：进垃圾桶（trash=1，记录删除时间），与附件垃圾桶机制一致（7 天后自动清理）
+		await orm(c).update(email).set({ trash: 1, trashTime: now }).where(
 			and(
 				eq(email.userId, userId),
 				inArray(email.emailId, emailIdList)))
 			.run();
+
+		// 连带将关联附件也移入垃圾桶（仅限本人附件）
+		await orm(c).update(att).set({ trash: 1, trashTime: now })
+			.where(and(inArray(att.emailId, emailIdList), eq(att.trash, 0), eq(att.userId, userId))).run();
+	},
+
+	// 恢复垃圾桶邮件：邮件恢复 + 连带恢复关联附件（删除时间机制与附件一致）
+	async restore(c, params, userId) {
+		const { emailIds } = params;
+		if (!emailIds) {
+			return;
+		}
+		const emailIdList = emailIds.split(',').map(Number);
+
+		await orm(c).update(email).set({ trash: 0, trashTime: null }).where(
+			and(
+				eq(email.userId, userId),
+				inArray(email.emailId, emailIdList)))
+			.run();
+
+		await orm(c).update(att).set({ trash: 0, trashTime: null })
+			.where(and(inArray(att.emailId, emailIdList), eq(att.trash, 1), eq(att.userId, userId))).run();
 	},
 
 	receive(c, params, cidAttList, r2domain) {
@@ -727,6 +758,7 @@ const emailService = {
 					gt(email.emailId, emailId),
 					eq(email.userId, userId),
 					eq(email.isDel, isDel.NORMAL),
+					eq(email.trash, 0),
 					eq(account.isDel, isDel.NORMAL),
 					allReceive ? eq(1,1) : eq(email.accountId, accountId),
 					eq(email.type, emailConst.type.RECEIVE)
@@ -841,6 +873,7 @@ const emailService = {
 		}
 
 		conditions.push(ne(email.status, emailConst.status.SAVING));
+		conditions.push(eq(email.trash, 0));
 
 		const countConditions = [...conditions];
 

@@ -45,6 +45,12 @@ app.delete('/email/delete', async (c) => {
 	return c.json(result.ok());
 });
 
+// 恢复垃圾桶邮件：恢复邮件 + 连带恢复关联附件
+app.post('/email/restore', async (c) => {
+	await emailService.restore(c, await c.req.json(), userContext.getUserId(c));
+	return c.json(result.ok());
+});
+
 app.get('/email/attList', async (c) => {
 	const attList = await attService.list(c, c.req.query(), userContext.getUserId(c));
 	return c.json(result.ok(attList));

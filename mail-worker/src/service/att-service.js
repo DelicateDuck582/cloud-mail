@@ -5,9 +5,9 @@ import user from '../entity/user';
 import email from '../entity/email';
 import role from '../entity/role';
 import r2Service from './r2-service';
+import s3Service from './s3-service';
 import constant from '../const/constant';
 import fileUtils from '../utils/file-utils';
-import { attConst } from '../const/entity-const';
 import { parseHTML } from 'linkedom';
 import { v4 as uuidv4 } from 'uuid';
 import domainUtils from '../utils/domain-uitls';
@@ -16,6 +16,7 @@ import signUtils from '../utils/sign-utils';
 import BizError from '../error/biz-error';
 import { t } from '../i18n/i18n';
 import dayjs from 'dayjs';
+import { attConst, isDel } from '../const/entity-const';
 
 const attService = {
 
@@ -221,7 +222,8 @@ const attService = {
 		return orm(c).select().from(att).where(
 			and(
 				inArray(att.emailId, emailIds),
-				eq(att.type, attConst.type.ATT)
+				eq(att.type, attConst.type.ATT),
+				eq(att.trash, 0)
 			))
 			.all();
 	},
@@ -365,7 +367,7 @@ const attService = {
 		return { list, total: totalRow.total };
 	},
 
-	// 删除附件（软删除）：移入垃圾桶，不删数据库记录、不删 COS 文件
+	// 删除附件（软删除）：移入垃圾桶，并连带软删原邮件（垃圾桶期间邮件不可看）
 	async manageDelete(c, params, currentUserId, isAdmin) {
 
 		const { attIds } = params;
@@ -379,6 +381,10 @@ const attService = {
 		// 权限：管理员可删任意，普通用户只能删自己的
 		const allowed = isAdmin ? rows : rows.filter(r => r.userId === currentUserId);
 		if (allowed.length === 0) {
+			// 请求了附件但没有权限：拒绝而非静默成功
+			if (rows.length > 0) {
+				throw new BizError(t('unauthorized'), 403);
+			}
 			return;
 		}
 
@@ -386,6 +392,13 @@ const attService = {
 		const now = dayjs().format('YYYY-MM-DD HH:mm:ss');
 
 		await orm(c).update(att).set({ trash: 1, trashTime: now }).where(inArray(att.attId, ids)).run();
+
+		// 连带软删原邮件 + 该邮件的全部附件（保持邮件与附件状态一致，避免垃圾桶期间/7天清理后产生孤儿附件）
+		const emailIds = [...new Set(allowed.map(r => r.emailId).filter(Boolean))];
+		if (emailIds.length > 0) {
+			await orm(c).update(email).set({ isDel: isDel.DELETE, trash: 1, trashTime: now }).where(inArray(email.emailId, emailIds)).run();
+			await orm(c).update(att).set({ trash: 1, trashTime: now }).where(and(inArray(att.emailId, emailIds), eq(att.trash, 0))).run();
+		}
 	},
 
 	// 彻底删除垃圾桶附件（仅超级管理员）：删 DB 记录 + 删 COS 文件
@@ -436,6 +449,12 @@ const attService = {
 		}
 
 		await orm(c).delete(att).where(inArray(att.attId, ids)).run();
+
+		// 超管彻底删除：只要邮件包含被删除的附件，就直接物理删除该邮件
+		const emailIds = [...new Set(rows.map(r => r.emailId).filter(Boolean))];
+		if (emailIds.length > 0) {
+			await orm(c).delete(email).where(inArray(email.emailId, emailIds)).run();
+		}
 	},
 
 	// 定时清理：垃圾桶中超过 7 天的附件彻底删除
@@ -477,9 +496,59 @@ const attService = {
 		}
 
 		await orm(c).delete(att).where(inArray(att.attId, ids)).run();
+
+		// 物理删除关联邮件：只删"删除后没有任何剩余附件记录"的邮件
+		const emailIds = [...new Set(rows.map(r => r.emailId).filter(Boolean))];
+		if (emailIds.length > 0) {
+			const remaining = await orm(c).select({ emailId: att.emailId }).from(att)
+				.where(inArray(att.emailId, emailIds))
+				.all();
+			const remainingSet = new Set(remaining.map(r => r.emailId));
+			const delEmailIds = emailIds.filter(id => !remainingSet.has(id));
+			if (delEmailIds.length > 0) {
+				await orm(c).delete(email).where(inArray(email.emailId, delEmailIds)).run();
+			}
+		}
+
+		// 7 天邮件清理：垃圾桶中超过 7 天的邮件物理删除，连带删除其仍处垃圾桶的附件（引用计数删 COS）
+		const delEmailRows = await orm(c).select().from(email)
+			.where(and(eq(email.trash, 1), lt(email.trashTime, sevenDaysAgo)))
+			.all();
+
+		if (delEmailRows.length > 0) {
+			const delEmailIds = delEmailRows.map(r => r.emailId);
+			const trashAttRows = await orm(c).select().from(att)
+				.where(and(inArray(att.emailId, delEmailIds), eq(att.trash, 1)))
+				.all();
+
+			if (trashAttRows.length > 0) {
+				const tKeys = [...new Set(trashAttRows.map(r => r.key).filter(Boolean))];
+				if (tKeys.length > 0) {
+					const refRows = await orm(c).select({ key: att.key, cnt: count(att.attId) }).from(att)
+						.where(inArray(att.key, tKeys))
+						.groupBy(att.key)
+						.all();
+					const refMap = {};
+					refRows.forEach(r => { refMap[r.key] = r.cnt; });
+					const delKeys = [];
+					for (const k of tKeys) {
+						const delCnt = trashAttRows.filter(r => r.key === k).length;
+						if ((refMap[k] || 0) <= delCnt) {
+							delKeys.push(k);
+						}
+					}
+					if (delKeys.length > 0) {
+						await this.batchDelete(c, delKeys);
+					}
+				}
+				await orm(c).delete(att).where(inArray(att.attId, trashAttRows.map(r => r.attId))).run();
+			}
+
+			await orm(c).delete(email).where(inArray(email.emailId, delEmailIds)).run();
+		}
 	},
 
-	// 恢复垃圾桶附件：普通用户只能恢复自己的，管理员可恢复任意用户的
+	// 恢复垃圾桶附件：普通用户只能恢复自己的，管理员可恢复任意用户的；连带恢复原邮件
 	async manageRestore(c, params, currentUserId, isAdmin) {
 
 		const { attIds } = params;
@@ -495,11 +564,52 @@ const attService = {
 
 		const allowed = isAdmin ? rows : rows.filter(r => r.userId === currentUserId);
 		if (allowed.length === 0) {
+			// 请求了附件但没有权限：拒绝而非静默成功
+			if (rows.length > 0) {
+				throw new BizError(t('unauthorized'), 403);
+			}
 			return;
 		}
 
 		const ids = allowed.map(r => r.attId);
 		await orm(c).update(att).set({ trash: 0, trashTime: null }).where(inArray(att.attId, ids)).run();
+
+		// 连带恢复原邮件 + 该邮件的全部垃圾桶附件（is_del=0 + trash=0，保持状态一致，重新可见）
+		const emailIds = [...new Set(allowed.map(r => r.emailId).filter(Boolean))];
+		if (emailIds.length > 0) {
+			await orm(c).update(email).set({ isDel: isDel.NORMAL, trash: 0, trashTime: null }).where(inArray(email.emailId, emailIds)).run();
+			await orm(c).update(att).set({ trash: 0, trashTime: null }).where(and(inArray(att.emailId, emailIds), eq(att.trash, 1))).run();
+		}
+	},
+
+	// 附件使用量统计：数据库附件记录 + COS 实际存储量 + 总容量配置
+	async getUsage(c) {
+
+		const setting = await settingService.query(c);
+
+		const stats = await orm(c).select({
+			count: count(),
+			totalSize: sql`COALESCE(SUM(${att.size}), 0)`
+		}).from(att).get();
+
+		let cos = { count: 0, totalSize: 0 };
+		try {
+			const storageType = await r2Service.storageType(c);
+			if (storageType === 'S3') {
+				cos = await s3Service.getBucketUsage(c);
+			}
+		} catch (e) {
+			console.error('COS usage error:', e);
+		}
+
+		return {
+			attCount: stats.count,
+			attSize: stats.totalSize,
+			cosCount: cos.count,
+			cosSize: cos.totalSize,
+			cosQuota: Number(setting.cosQuota) || 0,
+			s3Expire: setting.s3Expire || ''
+		};
 	}
 };
 

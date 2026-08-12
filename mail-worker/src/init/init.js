@@ -32,6 +32,10 @@ const dbInit = {
 		await this.v3_1DB(c);
 		await this.v3_2DB(c);
 		await this.v3_3DB(c);
+		await this.v3_4DB(c);
+		await this.v3_5DB(c);
+		await this.v3_6DB(c);
+		await this.v3_7DB(c);
 		await settingService.refresh(c);
 		return c.text('success');
 	},
@@ -42,6 +46,44 @@ const dbInit = {
 				c.env.db.prepare(`ALTER TABLE attachments ADD COLUMN trash INTEGER NOT NULL DEFAULT 0;`),
 				c.env.db.prepare(`ALTER TABLE attachments ADD COLUMN trash_time TEXT;`)
 			]);
+		} catch (e) {
+			console.warn(`跳过字段：${e.message}`);
+		}
+	},
+
+	async v3_4DB(c) {
+		try {
+			await c.env.db.prepare(`
+				INSERT OR IGNORE INTO perm (perm_id, name, perm_key, pid, type, sort) VALUES
+				(40, '使用量查看', 'att:usage', 37, 2, 2)
+			`).run();
+		} catch (e) {
+			console.warn(`跳过字段：${e.message}`);
+		}
+	},
+
+	async v3_5DB(c) {
+		try {
+			await c.env.db.prepare(`ALTER TABLE setting ADD COLUMN cos_quota TEXT NOT NULL DEFAULT '';`).run();
+		} catch (e) {
+			console.warn(`跳过字段：${e.message}`);
+		}
+	},
+
+	async v3_7DB(c) {
+		try {
+			await c.env.db.batch([
+				c.env.db.prepare(`ALTER TABLE email ADD COLUMN trash INTEGER NOT NULL DEFAULT 0;`),
+				c.env.db.prepare(`ALTER TABLE email ADD COLUMN trash_time TEXT;`)
+			]);
+		} catch (e) {
+			console.warn(`跳过字段：${e.message}`);
+		}
+	},
+
+	async v3_6DB(c) {
+		try {
+			await c.env.db.prepare(`ALTER TABLE setting ADD COLUMN s3_expire TEXT NOT NULL DEFAULT '';`).run();
 		} catch (e) {
 			console.warn(`跳过字段：${e.message}`);
 		}

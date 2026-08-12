@@ -7,6 +7,7 @@ import kvObjService from './service/kv-obj-service';
 import oauthService from "./service/oauth-service";
 import analysisService from './service/analysis-service';
 import attService from './service/att-service';
+import signUtils from './utils/sign-utils';
 export default {
 	 async fetch(req, env, ctx) {
 
@@ -19,6 +20,29 @@ export default {
 		}
 
 		 if (['/static/','/attachments/'].some(p => url.pathname.startsWith(p))) {
+
+			// 附件直读必须携带有效签名，防止绕过签名防伪系统（/static/ 静态资源除外）
+			if (url.pathname.startsWith('/attachments/')) {
+				const key = decodeURIComponent(url.pathname.substring(1));
+				const expires = url.searchParams.get('expires');
+				const sign = url.searchParams.get('sign');
+				const secret = (env?.ATT_SIGN_SECRET || '').trim();
+
+				if (!key || !expires || !sign || !secret) {
+					return new Response(JSON.stringify({ code: 403, message: 'unauthorized' }), { status: 403 });
+				}
+
+				const exp = Number(expires);
+				if (!Number.isFinite(exp) || Date.now() / 1000 > exp) {
+					return new Response(JSON.stringify({ code: 403, message: 'unauthorized' }), { status: 403 });
+				}
+
+				const expected = await signUtils.hmacHex(secret, `/${key}:${expires}`);
+				if (expected !== sign) {
+					return new Response(JSON.stringify({ code: 403, message: 'unauthorized' }), { status: 403 });
+				}
+			}
+
 			 return await kvObjService.toObjResp( { env }, url.pathname.substring(1));
 		 }
 

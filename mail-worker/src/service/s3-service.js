@@ -1,4 +1,4 @@
-import { S3Client, PutObjectCommand, DeleteObjectsCommand, GetObjectCommand } from "@aws-sdk/client-s3";
+import { S3Client, PutObjectCommand, DeleteObjectsCommand, GetObjectCommand, ListObjectsV2Command } from "@aws-sdk/client-s3";
 import settingService from './setting-service';
 import domainUtils from '../utils/domain-uitls';
 import { settingConst } from '../const/entity-const';
@@ -104,6 +104,36 @@ const s3Service = {
 				secretAccessKey: s3SecretKey,
 			}
 		});
+	},
+
+	// 统计整个 bucket 的实际存储使用量（对象数 + 总大小，非配额）
+	async getBucketUsage(c) {
+		const client = await this.client(c);
+		const { bucket } = await settingService.query(c);
+
+		let count = 0;
+		let totalSize = 0;
+		let continuationToken;
+		let pages = 0;
+
+		do {
+			// 页数保护：最多遍历 1000 页（约 100 万对象），防止超大桶导致请求超时
+			if (++pages > 1000) {
+				break;
+			}
+			const params = { Bucket: bucket, MaxKeys: 1000 };
+			if (continuationToken) {
+				params.ContinuationToken = continuationToken;
+			}
+			const result = await client.send(new ListObjectsV2Command(params));
+			for (const obj of result.Contents || []) {
+				count += 1;
+				totalSize += obj.Size || 0;
+			}
+			continuationToken = result.IsTruncated ? result.NextContinuationToken : undefined;
+		} while (continuationToken);
+
+		return { count, totalSize };
 	}
 }
 

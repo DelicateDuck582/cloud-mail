@@ -67,15 +67,24 @@ This fork adds the following custom features on top of the upstream:
 - **📁 Attachment Manager**: A dedicated attachment management page:
   
   - "All / Trash" tabs
-  - Auto-detected type labels (`Attachment-Image` / `Attachment-Word` / `Attachment-PDF` / `Attachment-Archive` / `Attachment-oc` etc., by extension)
-  - Select and act: preview / download / locate email / delete / restore
+  - **Grouped by file (content hash)**, expandable sub-table shows each user's reference, with per-user actions (locate email / delete / restore)
+  - Auto-detected type labels (`Attachment-Image` / `Attachment-Word` / `Attachment-PDF` / `Attachment-Archive` etc., by extension)
+  - Always-visible toolbar actions (preview / download / delete / restore / permanent delete) with hints when nothing is selected
   - Admins can filter by user and see the owner's email and role group
   - Click the filename to preview directly (mobile-friendly)
   - Responsive layout; table scrolls inside its container
-- **🗑️ Trash Mechanism**: Deleting moves attachments to trash (soft delete, original files untouched); the system auto-purges after 7 days; users can restore their own attachments; **only the super admin can permanently delete**.
+- **🗑️ Email & Attachment Trash Mechanism**: Deleting moves items to trash (soft delete, original files untouched) with the delete time recorded; auto-purged after 7 days. Deleting an attachment also moves its email to trash, and restoring restores the email too; emails can also be deleted to trash and restored; **only the super admin can permanently delete**.
+- **📊 COS Usage Stats**: The attachment page shows attachment usage / real COS storage / used / total / remaining; configurable capacity (GB) and S3 expiry date (turns red when expired).
 - **👥 Role Group (Security Group)**: Roles granted `all-email:query` can view all users' emails and attachments and manage (soft-delete / restore) any attachment, but **cannot permanently delete from trash** (super admin only).
 - **✍️ HTML Signature**: Configure an HTML signature (e.g., QQ Mail style card) in personal settings; it is auto-inserted when composing a new email.
 - **📏 Attachment Size Limit**: The frontend warns when an attachment exceeds 28MB (adapted to Resend's 40MB post-base64 total limit).
+- **🛡️ Security Hardening**:
+  - Fixed a bug where the default role was wrongly granted `all-email:query` (view all emails/attachments)
+  - Attachment read endpoints (`/api/oss`, `/attachments`) now enforce HMAC signature verification to prevent bypassing the anti-forgery system
+  - Unauthorized delete / restore operations now explicitly return 403 (no more silent success)
+  - Email delete / restore endpoints are covered by the permission middleware and ownership checks
+  - COS usage traversal is capped by page limit; error responses no longer leak internal details
+  - The cos-exchange proxy Worker fixes signature verification for filenames with spaces / Unicode, and relaxes Referer / Sec-Fetch checks for signed requests (email-client compatible)
 
 ## Tech Stack
 

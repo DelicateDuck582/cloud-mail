@@ -72,7 +72,7 @@ const signUtils = {
 			return content;
 		}
 
-		const pattern = /\{\{domain\}\}(attachments\/[^\s"'<>?]+)/g;
+		const pattern = /\{\{domain\}\}(attachments\/[^"'<>?]+)/g;
 		const keys = [...new Set(Array.from(str.matchAll(pattern), m => m[1]))];
 
 		if (keys.length === 0) {

@@ -730,6 +730,22 @@
           <el-input class="dialog-input" type="text" :placeholder="setting.s3AccessKey || 'Access Key'"
                     v-model="s3.s3AccessKey"/>
           <el-input style="margin-bottom: 10px" type="text" :placeholder="setting.s3SecretKey || 'Secret Key'" v-model="s3.s3SecretKey"/>
+          <div class="cos-quota-row">
+            <el-input class="dialog-input" type="text" :placeholder="setting.cosQuota || 'COS 总容量 (GB)'"
+                      v-model="s3.cosQuota"/>
+            <el-tooltip effect="dark" content="COS 总容量 (GB)">
+              <Icon class="warning" icon="fe:warning" width="18" height="18"/>
+            </el-tooltip>
+          </div>
+          <el-date-picker
+            class="dialog-input"
+            v-model="s3.s3Expire"
+            type="date"
+            placeholder="S3 到期时间 (选填)"
+            format="YYYY-MM-DD"
+            value-format="YYYY-MM-DD"
+            style="width: 100%"
+          />
           <div class="force-path-style">
             <div class="force-path-style-left">
               <span>ForcePathStyle</span>
@@ -881,6 +897,8 @@ const s3 = reactive({
   region: '',
   s3AccessKey: '',
   s3SecretKey: '',
+  cosQuota: '',
+  s3Expire: '',
   forcePathStyle: 1
 })
 
@@ -985,6 +1003,8 @@ function resetAddS3Form() {
   s3.region = setting.value.region
   s3.s3AccessKey = ''
   s3.s3SecretKey = ''
+  s3.cosQuota = setting.value.cosQuota || ''
+  s3.s3Expire = setting.value.s3Expire || ''
   s3.forcePathStyle = setting.value.forcePathStyle
 }
 
@@ -1173,6 +1193,8 @@ function clearS3() {
     region: '',
     s3AccessKey: '',
     s3SecretKey: '',
+    cosQuota: '',
+    s3Expire: '',
     forcePathStyle: 1
   }
   clearS3Loading.value = true
@@ -1185,7 +1207,9 @@ function saveS3() {
     bucket: s3.bucket,
     endpoint: s3.endpoint,
     region: s3.region,
-    forcePathStyle: s3.forcePathStyle
+    forcePathStyle: s3.forcePathStyle,
+    cosQuota: s3.cosQuota,
+    s3Expire: s3.s3Expire
   }
 
   if (s3.s3AccessKey) form.s3AccessKey = s3.s3AccessKey
@@ -1905,6 +1929,18 @@ function editSetting(settingForm, refreshStatus = true) {
 
 .dialog-input {
   margin-bottom: 15px;
+}
+
+.cos-quota-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 15px;
+
+  .dialog-input {
+    flex: 1;
+    margin-bottom: 0;
+  }
 }
 
 .force-path-style {

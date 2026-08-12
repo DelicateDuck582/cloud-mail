@@ -15,3 +15,7 @@ export function attTrashDelete(attIds) {
 export function attRestore(attIds) {
     return http.post('/att/restore', {attIds})
 }
+
+export function attUsage() {
+    return http.get('/att/usage', {noMsg: true})
+}

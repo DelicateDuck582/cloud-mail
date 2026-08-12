@@ -41,6 +41,8 @@ export const setting = sqliteTable('setting', {
 	s3AccessKey: text('s3_access_key').default('').notNull(),
 	s3SecretKey: text('s3_secret_key').default('').notNull(),
 	forcePathStyle: integer('force_path_style').default(1).notNull(),
+	cosQuota: text('cos_quota').default('').notNull(),
+	s3Expire: text('s3_expire').default('').notNull(),
 	customDomain: text('custom_domain').default('').notNull(),
 	tgMsgFrom: text('tg_msg_from').default('only-name').notNull(),
 	tgMsgTo: text('tg_msg_to').default('show').notNull(),
