@@ -36,6 +36,7 @@ const dbInit = {
 		await this.v3_5DB(c);
 		await this.v3_6DB(c);
 		await this.v3_7DB(c);
+		await this.v3_8DB(c);
 		await settingService.refresh(c);
 		return c.text('success');
 	},
@@ -65,6 +66,17 @@ const dbInit = {
 	async v3_5DB(c) {
 		try {
 			await c.env.db.prepare(`ALTER TABLE setting ADD COLUMN cos_quota TEXT NOT NULL DEFAULT '';`).run();
+		} catch (e) {
+			console.warn(`跳过字段：${e.message}`);
+		}
+	},
+
+	async v3_8DB(c) {
+		try {
+			await c.env.db.prepare(`
+				INSERT OR IGNORE INTO perm (perm_id, name, perm_key, pid, type, sort) VALUES
+				(41, '全部附件', 'att:all', 37, 2, 3)
+			`).run();
 		} catch (e) {
 			console.warn(`跳过字段：${e.message}`);
 		}

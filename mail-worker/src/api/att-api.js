@@ -14,7 +14,7 @@ async function getAttPerm(c) {
 	const user = c.get('user');
 	const isSuperAdmin = user.email === c.env.admin;
 	const permKeys = isSuperAdmin ? ['*'] : await permService.userPermKeys(c, user.userId);
-	const canViewAll = isSuperAdmin || permKeys.includes('all-email:query');
+	const canViewAll = isSuperAdmin || permKeys.includes('all-email:query') || permKeys.includes('att:all');
 	const canViewUsage = isSuperAdmin || permKeys.includes('att:usage');
 	return { isSuperAdmin, canViewAll, canViewUsage };
 }

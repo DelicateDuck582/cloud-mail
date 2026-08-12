@@ -28,9 +28,15 @@ export function hasPerm(permKey) {
 
 export function permsToRouter(permKeys) {
     const routerList = []
+    const seen = new Set()
     Object.keys(routers).forEach(perm => {
         if (permKeys.includes(perm) || permKeys.includes('*')) {
-            routerList.push(...routers[perm])
+            for (const r of routers[perm]) {
+                if (!seen.has(r.path)) {
+                    seen.add(r.path)
+                    routerList.push(r)
+                }
+            }
         }
     })
     return routerList;
@@ -110,6 +116,16 @@ const routers = {
         }
     }],
     'att:query': [{
+        path: '/att-manage',
+        name: 'att',
+        component: () => import('@/views/att/index.vue'),
+        meta: {
+            title: 'attManage',
+            name: 'att',
+            menu: true
+        }
+    }],
+    'att:all': [{
         path: '/att-manage',
         name: 'att',
         component: () => import('@/views/att/index.vue'),

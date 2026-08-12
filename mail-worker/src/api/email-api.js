@@ -19,7 +19,7 @@ app.get('/email/detail', async (c) => {
 	const user = c.get('user');
 	const isSuperAdmin = user.email === c.env.admin;
 	const permKeys = isSuperAdmin ? ['*'] : await permService.userPermKeys(c, userId);
-	const canViewAll = isSuperAdmin || permKeys.includes('all-email:query');
+	const canViewAll = isSuperAdmin || permKeys.includes('all-email:query') || permKeys.includes('att:all');
 
 	const emailRow = await emailService.selectById(c, Number(emailId));
 	if (!emailRow) {

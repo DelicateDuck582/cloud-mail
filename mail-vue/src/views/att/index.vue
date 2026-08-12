@@ -152,8 +152,8 @@ const emailStore = useEmailStore()
 const permKeys = computed(() => userStore.user.permKeys || [])
 // 仅超管可彻底删除垃圾桶
 const isAdmin = computed(() => permKeys.value.includes('*'))
-// 超管 或 有 all-email:query（如安全组）：可查看/管理全部用户的附件
-const canViewAll = computed(() => permKeys.value.includes('*') || permKeys.value.includes('all-email:query'))
+// 超管 / all-email:query（如安全组）/ att:all（全部附件权限）：可查看/管理全部用户的附件
+const canViewAll = computed(() => permKeys.value.includes('*') || permKeys.value.includes('all-email:query') || permKeys.value.includes('att:all'))
 // 超管 或 有 att:usage：可查看使用量
 const canViewUsage = computed(() => permKeys.value.includes('*') || permKeys.value.includes('att:usage'))
 // S3 到期时间是否已过期（未设置视为未过期）

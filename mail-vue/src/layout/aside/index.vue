@@ -49,7 +49,7 @@
           <Icon icon="fluent:mail-list-28-regular" width="22" height="22" />
           <span class="menu-name" style="margin-left: 20px">{{$t('allMail')}}</span>
         </el-menu-item>
-        <el-menu-item @click="router.push({name: 'att'})" index="att" v-perm="'att:query'"
+        <el-menu-item @click="router.push({name: 'att'})" index="att" v-perm="['att:query','att:all']"
                       :class="route.meta.name === 'att' ? 'choose-item' : ''">
           <Icon icon="fluent:folder-zip-24-regular" width="22" height="22" />
           <span class="menu-name" style="margin-left: 20px">{{$t('attManage')}}</span>
