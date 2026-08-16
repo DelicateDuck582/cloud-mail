@@ -63,7 +63,7 @@
 
 本仓库在 upstream 基础上增加了以下自定义功能：
 
-- **🔐 附件签名防伪造**：COS/S3 私有桶存储，附件访问使用后端签发的短期 HMAC 签名（默认 15 分钟有效）+ Referer/Sec-Fetch 双层校验，防止盗链与伪造访问；直读代理 Worker（cos-exchange）验签通过后用 Cache API 按文件缓存（附件 key 为内容哈希，缓存 7 天，文件不变即最多每 7 天回源一次）
+- **🔐 附件签名防伪造**：COS/S3 私有桶存储，附件访问使用后端签发的短期 HMAC 签名（默认 15 分钟有效）+ Referer/Sec-Fetch 双层校验，防止盗链与伪造访问；直读代理 Worker（cos-exchange）验签通过后用 Cache API 按文件缓存（附件 key 为内容哈希，缓存 7 天，文件不变即最多每 7 天回源一次）。改造说明见 [doc/签名防伪造改造说明.md](doc/签名防伪造改造说明.md)，代理 Worker 代码见 [doc/cos-proxy-worker.js](doc/cos-proxy-worker.js)
 - **📁 附件管理器**：独立的附件管理页面
   
   - 「全部 / 垃圾桶」双选项卡
