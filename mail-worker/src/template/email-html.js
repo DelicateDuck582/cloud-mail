@@ -1,13 +1,18 @@
-import { parseHTML } from 'linkedom';
 import domainUtils from '../utils/domain-uitls';
+import { sanitizeHtml, sanitizeCss } from '../utils/html-sanitize';
 
 export default function emailHtmlTemplate(html, domain) {
 
-	const { document } = parseHTML(html);
-	document.querySelectorAll('script').forEach(script => script.remove());
-	html = document.toString();
+	// 提取 <body> 的 style 并过滤危险 CSS（清洗会拆掉 body 标签，故先提取）
+	const bodyStyleRegex = /<body[^>]*style="([^"]*)"[^>]*>/i;
+	const bodyStyleMatch = (html || '').match(bodyStyleRegex);
+	const bodyStyle = bodyStyleMatch ? sanitizeCss(bodyStyleMatch[1]).replace(/[<>]/g, '') : '';
+
+	// 白名单清洗：移除 script / 事件属性 / javascript: URL / iframe 等
+	html = sanitizeHtml(html) || '';
 	html = html.replace(/{{domain}}/g, domainUtils.toOssDomain(domain) + '/');
 	const safeHtmlJson = JSON.stringify(html).replace(/</g, '\\u003C');
+	const bodyStyleJson = JSON.stringify(bodyStyle).replace(/</g, '\\u003C');
 
 	return `<!DOCTYPE html>
 <html lang='en' >
@@ -43,16 +48,11 @@ export default function emailHtmlTemplate(html, domain) {
 
     <script>
 
-        function renderHTML(html) {
+        function renderHTML(html, bodyStyle) {
             const container = document.getElementById('container');
             const shadowRoot = container.attachShadow({ mode: 'open' });
 
-            // 提取 <body> 的 style 属性
-            const bodyStyleRegex = /<body[^>]*style="([^"]*)"[^>]*>/i;
-            const bodyStyleMatch = html.match(bodyStyleRegex);
-            const bodyStyle = bodyStyleMatch ? bodyStyleMatch[1] : '';
-
-            // 移除 <body> 标签
+            // 移除 <body> 标签（内容已在服务端白名单清洗）
             const cleanedHtml = html.replace(/<\\/?body[^>]*>/gi, '');
 
             // 渲染内容
@@ -90,7 +90,7 @@ export default function emailHtmlTemplate(html, domain) {
                         width: fit-content;
                         height: fit-content;
                         min-width: 100%;
-                        \${bodyStyle ? bodyStyle : ''} /* 注入 body 的 style */
+                        \${bodyStyleCss} /* 注入 body 的 style（服务端已清洗） */
                     }
 
                     img:not(table img) {
@@ -129,9 +129,10 @@ export default function emailHtmlTemplate(html, domain) {
 
         // 使用示例
         const exampleHtml = ${safeHtmlJson};
+        const bodyStyleCss = ${bodyStyleJson};
 
         // 渲染HTML
-        renderHTML(exampleHtml);
+        renderHTML(exampleHtml, bodyStyleCss);
     </script>
 </body>
 </html>`

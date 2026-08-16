@@ -6,6 +6,7 @@
 
 <script setup>
 import { ref, onMounted, watch } from 'vue'
+import { sanitizeHtml, sanitizeCss } from '@/utils/sanitize-html'
 
 const props = defineProps({
   html: {
@@ -21,13 +22,18 @@ let shadowRoot = null
 function updateContent() {
   if (!shadowRoot) return;
 
-  // 1. 提取 <body> 的 style 属性（如果存在）
+  // 0. 白名单清洗邮件 HTML（纵深防御：Shadow DOM 不隔离脚本，事件属性等必须移除）
+  const safeHtml = sanitizeHtml(props.html);
+
+  // 1. 提取 <body> 的 style 属性（如果存在），并过滤危险 CSS
   const bodyStyleRegex = /<body[^>]*style="([^"]*)"[^>]*>/i;
   const bodyStyleMatch = props.html.match(bodyStyleRegex);
-  const bodyStyle = bodyStyleMatch ? bodyStyleMatch[1] : '';
+  const bodyStyle = bodyStyleMatch
+    ? sanitizeCss(bodyStyleMatch[1]).replace(/[<>]/g, '')
+    : '';
 
   // 2. 移除 <body> 标签（保留内容）
-  const cleanedHtml = props.html.replace(/<\/?body[^>]*>/gi, '');
+  const cleanedHtml = safeHtml.replace(/<\/?body[^>]*>/gi, '');
 
   // 3. 将 body 的 style 应用到 .shadow-content
   shadowRoot.innerHTML = `

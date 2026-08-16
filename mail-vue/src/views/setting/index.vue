@@ -57,7 +57,7 @@
           <el-button size="small" @click="clearSignature">{{$t('clearSignature')}}</el-button>
         </div>
         <div class="signature-desc">{{$t('htmlSignatureDesc')}}</div>
-        <div v-if="previewShow" class="signature-preview" v-html="htmlSignature"></div>
+        <div v-if="previewShow" class="signature-preview" v-html="sanitizeHtml(htmlSignature)"></div>
       </div>
     </div>
     <div class="del-email" v-perm="'my:delete'">
@@ -87,6 +87,7 @@ import {accountSetName} from "@/request/account.js";
 import {useAccountStore} from "@/store/account.js";
 import {useI18n} from "vue-i18n";
 import {useSettingStore} from "@/store/setting.js";
+import {sanitizeHtml} from "@/utils/sanitize-html.js";
 
 const { t } = useI18n()
 const accountStore = useAccountStore()

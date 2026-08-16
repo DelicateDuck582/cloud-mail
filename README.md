@@ -85,6 +85,7 @@
   - 邮件删除 / 恢复接口纳入权限中间件与归属校验
   - COS 用量遍历增加页数上限，错误响应不泄露内部信息
   - 附件直读代理 Worker（cos-exchange）修复含空格 / Unicode 文件名的签名校验，并对已签名请求放宽 Referer / Sec-Fetch 校验（兼容邮件客户端）
+  - **邮件内容 XSS 防护**：邮件 HTML 在入库时用白名单清洗（linkedom）：移除 `script` / `iframe` / `object` / `embed` / `svg` / `math` / 表单控件、所有 `on*` 事件属性、`javascript:` / `vbscript:` / `data:text/html` 等危险 URL 与危险 CSS；前端渲染（ShadowHtml 详情、回复/转发注入、TG 预览页、签名预览）再做一次同规则清洗兜底旧数据
 
 ## 技术栈
 

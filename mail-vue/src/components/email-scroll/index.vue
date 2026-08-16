@@ -554,15 +554,15 @@ const accountShow = computed(() => {
 function htmlToText(email) {
   if (email.content) {
 
-    const tempDiv = document.createElement('div');
+    // 用 DOMParser 解析（script 不执行、img 不加载），避免 innerHTML 的边缘情况
+    const doc = new DOMParser().parseFromString(email.content, 'text/html');
 
-    tempDiv.innerHTML = email.content.replace(
-        /<(img|iframe|object|embed|video|audio|source|link)[^>]*>/gi, ''
-    );
+    // 移除图片/媒体/脚本/样式等不参与文本摘要的元素
+    doc.body.querySelectorAll(
+        'script, style, title, iframe, object, embed, video, audio, source, img, link, form, input, button, select, textarea'
+    ).forEach(el => el.remove());
 
-    const scriptsAndStyles = tempDiv.querySelectorAll('script, style, title');
-    scriptsAndStyles.forEach(el => el.remove());
-    let text = tempDiv.textContent || tempDiv.innerText || '';
+    let text = doc.body.textContent || doc.body.innerText || '';
     text = text.replace(/\s+/g, ' ').trim();
     return cleanSpace(text)
   }

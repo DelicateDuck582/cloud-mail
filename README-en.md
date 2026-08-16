@@ -85,6 +85,7 @@ This fork adds the following custom features on top of the upstream:
   - Email delete / restore endpoints are covered by the permission middleware and ownership checks
   - COS usage traversal is capped by page limit; error responses no longer leak internal details
   - The cos-exchange proxy Worker fixes signature verification for filenames with spaces / Unicode, and relaxes Referer / Sec-Fetch checks for signed requests (email-client compatible)
+  - **Email content XSS protection**: Email HTML is whitelist-sanitized at write time (linkedom): removes `script` / `iframe` / `object` / `embed` / `svg` / `math` / form controls, all `on*` event attributes, dangerous URL schemes (`javascript:` / `vbscript:` / `data:text/html`) and dangerous CSS; the frontend re-sanitizes on every render (ShadowHtml detail view, reply/forward injection, TG preview page, signature preview) to cover legacy data
 
 ## Tech Stack
 

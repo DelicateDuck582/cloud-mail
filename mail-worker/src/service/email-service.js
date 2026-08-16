@@ -23,6 +23,7 @@ import account from "../entity/account";
 import { att } from '../entity/att';
 import telegramService from './telegram-service';
 import signUtils from '../utils/sign-utils';
+import { sanitizeDocument } from '../utils/html-sanitize';
 
 const emailService = {
 
@@ -728,6 +729,9 @@ const emailService = {
 		useAtts.forEach(att => {
 			att.type = attConst.type.EMBED
 		})
+
+		// 存储前白名单清洗，防邮件内容 XSS（覆盖外部收件 / 站内发送 / 站内收件所有入库路径）
+		sanitizeDocument(document);
 
 		return document.toString();
 	},
