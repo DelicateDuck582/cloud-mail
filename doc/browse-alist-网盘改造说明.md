@@ -40,8 +40,11 @@
 - **面包屑路径条**：首页 / 文件夹 / …，可点击任意层级，超出横向滚动。
 - **交互**：点图片 → 全屏灯箱（左右切换 / 触摸滑动 / 键盘方向键）；点其他文件 → 详情弹层
   （移动端底部抽屉 / 桌面居中卡片），内嵌预览视频/音频/PDF/文本 + **下载** + **收藏**。
-- **分页**：文件列表每页 100 条（COS `max-keys=100`）+「加载更多」去重累计；
-  最近/收藏前端分页每页 100；全部加载完显示斜体「没有更多了」。
+- **分页器（对齐 alist-web Paginator）**：文件列表与最近/收藏均在翻页部位显示
+  「每页条数选择（30/60/100）+ 页码导航」。文件列表用 COS continuation-token 顺序翻页
+  （已访问页可点页码回翻、上一页/下一页）；最近/收藏本地数据有总数，数字分页
+  （首页/当前附近/末页 + 省略号）。`/browse/api/list` 通过 `per_page` 控制每页条数
+  （默认 60，上限 200）。
 - **视频**：`Range` 流式透传（秒开、可拖动 seek，按段下载）；关闭弹层时自动暂停并释放媒体。
 - **缩略图**：IntersectionObserver 懒加载 + **并发限流（最多同时 4 个请求）**，避免打满限流。
 - **其它**：429 自动重试；深色模式记忆本地偏好；默认搜索/排序/筛选状态本地持久化。
@@ -55,7 +58,7 @@
 | `/browse` | GET | 密码门控，已登录返回主界面，未登录返回登录页 |
 | `/browse/login` | POST | 字段 `p`（密码）+ `cf-turnstile-response`（可选），成功 302 + Set-Cookie 7 天 |
 | `/browse/logout` | GET | **新增**。服务端 Set-Cookie 删除 HttpOnly cookie 后 302 回 `/browse` |
-| `/browse/api/list?prefix=&token=` | GET | ListObjectsV2 列目录，每页 100 条（max-keys） |
+| `/browse/api/list?prefix=&token=&per_page=` | GET | ListObjectsV2 列目录，`per_page` 控制每页条数（30/60/100，默认 60，上限 200 → `max-keys`） |
 | `/browse/api/file?key=` | GET/HEAD | 经 Worker 回源 COS（S3 签名），支持 `Range` 头（视频/音频流式） |
 
 ---
@@ -168,6 +171,9 @@ Copy-Item cos-proxy-worker.built.js "cloud-mail-fork\doc\cos-proxy-worker.js" -F
 
 - **视频/音频不走 Worker Cache**：Cache API 不支持 206/Range 且大文件不适合，视频直连 COS 回源（私有桶下行流量费）。
   若需进一步降流量，可考虑 R2 或 CF 边缘缓存（注意勿绕过 /browse 密码门控）。
+- **COS 列表无总数**：`ListObjectsV2` 不返回总条数/总页数，所以文件列表分页器只能
+  「已访问页 + 上一页/下一页」顺序翻页，无法像本地页那样一次显示全部页码并任意跳转。
+  若目录量大且需要任意跳页，需引入 R2/COS 索引服务（超出当前单 Worker 范围）。
 - **单一共享密码**：所有登录者看到同一桶全部文件，无用户级权限体系。
 - **文件路径结构**会出现在 `key=` 参数中（下载/预览必需），已通过移除复制链接降低暴露面。
 - 后续可选项：文件级签名链接（像附件那样）、R2 视频缓存、多用户体系。
