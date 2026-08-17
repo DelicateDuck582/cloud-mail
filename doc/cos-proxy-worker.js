@@ -823,6 +823,24 @@ async function browseFetchFile(env, key, ctx, method, range) {
 // 其余 HTML 实体，保证 served 页面纯 ASCII。手写模板时不要引入反引号
 // 与 ${}（页面内声明的插值除外），也不要在内联 JS 里写反斜杠正则。
 // =====================================================================
+
+// =====================================================================
+// 【文件浏览器】/browse —— Alist 风格个人只读网盘页面（登录页 + 主界面）
+// ---------------------------------------------------------------------
+// 参照 Alist 前端（AlistGo/alist-web，SolidJS + HopeUI）的设计语言重制：
+//   - 主色 #1890ff（getMainColor 默认值），页面背景 #f7f8fa，hover 底色
+//     rgba(132,133,141,0.18)，内容容器 min(99%, 980px)，字体栈与 Alist 一致；
+//   - 文件列表放在白色圆角卡片内（Obj 卡片风格，rounded 12px + 阴影）；
+//   - 网格卡片悬停 scale(1.05) + hover 底色，图标为主色单色 SVG；
+//   - 列表三列（名称 / 大小 / 修改时间），移动端隐藏修改时间列；
+//   - 文件大小格式同 Alist getFileSize（1.02K / 1.00M / 2.00G），
+//     时间格式 YYYY-MM-DD HH:MM:SS。
+// 实现方式：本文件由 _parts/ 分块拼接（_build-pages.mjs），再由
+// _build-browse.mjs 合并进 cos-proxy-worker.js（原附件代理/签名/浏览后端
+// 逻辑保持逐字节不变）。中文/emoji 由构建器转成 <script> 内 \uXXXX、
+// 其余 HTML 实体，保证 served 页面纯 ASCII。手写模板时不要引入反引号
+// 与 ${}（页面内声明的插值除外），也不要在内联 JS 里写反斜杠正则。
+// =====================================================================
 function browseLoginHtml(env) {
   const sitekey = (env && env.TURNSTILE_SITEKEY) || '';
   const tsScript = sitekey ? '<script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>' : '';
@@ -1142,7 +1160,6 @@ select{height:32px;border:1px solid var(--line);border-radius:8px;background:var
   </div>
   <div class="sh-actions">
     <button class="btn" id="shFavBtn">&#x2606; &#x6536;&#x85CF;</button>
-    <button class="btn" id="shCopyBtn">&#x1F517; &#x590D;&#x5236;&#x94FE;&#x63A5;</button>
     <button class="btn primary" id="shDlBtn">&#x2B07; &#x4E0B;&#x8F7D;</button>
   </div>
 </div>
@@ -1681,24 +1698,8 @@ $('shFavBtn').onclick=function(){
     toast('\\u5DF2\\u52A0\\u5165\\u6536\\u85CF');
   }
 };
-$('shCopyBtn').onclick=function(){
-  if(!curItem){return;}
-  var url=location.origin+urlOf(curItem.key);
-  var done=function(){toast('\\u94FE\\u63A5\\u5DF2\\u590D\\u5236');};
-  if(navigator.clipboard&&navigator.clipboard.writeText){
-    navigator.clipboard.writeText(url).then(done,function(){fallbackCopy(url);done();});
-  }else{fallbackCopy(url);done();}
-};
-function fallbackCopy(t){
-  var ta=document.createElement('textarea');
-  ta.value=t;
-  ta.style.position='fixed';
-  ta.style.opacity='0';
-  document.body.appendChild(ta);
-  ta.select();
-  try{document.execCommand('copy');}catch(e){}
-  document.body.removeChild(ta);
-}
+// \\u300C\\u590D\\u5236\\u94FE\\u63A5\\u300D\\u6309\\u94AE\\u5DF2\\u79FB\\u9664\\uFF1A\\u907F\\u514D\\u66B4\\u9732\\u6587\\u4EF6\\u8DEF\\u5F84\\u7ED3\\u6784\\uFF08key \\u76F4\\u63A5\\u51FA\\u73B0\\u5728 URL \\u4E2D\\uFF09\\u3002
+// \\u9700\\u8981\\u7684\\u53EA\\u6709\\u300C\\u4E0B\\u8F7D\\u300D\\u4E0E\\u300C\\u6536\\u85CF\\u300D\\uFF0C\\u5176\\u5B83\\u64CD\\u4F5C\\u5728\\u6587\\u4EF6\\u5217\\u8868\\u5185\\u5373\\u53EF\\u5B8C\\u6210\\u3002
 $('lbPrev').onclick=function(){imgIdx=(imgIdx-1+imgs.length)%imgs.length;lbShow();};
 $('lbNext').onclick=function(){imgIdx=(imgIdx+1)%imgs.length;lbShow();};
 $('lbClose').onclick=closeLb;
