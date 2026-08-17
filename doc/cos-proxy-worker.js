@@ -427,7 +427,10 @@ async function handleBrowse(request, env, ctx) {
       return new Response('bad key', { status: 400 });
     }
     try {
-      return await browseFetchFile(env, key, ctx, request.method);
+      // 透传 Range 头：视频/音频播放器靠 Range 流式分段下载 + seek，
+      // 没有它浏览器只能全量下载完才能播，表现为"等待很久才开始"
+      const range = request.headers.get('Range') || '';
+      return await browseFetchFile(env, key, ctx, request.method, range);
     } catch (e) {
       console.error('browse file error:', e);
       return new Response('fetch failed', { status: 500 });
@@ -614,7 +617,9 @@ async function browseList(env, prefix, token) {
   const region = (env.REGION || '').trim();
   const ak = (env.AWS_ACCESS_KEY_ID || '').trim();
   const sk = (env.AWS_SECRET_ACCESS_KEY || '').trim();
-  const params = { 'list-type': '2', 'encoding-type': 'url', delimiter: '/' };
+  // max-keys=100：每页最多 100 条（文件夹+文件），配合前端「加载更多」翻页，
+  // 避免一次拉回上千条导致页面渲染卡顿、响应过大
+  const params = { 'list-type': '2', 'encoding-type': 'url', delimiter: '/', 'max-keys': '100' };
   if (prefix) params.prefix = prefix;
   if (token) params['continuation-token'] = token;
 
@@ -691,8 +696,9 @@ function parseListXml(xml) {
 }
 
 // 下载：经本 Worker 回源 COS（S3 签名 GET），不直连 COS 默认域名
-async function browseFetchFile(env, key, ctx, method) {
+async function browseFetchFile(env, key, ctx, method, range) {
   method = method || 'GET';
+  range = range || '';
   const rawEndpoint = (env.S3_ENDPOINT || '').trim().replace(/\/+$/, '');
   const region = (env.REGION || '').trim();
   const ak = (env.AWS_ACCESS_KEY_ID || '').trim();
@@ -700,10 +706,15 @@ async function browseFetchFile(env, key, ctx, method) {
   const encodedPath = '/' + key.split('/').map(enc).join('/');
   const targetUrl = new URL(encodedPath, rawEndpoint);
 
-  // Cache API 按 key 缓存（缩略图/预览会反复请求同一文件，7 天内只回源一次）
+  // Cache API 按 key 缓存（缩略图/预览会反复请求同一文件，7 天内只回源一次）。
+  // Range 请求（视频/音频流式播放、拖动 seek）跳过缓存：Cache API 不支持 206/Range，
+  // 且大视频不适合 Worker Cache。直接回源透传 Range，浏览器按段下载，首帧更快。
+  const isRange = range !== '';
   const cacheKey = new Request('https://' + new URL(rawEndpoint).host + '/_browse/' + encodedPath);
-  const cached = await caches.default.match(cacheKey);
-  if (cached) return cached;
+  if (!isRange) {
+    const cached = await caches.default.match(cacheKey);
+    if (cached) return cached;
+  }
 
   const signedHeaders = await getS3v4Headers({
     method: 'GET',
@@ -715,6 +726,7 @@ async function browseFetchFile(env, key, ctx, method) {
   const headersForFetch = { ...signedHeaders };
   delete headersForFetch['host'];
   delete headersForFetch['Host'];
+  if (range) headersForFetch['Range'] = range;
 
   const res = await fetch(targetUrl.toString(), { method: 'GET', headers: headersForFetch, signal: AbortSignal.timeout(10000) });
   let final = res;
@@ -729,9 +741,9 @@ async function browseFetchFile(env, key, ctx, method) {
   newHeaders.set('X-Content-Type-Options', 'nosniff');
   // 非 200 时标记上游状态：X-Upstream-Status 存在 = 429 来自 COS；不存在 = 429 来自 CF（worker 前被拒）
   if (!final.ok) newHeaders.set('X-Upstream-Status', String(final.status));
-  // 只对 GET 写缓存：HEAD 无 body，若把空 body 缓存进同一 cacheKey，
-  // 之后同路径的 GET 命中会返回空内容（与附件主流程同坑，见交接文档 §5-6）
-  if (final.ok && method === 'GET') {
+  // 只对 GET 写缓存：HEAD 无 body、Range 的 206 分段都不写入（否则污染同 key 的
+  // 完整 GET 缓存；视频等大文件也不适合 Worker Cache，交给 COS 回源）
+  if (final.ok && method === 'GET' && !isRange) {
     newHeaders.set('Cache-Control', 'public, max-age=604800');
     const cacheResp = new Response(final.body, { status: final.status, statusText: final.statusText, headers: newHeaders });
     ctx.waitUntil(caches.default.put(cacheKey, cacheResp.clone()));
@@ -757,6 +769,24 @@ async function browseFetchFile(env, key, ctx, method) {
 //     也不要在内联 JS 里写反斜杠正则（如 \d）。
 // =====================================================================
 
+
+// =====================================================================
+// 【文件浏览器】/browse —— Alist 风格个人只读网盘页面（登录页 + 主界面）
+// ---------------------------------------------------------------------
+// 参照 Alist 前端（AlistGo/alist-web，SolidJS + HopeUI）的设计语言重制：
+//   - 主色 #1890ff（getMainColor 默认值），页面背景 #f7f8fa，hover 底色
+//     rgba(132,133,141,0.18)，内容容器 min(99%, 980px)，字体栈与 Alist 一致；
+//   - 文件列表放在白色圆角卡片内（Obj 卡片风格，rounded 12px + 阴影）；
+//   - 网格卡片悬停 scale(1.05) + hover 底色，图标为主色单色 SVG；
+//   - 列表三列（名称 / 大小 / 修改时间），移动端隐藏修改时间列；
+//   - 文件大小格式同 Alist getFileSize（1.02K / 1.00M / 2.00G），
+//     时间格式 YYYY-MM-DD HH:MM:SS。
+// 实现方式：本文件由 _parts/ 分块拼接（_build-pages.mjs），再由
+// _build-browse.mjs 合并进 cos-proxy-worker.js（原附件代理/签名/浏览后端
+// 逻辑保持逐字节不变）。中文/emoji 由构建器转成 <script> 内 \uXXXX、
+// 其余 HTML 实体，保证 served 页面纯 ASCII。手写模板时不要引入反引号
+// 与 ${}（页面内声明的插值除外），也不要在内联 JS 里写反斜杠正则。
+// =====================================================================
 
 // =====================================================================
 // 【文件浏览器】/browse —— Alist 风格个人只读网盘页面（登录页 + 主界面）
@@ -1188,6 +1218,9 @@ var imgIdx=0;
 var curItem=null;
 var favs=loadArray('browse_fav');
 var recents=loadArray('browse_recent');
+// \\u672C\\u5730\\u9875\\u9762\\uFF08\\u6700\\u8FD1/\\u6536\\u85CF\\uFF09\\u5206\\u9875\\uFF1A\\u6BCF\\u9875 100 \\u6761
+var LOCAL_PAGE_SIZE=100;
+var localPage=1;
 function loadArray(k){try{var v=JSON.parse(localStorage.getItem(k)||'[]');return v instanceof Array?v:[];}catch(e){return [];}}
 function applyFilter(list){
   if(filter!=='all'){list=list.filter(function(o){return o.type===filter;});}
@@ -1297,7 +1330,7 @@ function renderHome(){
 }
 function renderLocal(){
   var src=(page==='recent')?recents:favs;
-  var list=sortList(applyFilter(src.slice()));
+  var list=sortList(applyFilter(src.slice())).slice(0,localPage*LOCAL_PAGE_SIZE);
   activeItems=list;
   imgs=list.filter(function(o){return o.type==='img';});
   var box=$('filelist');
@@ -1383,6 +1416,7 @@ function sortKey(field){
 function go(p){
   page='home';
   prefix=p;
+  localPage=1;
   closeSidebar();
   load(true);
   window.scrollTo(0,0);
@@ -1422,11 +1456,24 @@ function renderCrumbs(){
 }
 function renderPager(){
   var p=$('pager');
-  if(page!=='home'||!allData){p.innerHTML='';return;}
+  if(page!=='home'){
+    // \\u6700\\u8FD1/\\u6536\\u85CF\\uFF1A\\u524D\\u7AEF\\u672C\\u5730\\u5206\\u9875\\uFF0C\\u6BCF\\u9875 100
+    var src=(page==='recent')?recents:favs;
+    var full=sortList(applyFilter(src.slice()));
+    if(full.length>localPage*LOCAL_PAGE_SIZE){
+      p.innerHTML='<button id="loadmore">\\u52A0\\u8F7D\\u66F4\\u591A</button>';
+      var lm=document.getElementById('loadmore');
+      if(lm){lm.onclick=function(){localPage++;render();};}
+    }else{
+      p.innerHTML='';
+    }
+    return;
+  }
+  if(!allData){p.innerHTML='';return;}
   if(truncated){
     p.innerHTML='<button id="loadmore">\\u52A0\\u8F7D\\u66F4\\u591A</button>';
-    var lm=document.getElementById('loadmore');
-    if(lm){lm.onclick=function(){load(false);};}
+    var lm2=document.getElementById('loadmore');
+    if(lm2){lm2.onclick=function(){load(false);};}
   }else if(folders.length||files.length){
     p.innerHTML='<span class="nomore">\\u6CA1\\u6709\\u66F4\\u591A\\u4E86</span>';
   }else{
@@ -1492,7 +1539,7 @@ function removeFav(key){favs=favs.filter(function(x){return x.key!==key;});saveF
 function recordRecent(o){
   recents=recents.filter(function(x){return x.key!==o.key;});
   recents.unshift(o);
-  if(recents.length>60){recents=recents.slice(0,60);}
+  if(recents.length>200){recents=recents.slice(0,200);}
   try{localStorage.setItem('browse_recent',JSON.stringify(recents));}catch(e){}
 }
 var VIEW_ICON={
@@ -1556,6 +1603,7 @@ for(var ni=0;ni<navs.length;ni++){
   navs[ni].addEventListener('click',function(){
     var n=this.getAttribute('data-nav');
     page=n;
+    localPage=1;
     for(var k=0;k<navs.length;k++){navs[k].classList.toggle('on',navs[k]===this);}
     closeSidebar();
     if(n==='home'){load(true);}else{renderLocal();}
@@ -1607,8 +1655,17 @@ $('chips').addEventListener('click',function(e){
   for(var i=0;i<cs.length;i++){cs[i].classList.toggle('on',cs[i]===c);}
   render();
 });
-$('shClose').onclick=function(){$('sheet').classList.remove('show');};
-$('sheet').onclick=function(e){if(e.target===$('sheet')){$('sheet').classList.remove('show');}};
+// \\u5173\\u95ED\\u5F39\\u5C42\\u65F6\\u6682\\u505C/\\u91CA\\u653E\\u5A92\\u4F53\\uFF1A\\u5426\\u5219 video/audio \\u5143\\u7D20\\u53EA\\u662F\\u88AB\\u9690\\u85CF\\uFF0C\\u4ECD\\u4F1A\\u7EE7\\u7EED\\u64AD\\u653E\\u4E0E\\u4E0B\\u8F7D
+function closeSheet(){
+  var pv=$('shPreview');
+  var v=pv.querySelector('video');
+  var a=pv.querySelector('audio');
+  if(v){v.pause();v.removeAttribute('src');v.load();}
+  if(a){a.pause();a.removeAttribute('src');a.load();}
+  $('sheet').classList.remove('show');
+}
+$('shClose').onclick=closeSheet;
+$('sheet').onclick=function(e){if(e.target===$('sheet')){closeSheet();}};
 $('shDlBtn').onclick=function(){if(curItem){recordRecent(curItem);window.location.href=urlOf(curItem.key);}};
 $('shFavBtn').onclick=function(){
   if(!curItem){return;}
@@ -1665,7 +1722,7 @@ document.addEventListener('keydown',function(e){
   if(e.key==='Escape'){
     if(sb.style.display!=='none'){showSearch(false);render();}
     closeLb();
-    $('sheet').classList.remove('show');
+    closeSheet();
     return;
   }
   if(e.key==='ArrowLeft'&&$('lightbox').classList.contains('show')){imgIdx=(imgIdx-1+imgs.length)%imgs.length;lbShow();}
