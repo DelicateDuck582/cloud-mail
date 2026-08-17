@@ -386,7 +386,7 @@ async function handleBrowse(request, env) {
       });
     } catch (e) {
       console.error('browse list error:', e);
-      return new Response(JSON.stringify({ error: 'list failed' }), { status: 500 });
+      return new Response(JSON.stringify({ error: String(e && e.message || e).slice(0, 200) }), { status: 500 });
     }
   }
 
@@ -510,6 +510,7 @@ async function browseList(env, prefix, token) {
       'x-amz-content-sha256': payloadHash,
       Authorization: auth,
     },
+    signal: AbortSignal.timeout(10000),
   });
   if (!res.ok) {
     throw new Error(`list failed ${res.status}: ${await res.text()}`);
@@ -554,7 +555,7 @@ async function browseFetchFile(env, key) {
   delete headersForFetch['host'];
   delete headersForFetch['Host'];
 
-  const res = await fetch(targetUrl.toString(), { method: 'GET', headers: headersForFetch });
+  const res = await fetch(targetUrl.toString(), { method: 'GET', headers: headersForFetch, signal: AbortSignal.timeout(10000) });
   const newHeaders = new Headers(res.headers);
   newHeaders.delete('x-cos-request-id');
   newHeaders.delete('x-cos-hash-crc64ecma');
@@ -615,10 +616,21 @@ async function load(reset) {
   if (reset) { token = ''; truncated = false; }
   const q = new URLSearchParams({prefix});
   if (token) q.set('token', token);
-  const res = await fetch('/browse/api/list?' + q);
-  const data = await res.json();
-  if (data.error) { document.getElementById('list').innerHTML = '<div id="status">&#x52A0;&#x8F7D;&#x5931;&#x8D25;</div>'; return; }
-  render(data);
+  const box = document.getElementById('list');
+  try {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 15000);
+    const res = await fetch('/browse/api/list?' + q, { signal: ctrl.signal });
+    clearTimeout(timer);
+    const data = await res.json();
+    if (data.error) {
+      box.innerHTML = '<div id="status">&#x52A0;&#x8F7D;&#x5931;&#x8D25;: ' + esc(data.error) + '</div>';
+      return;
+    }
+    render(data);
+  } catch (e) {
+    box.innerHTML = '<div id="status">&#x52A0;&#x8F7D;&#x5931;&#x8D25;: ' + esc(String((e && e.message) || e)) + '</div>';
+  }
 }
 
 function render(d) {
