@@ -228,7 +228,11 @@ async function verifySignature(url, env) {
   }
 
   // 防"长期有效签名"：后端误配了超长 TTL 或签名被长期复用也拒绝
-  const maxTtl = Math.max(60, Math.min(Number(env.ATT_SIGN_MAX_TTL || 3600), 86400));
+  // 注意：ATT_SIGN_MAX_TTL 若被配成非数字（如粘贴错值），Number() 得 NaN，
+  // NaN 参与比较恒为 false → TTL 限制会整体失效（超长签名被放行）。必须兜底回默认值。
+  let maxTtl = Number(env.ATT_SIGN_MAX_TTL || 3600);
+  if (!Number.isFinite(maxTtl) || maxTtl <= 0) maxTtl = 3600;
+  maxTtl = Math.max(60, Math.min(maxTtl, 86400));
   if (expires - now > maxTtl) {
     return { ok: false, reason: 'Forbidden', remaining: 0 };
   }
@@ -416,7 +420,7 @@ async function handleBrowse(request, env, ctx) {
       return new Response('bad key', { status: 400 });
     }
     try {
-      return await browseFetchFile(env, key, ctx);
+      return await browseFetchFile(env, key, ctx, request.method);
     } catch (e) {
       console.error('browse file error:', e);
       return new Response('fetch failed', { status: 500 });
@@ -525,9 +529,19 @@ function rateLimited(key, max, windowMs) {
   return rec.c > max;
 }
 const loginFailMap = new Map();
+// 定期清理过期的失败记录，防止攻击者用海量不同 IP 把 Map 撑爆
+function loginFailGC(now) {
+  if (loginFailMap.size < 10000) return;
+  for (const [k, v] of loginFailMap) {
+    if (now - v.t > 600000) loginFailMap.delete(k);
+  }
+  if (loginFailMap.size > 20000) loginFailMap.clear();
+}
 function loginBlocked(ip) {
+  const now = Date.now();
+  loginFailGC(now);
   const rec = loginFailMap.get(ip);
-  return !!(rec && Date.now() - rec.t < 600000 && rec.c >= 5);
+  return !!(rec && now - rec.t < 600000 && rec.c >= 5);
 }
 function loginFailRecord(ip) {
   const rec = loginFailMap.get(ip);
@@ -670,7 +684,8 @@ function parseListXml(xml) {
 }
 
 // 下载：经本 Worker 回源 COS（S3 签名 GET），不直连 COS 默认域名
-async function browseFetchFile(env, key, ctx) {
+async function browseFetchFile(env, key, ctx, method) {
+  method = method || 'GET';
   const rawEndpoint = (env.S3_ENDPOINT || '').trim().replace(/\/+$/, '');
   const region = (env.REGION || '').trim();
   const ak = (env.AWS_ACCESS_KEY_ID || '').trim();
@@ -707,7 +722,9 @@ async function browseFetchFile(env, key, ctx) {
   newHeaders.set('X-Content-Type-Options', 'nosniff');
   // 非 200 时标记上游状态：X-Upstream-Status 存在 = 429 来自 COS；不存在 = 429 来自 CF（worker 前被拒）
   if (!final.ok) newHeaders.set('X-Upstream-Status', String(final.status));
-  if (final.ok) {
+  // 只对 GET 写缓存：HEAD 无 body，若把空 body 缓存进同一 cacheKey，
+  // 之后同路径的 GET 命中会返回空内容（与附件主流程同坑，见交接文档 §5-6）
+  if (final.ok && method === 'GET') {
     newHeaders.set('Cache-Control', 'public, max-age=604800');
     const cacheResp = new Response(final.body, { status: final.status, statusText: final.statusText, headers: newHeaders });
     ctx.waitUntil(caches.default.put(cacheKey, cacheResp.clone()));
@@ -733,6 +750,24 @@ async function browseFetchFile(env, key, ctx) {
 //     也不要在内联 JS 里写反斜杠正则（如 \d）。
 // =====================================================================
 
+
+// =====================================================================
+// 【文件浏览器】/browse —— Alist 风格个人只读网盘页面（登录页 + 主界面）
+// ---------------------------------------------------------------------
+// 参照 Alist 前端（AlistGo/alist-web，SolidJS + HopeUI）的设计语言重制：
+//   - 主色 #1890ff（getMainColor 默认值），页面背景 #f7f8fa，hover 底色
+//     rgba(132,133,141,0.18)，内容容器 min(99%, 980px)，字体栈与 Alist 一致；
+//   - 文件列表放在白色圆角卡片内（Obj 卡片风格，rounded 12px + 阴影）；
+//   - 网格卡片悬停 scale(1.05) + hover 底色，图标为主色单色 SVG；
+//   - 列表三列（名称 / 大小 / 修改时间），移动端隐藏修改时间列；
+//   - 文件大小格式同 Alist getFileSize（1.02K / 1.00M / 2.00G），
+//     时间格式 YYYY-MM-DD HH:MM:SS。
+// 实现方式：本文件由 _parts/ 分块拼接（_build-pages.mjs），再由
+// _build-browse.mjs 合并进 cos-proxy-worker.js（原附件代理/签名/浏览后端
+// 逻辑保持逐字节不变）。中文/emoji 由构建器转成 <script> 内 \uXXXX、
+// 其余 HTML 实体，保证 served 页面纯 ASCII。手写模板时不要引入反引号
+// 与 ${}（页面内声明的插值除外），也不要在内联 JS 里写反斜杠正则。
+// =====================================================================
 
 // =====================================================================
 // 【文件浏览器】/browse —— Alist 风格个人只读网盘页面（登录页 + 主界面）
@@ -1468,6 +1503,22 @@ function toast(msg){
   clearTimeout(toastTimer);
   toastTimer=setTimeout(function(){t.classList.remove('show');},1800);
 }
+// \\u7F29\\u7565\\u56FE\\u61D2\\u52A0\\u8F7D + \\u5E76\\u53D1\\u9650\\u6D41\\uFF1A\\u6700\\u591A\\u540C\\u65F6 4 \\u4E2A /browse/api/file \\u8BF7\\u6C42\\uFF0C
+// \\u907F\\u514D\\u5927\\u76EE\\u5F55\\u77AC\\u95F4\\u6253\\u6EE1 per-IP \\u9650\\u6D41(120/min)\\u6216\\u6324\\u5360 Worker \\u8D44\\u6E90
+var MAX_CONCURRENT=4;
+var thumbQueue=[];
+var thumbActive=0;
+function thumbPump(){
+  while(thumbActive<MAX_CONCURRENT&&thumbQueue.length){
+    var img=thumbQueue.shift();
+    if(!img||img.dataset.src===undefined){continue;}
+    thumbActive++;
+    img.onload=function(){thumbActive--;thumbPump();};
+    img.onerror=function(){this.style.display='none';thumbActive--;thumbPump();};
+    img.src=img.dataset.src;
+    img.removeAttribute('data-src');
+  }
+}
 var io=null;
 if('IntersectionObserver' in window){
   io=new IntersectionObserver(function(entries){
@@ -1475,7 +1526,7 @@ if('IntersectionObserver' in window){
       var en=entries[i];
       if(en.isIntersecting){
         var im=en.target;
-        if(im.dataset.src){im.src=im.dataset.src;im.removeAttribute('data-src');}
+        if(im.dataset.src){thumbQueue.push(im);thumbPump();}
         io.unobserve(im);
       }
     }
@@ -1484,7 +1535,8 @@ if('IntersectionObserver' in window){
 function lazyBind(root){
   var imgs=(root||document).querySelectorAll('img[data-src]');
   for(var i=0;i<imgs.length;i++){
-    if(io){io.observe(imgs[i]);}else{imgs[i].src=imgs[i].dataset.src;imgs[i].removeAttribute('data-src');}
+    if(io){io.observe(imgs[i]);}
+    else{thumbQueue.push(imgs[i]);thumbPump();}
   }
 }
 var side=$('sidebar');
