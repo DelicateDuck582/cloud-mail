@@ -54,6 +54,10 @@
           <Icon icon="fluent:folder-zip-24-regular" width="22" height="22" />
           <span class="menu-name" style="margin-left: 20px">{{$t('attManage')}}</span>
         </el-menu-item>
+        <el-menu-item @click="openNetdisk" index="netdisk" v-perm="'att:query'">
+          <Icon icon="fluent:folder-open-24-regular" width="22" height="22" />
+          <span class="menu-name" style="margin-left: 20px">{{$t('netdisk')}}</span>
+        </el-menu-item>
         <el-menu-item @click="router.push({name: 'role'})" index="setting" v-perm="'role:query'"
                       :class="route.meta.name === 'role' ? 'choose-item' : ''">
           <Icon icon="fluent:lock-closed-16-regular" width="22" height="22" />
@@ -82,6 +86,14 @@ import {useSettingStore} from "@/store/setting.js";
 
 const settingStore = useSettingStore();
 const route = useRoute();
+
+// 打开 COS 网盘（cos-exchange /browse，独立密码门控，新标签页）
+const openNetdisk = () => {
+  let base = settingStore.settings.r2Domain;
+  if (!base) return;
+  if (!base.startsWith('http')) base = 'https://' + base;
+  window.open(base.replace(/\/+$/, '') + '/browse', '_blank');
+};
 
 </script>
 

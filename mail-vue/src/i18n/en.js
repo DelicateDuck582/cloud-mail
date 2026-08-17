@@ -8,6 +8,7 @@ const en = {
     allUsers: 'All Users',
     allMail: 'All Mail',
     attManage: 'Attachments',
+    netdisk: 'Netdisk',
     attAll: 'All',
     attTrash: 'Trash',
     attKeyword: 'Search filename / user / subject',

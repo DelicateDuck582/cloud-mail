@@ -8,6 +8,7 @@ const zh = {
     allUsers: '用户列表',
     allMail: '全部邮件',
     attManage: '附件管理',
+    netdisk: '网盘',
     attAll: '全部',
     attTrash: '垃圾桶',
     attKeyword: '搜索文件名 / 用户 / 主题',
