@@ -24,6 +24,15 @@ export default {
         return Response.redirect(REDIRECT_TARGET, 302);
       }
 
+      // =====================================================
+      // 1.2 【文件浏览器】/browse —— 个人只读网盘
+      //     所有请求都经本 Worker（cos-exchange），手机不直连 COS
+      //     独立密码门控（BROWSE_PASS），与附件签名体系互不影响
+      // =====================================================
+      if (url.pathname === '/browse' || url.pathname.startsWith('/browse/')) {
+        return await handleBrowse(request, env);
+      }
+
       // 仅允许 GET 和 HEAD 请求
       if (request.method !== 'GET' && request.method !== 'HEAD') {
         return new Response('Method Not Allowed', { status: 405 });
@@ -325,4 +334,340 @@ async function getS3v4Headers({ method, url, region, accessKeyId, secretAccessKe
 
 // 导出供测试使用（Cloudflare 只用 default export，不受影响）
 export { verifySignature, hmacSha256Hex, timingSafeEqual };
+
+// =====================================================================
+// 【文件浏览器】/browse —— 个人只读网盘（请求全部经本 Worker，手机不直连 COS）
+// ---------------------------------------------------------------------
+// 需要：
+//   env.BROWSE_PASS                访问密码（必设；未配置时 /browse 一律拒绝）
+//   AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / S3_ENDPOINT / REGION
+//                                  复用上面的只读子账号（策略需含 GetObject + GetBucket）
+// 说明：/browse 是独立密码门控的个人浏览入口，不参与附件签名体系
+// =====================================================================
+async function handleBrowse(request, env) {
+  const url = new URL(request.url);
+
+  // 登录（POST）
+  if (request.method === 'POST' && url.pathname === '/browse/login') {
+    return await browseLogin(request, env);
+  }
+  if (request.method !== 'GET' && request.method !== 'HEAD') {
+    return new Response('Method Not Allowed', { status: 405 });
+  }
+
+  // 密码门控：未配置 BROWSE_PASS 时直接拒绝，防止误配导致整桶裸奔
+  if (!env.BROWSE_PASS || !browseAuthed(request, env.BROWSE_PASS)) {
+    return new Response(browseLoginHtml(), {
+      status: 200,
+      headers: { 'Content-Type': 'text/html; charset=utf-8' },
+    });
+  }
+
+  // 首页
+  if (url.pathname === '/browse' || url.pathname === '/browse/') {
+    return new Response(browseIndexHtml(), {
+      headers: { 'Content-Type': 'text/html; charset=utf-8' },
+    });
+  }
+
+  // 列目录
+  if (url.pathname === '/browse/api/list') {
+    try {
+      const prefix = url.searchParams.get('prefix') || '';
+      const token = url.searchParams.get('token') || '';
+      const data = await browseList(env, prefix, token);
+      return new Response(JSON.stringify(data), {
+        headers: { 'Content-Type': 'application/json; charset=utf-8' },
+      });
+    } catch (e) {
+      console.error('browse list error:', e);
+      return new Response(JSON.stringify({ error: 'list failed' }), { status: 500 });
+    }
+  }
+
+  // 下载/预览（经本 Worker 回源，不直连 COS）
+  if (url.pathname === '/browse/api/file') {
+    const key = url.searchParams.get('key') || '';
+    if (!key || key.startsWith('/') || key.includes('../')) {
+      return new Response('bad key', { status: 400 });
+    }
+    try {
+      return await browseFetchFile(env, key);
+    } catch (e) {
+      console.error('browse file error:', e);
+      return new Response('fetch failed', { status: 500 });
+    }
+  }
+
+  return new Response('Not Found', { status: 404 });
+}
+
+function browseAuthed(request, pass) {
+  const cookies = (request.headers.get('Cookie') || '').split(';');
+  for (const c of cookies) {
+    const [k, v] = c.trim().split('=');
+    if (k === 'browse_pwd' && v === browseFingerprint(pass)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+async function browseLogin(request, env) {
+  const form = await request.formData();
+  const p = form.get('p') || '';
+  if (p === env.BROWSE_PASS) {
+    return new Response('', {
+      status: 302,
+      headers: {
+        Location: '/browse',
+        'Set-Cookie': `browse_pwd=${browseFingerprint(env.BROWSE_PASS)}; Path=/; Max-Age=604800; SameSite=Lax`,
+      },
+    });
+  }
+  return new Response('密码错误', { status: 401 });
+}
+
+// cookie 校验用轻量指纹（非安全加密场景；正式场景请再加 Cloudflare Access）
+function browseFingerprint(s) {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 0x01000193) >>> 0;
+  }
+  return h.toString(16);
+}
+
+// ---- S3 SigV4 工具（浏览专用，与上方 getS3v4Headers 同算法）----
+function enc(s) {
+  return encodeURIComponent(s).replace(/[!'()*]/g, c => '%' + c.charCodeAt(0).toString(16).toUpperCase());
+}
+
+function canonQuery(params) {
+  return Object.keys(params)
+    .sort()
+    .map(k => `${enc(k)}=${enc(params[k])}`)
+    .join('&');
+}
+
+async function hmacHex(key, data) {
+  const cryptoKey = await crypto.subtle.importKey(
+    'raw',
+    typeof key === 'string' ? new TextEncoder().encode(key) : key,
+    { name: 'HMAC', hash: 'SHA-256' },
+    false,
+    ['sign']
+  );
+  const sig = await crypto.subtle.sign('HMAC', cryptoKey, new TextEncoder().encode(data));
+  return Array.from(new Uint8Array(sig)).map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
+async function sha256Hex(data) {
+  const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(data));
+  return Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
+async function signingKey(sk, dateStamp, region) {
+  const kDate = await hmacHex('AWS4' + sk, dateStamp);
+  const kRegion = await hmacHex(kDate, region);
+  const kService = await hmacHex(kRegion, 's3');
+  return await hmacHex(kService, 'aws4_request');
+}
+
+// 列目录：GET ?list-type=2&delimiter=/&prefix=...&continuation-token=...
+async function browseList(env, prefix, token) {
+  const host = new URL(env.S3_ENDPOINT).host;
+  const params = { 'list-type': '2', 'encoding-type': 'url', delimiter: '/' };
+  if (prefix) params.prefix = prefix;
+  if (token) params['continuation-token'] = token;
+
+  const qs = canonQuery(params);
+  const now = new Date();
+  const amzDate = now.toISOString().replace(/[:-]|\.\d{3}/g, '');
+  const dateStamp = amzDate.slice(0, 8);
+  const payloadHash = 'UNSIGNED-PAYLOAD';
+
+  const canonicalHeaders = `host:${host}\nx-amz-content-sha256:${payloadHash}\nx-amz-date:${amzDate}\n`;
+  const signedHeadersStr = 'host;x-amz-content-sha256;x-amz-date';
+  const canonicalRequest = ['GET', '/', qs, canonicalHeaders, signedHeadersStr, payloadHash].join('\n');
+  const scope = `${dateStamp}/${env.REGION}/s3/aws4_request`;
+  const stringToSign = ['AWS4-HMAC-SHA256', amzDate, scope, await sha256Hex(canonicalRequest)].join('\n');
+  const key = await signingKey(env.AWS_SECRET_ACCESS_KEY, dateStamp, env.REGION);
+  const signature = await hmacHex(key, stringToSign);
+  const auth = `AWS4-HMAC-SHA256 Credential=${env.AWS_ACCESS_KEY_ID}/${scope}, SignedHeaders=${signedHeadersStr}, Signature=${signature}`;
+
+  const res = await fetch(`https://${host}/?${qs}`, {
+    headers: {
+      'x-amz-date': amzDate,
+      'x-amz-content-sha256': payloadHash,
+      Authorization: auth,
+    },
+  });
+  if (!res.ok) {
+    throw new Error(`list failed ${res.status}: ${await res.text()}`);
+  }
+  return parseListXml(await res.text());
+}
+
+function parseListXml(xml) {
+  const folders = [];
+  const reFolder = /<CommonPrefixes><Prefix>([^<]*)<\/Prefix><\/CommonPrefixes>/g;
+  let m;
+  while ((m = reFolder.exec(xml))) {
+    try { folders.push(decodeURIComponent(m[1])); } catch (e) { folders.push(m[1]); }
+  }
+  const files = [];
+  const reFile = /<Contents>[\s\S]*?<Key>([^<]*)<\/Key>[\s\S]*?<Size>(\d+)<\/Size>[\s\S]*?<\/Contents>/g;
+  while ((m = reFile.exec(xml))) {
+    let k = m[1];
+    try { k = decodeURIComponent(k); } catch (e) {}
+    files.push({ key: k, size: Number(m[2]) });
+  }
+  const truncated = /<IsTruncated>true<\/IsTruncated>/.test(xml);
+  const tm = xml.match(/<NextContinuationToken>([^<]*)<\/NextContinuationToken>/);
+  return { folders, files, truncated, token: tm ? tm[1] : '' };
+}
+
+// 下载：经本 Worker 回源 COS（S3 签名 GET），不直连 COS 默认域名
+async function browseFetchFile(env, key) {
+  const rawEndpoint = (env.S3_ENDPOINT || '').trim().replace(/\/+$/, '');
+  const region = (env.REGION || '').trim();
+  const encodedPath = '/' + key.split('/').map(enc).join('/');
+  const targetUrl = new URL(encodedPath, rawEndpoint);
+
+  const signedHeaders = await getS3v4Headers({
+    method: 'GET',
+    url: targetUrl,
+    region: region,
+    accessKeyId: env.AWS_ACCESS_KEY_ID,
+    secretAccessKey: env.AWS_SECRET_ACCESS_KEY,
+  });
+  const headersForFetch = { ...signedHeaders };
+  delete headersForFetch['host'];
+  delete headersForFetch['Host'];
+
+  const res = await fetch(targetUrl.toString(), { method: 'GET', headers: headersForFetch });
+  const newHeaders = new Headers(res.headers);
+  newHeaders.delete('x-cos-request-id');
+  newHeaders.delete('x-cos-hash-crc64ecma');
+  return new Response(res.body, { status: res.status, statusText: res.statusText, headers: newHeaders });
+}
+
+// ---- 页面 ----
+function browseLoginHtml() {
+  return `<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>登录 - COS 文件浏览</title>
+<style>
+body{font-family:system-ui,-apple-system,'PingFang SC','Microsoft YaHei',sans-serif;background:#f5f6f8;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0}
+.card{background:#fff;border-radius:12px;padding:32px;width:min(90vw,340px);box-shadow:0 4px 24px rgba(0,0,0,.08)}
+h1{font-size:18px;margin:0 0 20px;text-align:center;color:#1a1a2e}
+input{width:100%;box-sizing:border-box;padding:10px 12px;border:1px solid #ddd;border-radius:8px;margin-bottom:14px;font-size:15px}
+button{width:100%;padding:11px;border:0;border-radius:8px;background:#3b82f6;color:#fff;font-size:15px;cursor:pointer}
+</style></head><body>
+<div class="card"><h1>🔐 COS 文件浏览</h1>
+<form method="post" action="/browse/login"><input type="password" name="p" placeholder="访问密码" required autofocus><button type="submit">登 录</button></form>
+</div></body></html>`;
+}
+
+function browseIndexHtml() {
+  return `<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>COS 文件浏览</title>
+<style>
+body{font-family:system-ui,-apple-system,'PingFang SC','Microsoft YaHei',sans-serif;background:#f5f6f8;margin:0;color:#1a1a2e}
+header{position:sticky;top:0;background:#1a1a2e;color:#fff;padding:12px 16px;display:flex;align-items:center;justify-content:space-between;z-index:10}
+header h1{font-size:16px;margin:0}
+#crumbs{padding:10px 16px;font-size:14px;background:#fff;border-bottom:1px solid #eee;overflow-x:auto;white-space:nowrap;position:sticky;top:49px;z-index:9}
+#crumbs a,#crumbs .crumb{color:#3b82f6;text-decoration:none;margin-right:6px;cursor:pointer}
+#list{max-width:720px;margin:0 auto;padding:8px 12px 80px}
+.row{display:flex;align-items:center;background:#fff;border-radius:10px;padding:12px;margin-bottom:8px;box-shadow:0 1px 4px rgba(0,0,0,.05);cursor:pointer}
+.row .icon{font-size:22px;margin-right:12px;flex-shrink:0}
+.row .name{flex:1;font-size:15px;word-break:break-all}
+.row .meta{font-size:12px;color:#999;flex-shrink:0;margin-left:12px}
+#loadmore{display:block;width:100%;padding:10px;border:1px solid #ddd;background:#fff;border-radius:10px;color:#3b82f6;font-size:14px;cursor:pointer}
+#status{text-align:center;color:#999;font-size:13px;padding:24px}
+footer{position:fixed;bottom:0;left:0;right:0;text-align:center;font-size:12px;color:#bbb;padding:8px;background:#fff}
+</style></head><body>
+<header><h1>📁 COS 文件浏览</h1></header>
+<div id="crumbs"></div>
+<div id="list"><div id="status">加载中…</div></div>
+<footer>只读浏览 · 经 cos-exchange</footer>
+<script>
+let prefix = '';
+let token = '';
+let truncated = false;
+
+const icons = {jpg:'🖼️',jpeg:'🖼️',png:'🖼️',gif:'🖼️',webp:'🖼️',bmp:'🖼️',pdf:'📕',zip:'🗜️',rar:'🗜️',7z:'🗜️',tar:'🗜️',gz:'🗜️',mp3:'🎵',wav:'🎵',flac:'🎵',mp4:'🎬',mkv:'🎬',mov:'🎬',avi:'🎬',doc:'📄',docx:'📄',xls:'📊',xlsx:'📊',ppt:'📽️',pptx:'📽️',txt:'📃',md:'📃',html:'🌐',exe:'⚙️',apk:'📱'};
+const ext = n => (n.split('.').pop() || '').toLowerCase();
+const iconOf = n => icons[ext(n)] || '📦';
+const fmt = s => s < 1024 ? s+' B' : s < 1048576 ? (s/1024).toFixed(1)+' KB' : (s/1048576).toFixed(1)+' MB';
+
+async function load(reset) {
+  if (reset) { token = ''; truncated = false; }
+  const q = new URLSearchParams({prefix});
+  if (token) q.set('token', token);
+  const res = await fetch('/browse/api/list?' + q);
+  const data = await res.json();
+  if (data.error) { document.getElementById('list').innerHTML = '<div id="status">加载失败</div>'; return; }
+  render(data);
+}
+
+function render(d) {
+  const box = document.getElementById('list');
+  const crumb = document.getElementById('crumbs');
+  let html = '';
+  if (prefix) html += '<div class="row" data-act="up"><span class="icon">⬆️</span><span class="name">返回上级</span></div>';
+  for (const f of d.folders) {
+    const name = f.slice(0, -1).split('/').pop();
+    html += '<div class="row" data-act="open" data-key="' + escAttr(f) + '"><span class="icon">📁</span><span class="name">' + esc(name) + '</span><span class="meta">文件夹</span></div>';
+  }
+  for (const f of d.files) {
+    const name = f.key.split('/').pop();
+    html += '<div class="row" data-act="dl" data-key="' + escAttr(f.key) + '"><span class="icon">' + iconOf(name) + '</span><span class="name">' + esc(name) + '</span><span class="meta">' + fmt(f.size) + '</span></div>';
+  }
+  if (d.truncated) html += '<button id="loadmore" onclick="more()">加载更多</button>';
+  box.innerHTML = html || '<div id="status">（空目录）</div>';
+
+  box.onclick = (e) => {
+    const row = e.target.closest('.row');
+    if (!row) return;
+    const act = row.dataset.act;
+    const key = row.dataset.key || '';
+    if (act === 'up') up();
+    else if (act === 'open') open(key);
+    else if (act === 'dl') dl(key);
+  };
+
+  const parts = prefix.split('/').filter(Boolean);
+  let cr = '<span class="crumb" data-cr="">根目录</span>';
+  let acc = '';
+  parts.forEach((p) => {
+    acc += p + '/';
+    cr += ' / <span class="crumb" data-cr="' + escAttr(acc) + '">' + esc(p) + '</span>';
+  });
+  crumb.innerHTML = cr;
+  crumb.onclick = (e) => {
+    const c = e.target.closest('.crumb');
+    if (c) go(c.dataset.cr || '');
+  };
+
+  truncated = d.truncated;
+  token = d.token || '';
+}
+
+const esc = s => String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/'/g,'&#39;').replace(/"/g,'&quot;');
+const escAttr = s => String(s).replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;');
+const go = p => { prefix = p; load(true); window.scrollTo(0,0); };
+const up = () => { const parts = prefix.split('/').filter(Boolean); parts.pop(); prefix = parts.length ? parts.join('/') + '/' : ''; load(true); window.scrollTo(0,0); };
+const open = p => { prefix = p; load(true); window.scrollTo(0,0); };
+const dl = k => { window.location.href = '/browse/api/file?key=' + encodeURIComponent(k); };
+const more = () => load(false);
+
+load(true);
+</script></body></html>`;
+}
+
+
+
 
