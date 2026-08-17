@@ -446,8 +446,19 @@ async function browseLogin(request, env) {
   // Turnstile 人机验证（可选，配置 TURNSTILE_SECRET 后生效）
   if (env.TURNSTILE_SECRET) {
     const token = form.get('cf-turnstile-response') || '';
-    if (!token || !(await verifyTurnstile(env.TURNSTILE_SECRET, token, ip))) {
-      return new Response('Captcha verification failed', { status: 400 });
+    if (!token) {
+      return new Response('&#x9A8C;&#x8BC1;&#x7801;&#x672A;&#x52A0;&#x8F7D;&#xFF0C;&#x8BF7;&#x91CD;&#x65B0;&#x52A0;&#x8F7D;&#x9875;&#x9762;&#x540E;&#x5B8C;&#x6210;&#x4EBA;&#x673A;&#x9A8C;&#x8BC1;', {
+        status: 400,
+        headers: { 'Content-Type': 'text/html; charset=utf-8' },
+      });
+    }
+    const ok = await verifyTurnstile(env.TURNSTILE_SECRET, token, ip);
+    if (!ok) {
+      console.error('turnstile verify failed ip=', ip);
+      return new Response('&#x9A8C;&#x8BC1;&#x7801;&#x9A8C;&#x8BC1;&#x5931;&#x8D25;&#xFF0C;&#x8BF7;&#x91CD;&#x8BD5;', {
+        status: 400,
+        headers: { 'Content-Type': 'text/html; charset=utf-8' },
+      });
     }
   }
   const p = form.get('p') || '';
@@ -479,6 +490,7 @@ async function verifyTurnstile(secret, token, ip) {
       body: `secret=${encodeURIComponent(secret)}&response=${encodeURIComponent(token)}&remoteip=${encodeURIComponent(ip)}`,
     });
     const j = await r.json();
+    if (!j || !j.success) console.error('turnstile siteverify:', JSON.stringify(j));
     return !!(j && j.success);
   } catch (e) {
     return false;
@@ -704,20 +716,23 @@ async function browseFetchFile(env, key, ctx) {
 function browseLoginHtml(env) {
   const sitekey = (env && env.TURNSTILE_SITEKEY) || '';
   const tsScript = sitekey ? '<script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>' : '';
-  const tsWidget = sitekey ? '<div class="cf-turnstile" data-sitekey="' + sitekey + '" style="margin-bottom:14px"></div>' : '';
+  const tsWidget = sitekey ? '<div class="cf-turnstile" data-sitekey="' + sitekey + '" data-callback="onTs" style="margin-bottom:14px"></div>' : '';
+  const tsJs = sitekey ? '<script>function onTs(){var b=document.getElementById("loginBtn");if(b){b.disabled=false;}}</script>' : '';
   return `<!DOCTYPE html>
 <html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>&#x767B;&#x5F55; - COS &#x6587;&#x4EF6;&#x6D4F;&#x89C8;</title>
 ${tsScript}
+${tsJs}
 <style>
 body{font-family:system-ui,-apple-system,'PingFang SC','Microsoft YaHei',sans-serif;background:#f5f6f8;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0}
 .card{background:#fff;border-radius:12px;padding:32px;width:min(90vw,340px);box-shadow:0 4px 24px rgba(0,0,0,.08)}
 h1{font-size:18px;margin:0 0 20px;text-align:center;color:#1a1a2e}
 input{width:100%;box-sizing:border-box;padding:10px 12px;border:1px solid #ddd;border-radius:8px;margin-bottom:14px;font-size:15px}
 button{width:100%;padding:11px;border:0;border-radius:8px;background:#3b82f6;color:#fff;font-size:15px;cursor:pointer}
+button:disabled{opacity:.5;cursor:not-allowed}
 </style></head><body>
 <div class="card"><h1>&#x1F510; COS &#x6587;&#x4EF6;&#x6D4F;&#x89C8;</h1>
-<form method="post" action="/browse/login"><input type="password" name="p" placeholder="&#x8BBF;&#x95EE;&#x5BC6;&#x7801;" required autofocus>${tsWidget}<button type="submit">&#x767B; &#x5F55;</button></form>
+<form method="post" action="/browse/login"><input type="password" name="p" placeholder="&#x8BBF;&#x95EE;&#x5BC6;&#x7801;" required autofocus>${tsWidget}<button type="submit" id="loginBtn"${sitekey ? ' disabled' : ''}>&#x767B; &#x5F55;</button></form>
 </div></body></html>`;
 }
 function browseIndexHtml() {
