@@ -927,6 +927,24 @@ async function browseFetchFile(env, key, ctx, method, range) {
 // 其余 HTML 实体，保证 served 页面纯 ASCII。手写模板时不要引入反引号
 // 与 ${}（页面内声明的插值除外），也不要在内联 JS 里写反斜杠正则。
 // =====================================================================
+
+// =====================================================================
+// 【文件浏览器】/browse —— Alist 风格个人只读网盘页面（登录页 + 主界面）
+// ---------------------------------------------------------------------
+// 参照 Alist 前端（AlistGo/alist-web，SolidJS + HopeUI）的设计语言重制：
+//   - 主色 #1890ff（getMainColor 默认值），页面背景 #f7f8fa，hover 底色
+//     rgba(132,133,141,0.18)，内容容器 min(99%, 980px)，字体栈与 Alist 一致；
+//   - 文件列表放在白色圆角卡片内（Obj 卡片风格，rounded 12px + 阴影）；
+//   - 网格卡片悬停 scale(1.05) + hover 底色，图标为主色单色 SVG；
+//   - 列表三列（名称 / 大小 / 修改时间），移动端隐藏修改时间列；
+//   - 文件大小格式同 Alist getFileSize（1.02K / 1.00M / 2.00G），
+//     时间格式 YYYY-MM-DD HH:MM:SS。
+// 实现方式：本文件由 _parts/ 分块拼接（_build-pages.mjs），再由
+// _build-browse.mjs 合并进 cos-proxy-worker.js（原附件代理/签名/浏览后端
+// 逻辑保持逐字节不变）。中文/emoji 由构建器转成 <script> 内 \uXXXX、
+// 其余 HTML 实体，保证 served 页面纯 ASCII。手写模板时不要引入反引号
+// 与 ${}（页面内声明的插值除外），也不要在内联 JS 里写反斜杠正则。
+// =====================================================================
 function browseLoginHtml(env) {
   const sitekey = (env && env.TURNSTILE_SITEKEY) || '';
   const tsScript = sitekey ? '<script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>' : '';
@@ -1592,8 +1610,18 @@ function renderPager(){
   if(pageNo>1){
     html+='<button class="pg-btn" data-pg="prev" title="\\u4E0A\\u4E00\\u9875">&#x2039;</button>';
   }
+  // \\u9875\\u7801\\u6298\\u53E0\\uFF1A\\u53EA\\u663E\\u793A \\u9996\\u98751 / \\u5F53\\u524D\\u9875\\u9644\\u8FD1\\u00B11 / \\u5DF2\\u8BBF\\u95EE\\u6700\\u5927\\u9875\\uFF0C\\u5176\\u4F59\\u7528\\u7701\\u7565\\u53F7\\u3002
+  // \\u6587\\u4EF6\\u4E0A\\u4E07\\u3001\\u9875\\u6570\\u518D\\u591A\\u4E5F\\u4E0D\\u4F1A\\u6E32\\u67D3\\u51FA\\u4E00\\u957F\\u4E32\\u9875\\u7801\\uFF08\\u907F\\u514D\\u7FFB\\u9875\\u5668\\u6EA2\\u51FA\\uFF09\\u3002
+  var shown=[];
   for(var i=1;i<=maxLoadedPage;i++){
-    html+='<button class="pg-btn'+(i===pageNo?' cur':'')+'" data-pg="'+i+'">'+i+'</button>';
+    if(i===1||i===maxLoadedPage||Math.abs(i-pageNo)<=1){shown.push(i);}
+  }
+  var last=0;
+  for(var j=0;j<shown.length;j++){
+    var pg=shown[j];
+    if(pg-last>1){html+='<span class="pg-dots">&#x2026;</span>';}
+    html+='<button class="pg-btn'+(pg===pageNo?' cur':'')+'" data-pg="'+pg+'">'+pg+'</button>';
+    last=pg;
   }
   if(hasMore){
     html+='<button class="pg-btn" data-pg="next" title="\\u4E0B\\u4E00\\u9875">&#x203A;</button>';
