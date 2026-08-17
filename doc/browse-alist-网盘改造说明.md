@@ -68,15 +68,18 @@
 | 变量 | 说明 | 必填 |
 |---|---|---|
 | `ATT_SIGN_SECRET` | 附件签名密钥（与 mail-worker 一致） | ✅ |
-| `S3_ENDPOINT` | `https://cloudmail-1304899838.cos.ap-osaka.myqcloud.com` | ✅ |
-| `REGION` | `ap-osaka` | ✅ |
-| `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` | `cos-worker-readonly` 只读子账号（GetObject + GetBucket） | ✅ |
-| `BROWSE_PASS` | 网盘访问密码 | ✅ |
+| `S3_ENDPOINT` | COS 桶默认访问域名（`https://<BUCKET>.cos.<REGION>.myqcloud.com`）。⚠️ **真实桶地址/密钥属于敏感配置，不要提交到公开仓库**，只在 CF 环境变量里配置 | ✅ |
+| `REGION` | COS 桶所在地域（如 `ap-guangzhou`，按桶实际所在地配置） | ✅ |
+| `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` | `cos-worker-readonly` 只读子账号（GetObject + GetBucket）。⚠️ **SecretKey 绝不可出现在任何文档** | ✅ |
+| `BROWSE_PASS` | 网盘访问密码。⚠️ **绝不可提交到公开仓库** | ✅ |
 | `ATT_SIGN_MAX_TTL` | 可选，默认 3600（非法值自动回退默认） | 否 |
 | `BROWSE_ALLOW_COUNTRY` | 可选，如 `CN` | 否 |
 | `TURNSTILE_SITEKEY` / `TURNSTILE_SECRET` | 可选，登录人机验证 | 否 |
 
 > ⚠️ `cos-exchange` **不需要 KV 绑定**（代码无 `env.kv`）。KV 是 mail-worker 用的。
+> 本文档面向公开 fork 仓库：除公网域名（`cos./mail.duckgame-play.top`）外，所有真实配置值
+> （桶地址、SecretId/SecretKey、密码、Turnstile Secret）一律用占位符，真实值只存在于 CF 环境变量。
+> 含完整敏感值的交接文档在仓库外（`web开发\交接文档-CloudMail-COS现状.md`），标注禁止外发、禁止提交 GitHub。
 
 ---
 
