@@ -21,6 +21,13 @@ export default {
       // 1. 根路径拦截：访问根域名时自动跳转到邮件登录页
       const REDIRECT_TARGET = 'https://mail.duckgame-play.top';
       if (url.pathname === '/' || url.pathname === '') {
+        // 防自杀式重定向：若本代码被误部署到跳转目标域名（如 mail.duckgame-play.top），
+        // 302 到自身会无限循环（ERR_TOO_MANY_REDIRECTS）。命中即 200 兜底，不跳转。
+        try {
+          if (url.hostname === new URL(REDIRECT_TARGET).hostname) {
+            return new Response('OK', { status: 200 });
+          }
+        } catch (e) {}
         return Response.redirect(REDIRECT_TARGET, 302);
       }
 
