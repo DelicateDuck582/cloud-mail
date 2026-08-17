@@ -24,6 +24,11 @@ export default {
         return Response.redirect(REDIRECT_TARGET, 302);
       }
 
+      // 浏览器自动请求的 favicon：直接 204，避免落入白名单 403 刷日志
+      if (url.pathname === '/favicon.ico') {
+        return new Response(null, { status: 204 });
+      }
+
       // =====================================================
       // 1.2 【文件浏览器】/browse —— 个人只读网盘
       //     所有请求都经本 Worker（cos-exchange），手机不直连 COS
@@ -425,7 +430,10 @@ async function browseLogin(request, env) {
       },
     });
   }
-  return new Response('密码错误', { status: 401 });
+  return new Response('&#x5BC6;&#x7801;&#x9519;&#x8BEF;', {
+    status: 401,
+    headers: { 'Content-Type': 'text/html; charset=utf-8' },
+  });
 }
 
 // cookie 校验用轻量指纹（非安全加密场景；正式场景请再加 Cloudflare Access）
@@ -553,11 +561,11 @@ async function browseFetchFile(env, key) {
   return new Response(res.body, { status: res.status, statusText: res.statusText, headers: newHeaders });
 }
 
-// ---- 页面 ----
+// ---- 页面（全部 ASCII：中文/emoji 用 HTML 实体，免疫粘贴编码问题）----
 function browseLoginHtml() {
   return `<!DOCTYPE html>
 <html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>登录 - COS 文件浏览</title>
+<title>&#x767B;&#x5F55; - COS &#x6587;&#x4EF6;&#x6D4F;&#x89C8;</title>
 <style>
 body{font-family:system-ui,-apple-system,'PingFang SC','Microsoft YaHei',sans-serif;background:#f5f6f8;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0}
 .card{background:#fff;border-radius:12px;padding:32px;width:min(90vw,340px);box-shadow:0 4px 24px rgba(0,0,0,.08)}
@@ -565,15 +573,15 @@ h1{font-size:18px;margin:0 0 20px;text-align:center;color:#1a1a2e}
 input{width:100%;box-sizing:border-box;padding:10px 12px;border:1px solid #ddd;border-radius:8px;margin-bottom:14px;font-size:15px}
 button{width:100%;padding:11px;border:0;border-radius:8px;background:#3b82f6;color:#fff;font-size:15px;cursor:pointer}
 </style></head><body>
-<div class="card"><h1>🔐 COS 文件浏览</h1>
-<form method="post" action="/browse/login"><input type="password" name="p" placeholder="访问密码" required autofocus><button type="submit">登 录</button></form>
+<div class="card"><h1>&#x1F510; COS &#x6587;&#x4EF6;&#x6D4F;&#x89C8;</h1>
+<form method="post" action="/browse/login"><input type="password" name="p" placeholder="&#x8BBF;&#x95EE;&#x5BC6;&#x7801;" required autofocus><button type="submit">&#x767B; &#x5F55;</button></form>
 </div></body></html>`;
 }
 
 function browseIndexHtml() {
   return `<!DOCTYPE html>
 <html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>COS 文件浏览</title>
+<title>COS &#x6587;&#x4EF6;&#x6D4F;&#x89C8;</title>
 <style>
 body{font-family:system-ui,-apple-system,'PingFang SC','Microsoft YaHei',sans-serif;background:#f5f6f8;margin:0;color:#1a1a2e}
 header{position:sticky;top:0;background:#1a1a2e;color:#fff;padding:12px 16px;display:flex;align-items:center;justify-content:space-between;z-index:10}
@@ -589,18 +597,18 @@ header h1{font-size:16px;margin:0}
 #status{text-align:center;color:#999;font-size:13px;padding:24px}
 footer{position:fixed;bottom:0;left:0;right:0;text-align:center;font-size:12px;color:#bbb;padding:8px;background:#fff}
 </style></head><body>
-<header><h1>📁 COS 文件浏览</h1></header>
+<header><h1>&#x1F4C1; COS &#x6587;&#x4EF6;&#x6D4F;&#x89C8;</h1></header>
 <div id="crumbs"></div>
-<div id="list"><div id="status">加载中…</div></div>
-<footer>只读浏览 · 经 cos-exchange</footer>
+<div id="list"><div id="status">&#x52A0;&#x8F7D;&#x4E2D;&#x2026;</div></div>
+<footer>&#x53EA;&#x8BFB;&#x6D4F;&#x89C8; &#xB7; &#x7ECF; cos-exchange</footer>
 <script>
 let prefix = '';
 let token = '';
 let truncated = false;
 
-const icons = {jpg:'🖼️',jpeg:'🖼️',png:'🖼️',gif:'🖼️',webp:'🖼️',bmp:'🖼️',pdf:'📕',zip:'🗜️',rar:'🗜️',7z:'🗜️',tar:'🗜️',gz:'🗜️',mp3:'🎵',wav:'🎵',flac:'🎵',mp4:'🎬',mkv:'🎬',mov:'🎬',avi:'🎬',doc:'📄',docx:'📄',xls:'📊',xlsx:'📊',ppt:'📽️',pptx:'📽️',txt:'📃',md:'📃',html:'🌐',exe:'⚙️',apk:'📱'};
+const icons = {jpg:'&#x1F5BC;&#xFE0F;',jpeg:'&#x1F5BC;&#xFE0F;',png:'&#x1F5BC;&#xFE0F;',gif:'&#x1F5BC;&#xFE0F;',webp:'&#x1F5BC;&#xFE0F;',bmp:'&#x1F5BC;&#xFE0F;',pdf:'&#x1F4D5;',zip:'&#x1F5DC;&#xFE0F;',rar:'&#x1F5DC;&#xFE0F;',7z:'&#x1F5DC;&#xFE0F;',tar:'&#x1F5DC;&#xFE0F;',gz:'&#x1F5DC;&#xFE0F;',mp3:'&#x1F3B5;',wav:'&#x1F3B5;',flac:'&#x1F3B5;',mp4:'&#x1F3AC;',mkv:'&#x1F3AC;',mov:'&#x1F3AC;',avi:'&#x1F3AC;',doc:'&#x1F4C4;',docx:'&#x1F4C4;',xls:'&#x1F4CA;',xlsx:'&#x1F4CA;',ppt:'&#x1F4FD;&#xFE0F;',pptx:'&#x1F4FD;&#xFE0F;',txt:'&#x1F4C3;',md:'&#x1F4C3;',html:'&#x1F310;',exe:'&#x2699;&#xFE0F;',apk:'&#x1F4F1;'};
 const ext = n => (n.split('.').pop() || '').toLowerCase();
-const iconOf = n => icons[ext(n)] || '📦';
+const iconOf = n => icons[ext(n)] || '&#x1F4E6;';
 const fmt = s => s < 1024 ? s+' B' : s < 1048576 ? (s/1024).toFixed(1)+' KB' : (s/1048576).toFixed(1)+' MB';
 
 async function load(reset) {
@@ -609,7 +617,7 @@ async function load(reset) {
   if (token) q.set('token', token);
   const res = await fetch('/browse/api/list?' + q);
   const data = await res.json();
-  if (data.error) { document.getElementById('list').innerHTML = '<div id="status">加载失败</div>'; return; }
+  if (data.error) { document.getElementById('list').innerHTML = '<div id="status">&#x52A0;&#x8F7D;&#x5931;&#x8D25;</div>'; return; }
   render(data);
 }
 
@@ -617,17 +625,17 @@ function render(d) {
   const box = document.getElementById('list');
   const crumb = document.getElementById('crumbs');
   let html = '';
-  if (prefix) html += '<div class="row" data-act="up"><span class="icon">⬆️</span><span class="name">返回上级</span></div>';
+  if (prefix) html += '<div class="row" data-act="up"><span class="icon">&#x2B06;&#xFE0F;</span><span class="name">&#x8FD4;&#x56DE;&#x4E0A;&#x7EA7;</span></div>';
   for (const f of d.folders) {
     const name = f.slice(0, -1).split('/').pop();
-    html += '<div class="row" data-act="open" data-key="' + escAttr(f) + '"><span class="icon">📁</span><span class="name">' + esc(name) + '</span><span class="meta">文件夹</span></div>';
+    html += '<div class="row" data-act="open" data-key="' + escAttr(f) + '"><span class="icon">&#x1F4C1;</span><span class="name">' + esc(name) + '</span><span class="meta">&#x6587;&#x4EF6;&#x5939;</span></div>';
   }
   for (const f of d.files) {
     const name = f.key.split('/').pop();
     html += '<div class="row" data-act="dl" data-key="' + escAttr(f.key) + '"><span class="icon">' + iconOf(name) + '</span><span class="name">' + esc(name) + '</span><span class="meta">' + fmt(f.size) + '</span></div>';
   }
-  if (d.truncated) html += '<button id="loadmore" onclick="more()">加载更多</button>';
-  box.innerHTML = html || '<div id="status">（空目录）</div>';
+  if (d.truncated) html += '<button id="loadmore" onclick="more()">&#x52A0;&#x8F7D;&#x66F4;&#x591A;</button>';
+  box.innerHTML = html || '<div id="status">&#xFF08;&#x7A7A;&#x76EE;&#x5F55;&#xFF09;</div>';
 
   box.onclick = (e) => {
     const row = e.target.closest('.row');
@@ -640,7 +648,7 @@ function render(d) {
   };
 
   const parts = prefix.split('/').filter(Boolean);
-  let cr = '<span class="crumb" data-cr="">根目录</span>';
+  let cr = '<span class="crumb" data-cr="">&#x6839;&#x76EE;&#x5F55;</span>';
   let acc = '';
   parts.forEach((p) => {
     acc += p + '/';
