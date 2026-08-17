@@ -393,7 +393,7 @@ async function handleBrowse(request, env, ctx) {
   }
 
   // 密码门控：未配置 BROWSE_PASS 时直接拒绝，防止误配导致整桶裸奔
-  if (!env.BROWSE_PASS || !browseAuthed(request, env.BROWSE_PASS)) {
+  if (!env.BROWSE_PASS || !(await browseAuthed(request, env.BROWSE_PASS))) {
     return new Response(browseLoginHtml(env), {
       status: 200,
       headers: { 'Content-Type': 'text/html; charset=utf-8', 'X-Content-Type-Options': 'nosniff' },
@@ -452,11 +452,12 @@ async function handleBrowse(request, env, ctx) {
   return new Response('Not Found', { status: 404 });
 }
 
-function browseAuthed(request, pass) {
+async function browseAuthed(request, pass) {
+  const fingerprint = await browseFingerprint(pass);
   const cookies = (request.headers.get('Cookie') || '').split(';');
   for (const c of cookies) {
     const [k, v] = c.trim().split('=');
-    if (k === 'browse_pwd' && v === browseFingerprint(pass)) {
+    if (k === 'browse_pwd' && v === fingerprint) {
       return true;
     }
   }
@@ -490,11 +491,12 @@ async function browseLogin(request, env) {
   const p = form.get('p') || '';
   if (p === env.BROWSE_PASS) {
     loginOk(ip);
+    const fp = await browseFingerprint(env.BROWSE_PASS);
     return new Response('', {
       status: 302,
       headers: {
         Location: '/browse',
-        'Set-Cookie': `browse_pwd=${browseFingerprint(env.BROWSE_PASS)}; Path=/; Max-Age=604800; SameSite=Lax; HttpOnly; Secure`,
+        'Set-Cookie': `browse_pwd=${fp}; Path=/; Max-Age=604800; SameSite=Lax; HttpOnly; Secure`,
       },
     });
   }
@@ -527,14 +529,26 @@ async function verifyTurnstile(secret, token, ip) {
   }
 }
 
-// cookie 校验用轻量指纹（非安全加密场景；正式场景请再加 Cloudflare Access）
-function browseFingerprint(s) {
-  let h = 0x811c9dc5;
-  for (let i = 0; i < s.length; i++) {
-    h ^= s.charCodeAt(i);
-    h = Math.imul(h, 0x01000193) >>> 0;
-  }
-  return h.toString(16);
+// cookie 校验用 HMAC-SHA256 指纹。
+// 原 FNV-1a 32 位可碰撞、可用字典反推密码；HMAC-SHA256 输出 256 位，不可碰撞、
+// 单向不可逆（对强密码无法反推）。密钥为独立常量（非 BROWSE_PASS 本身），
+// 同一密码只产生唯一指纹，无法通过 cookie 值关联/推导其它信息。
+// BROWSE_PASS 在 Worker 实例生命周期内不变，缓存指纹避免每次请求重复 importKey。
+let fpCachePass = '';
+let fpCacheVal = '';
+async function browseFingerprint(pass) {
+  if (fpCachePass === pass && fpCacheVal) return fpCacheVal;
+  const key = await crypto.subtle.importKey(
+    'raw',
+    new TextEncoder().encode('cos-browse-cookie-fp-v2'),
+    { name: 'HMAC', hash: 'SHA-256' },
+    false,
+    ['sign']
+  );
+  const sig = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(pass));
+  fpCachePass = pass;
+  fpCacheVal = Array.from(new Uint8Array(sig)).map(b => b.toString(16).padStart(2, '0')).join('');
+  return fpCacheVal;
 }
 
 // ---- per-IP 速率限制（内存实现；配合 CF Access 更稳）----
