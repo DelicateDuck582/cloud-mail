@@ -484,10 +484,14 @@ async function browseLogin(request, env) {
 // Turnstile 人机验证（免费、无需绑卡）：用 secret 校验前端提交的 token
 async function verifyTurnstile(secret, token, ip) {
   try {
+    // remoteip 可选，且必须是合法 IP 才传，否则 siteverify 可能直接拒绝
+    const isIp = /^(\d{1,3}\.){3}\d{1,3}$|^[0-9a-fA-F:]+$/.test(ip || '');
+    let body = `secret=${encodeURIComponent(secret)}&response=${encodeURIComponent(token)}`;
+    if (isIp) body += `&remoteip=${encodeURIComponent(ip)}`;
     const r = await fetch('https://challenges.cloudflare.com/turnstile/v0/siteverify', {
       method: 'POST',
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: `secret=${encodeURIComponent(secret)}&response=${encodeURIComponent(token)}&remoteip=${encodeURIComponent(ip)}`,
+      body: body,
     });
     const j = await r.json();
     if (!j || !j.success) console.error('turnstile siteverify:', JSON.stringify(j));
