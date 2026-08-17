@@ -415,7 +415,11 @@ async function handleBrowse(request, env, ctx) {
     try {
       const prefix = url.searchParams.get('prefix') || '';
       const token = url.searchParams.get('token') || '';
-      const data = await browseList(env, prefix, token);
+      // per_page：每页条数（前端 30/60/100），限制 1~200，非法值回退 100
+      let perPage = parseInt(url.searchParams.get('per_page') || '', 10);
+      if (!Number.isFinite(perPage) || perPage < 1) perPage = 100;
+      if (perPage > 200) perPage = 200;
+      const data = await browseList(env, prefix, token, perPage);
       return new Response(JSON.stringify(data), {
         headers: { 'Content-Type': 'application/json; charset=utf-8', 'X-Content-Type-Options': 'nosniff' },
       });
@@ -636,16 +640,18 @@ async function signingKey(sk, dateStamp, region) {
   return await h(kService, 'aws4_request');
 }
 
-// 列目录：GET ?list-type=2&delimiter=/&prefix=...&continuation-token=...
-async function browseList(env, prefix, token) {
+// 列目录：GET ?list-type=2&delimiter=/&prefix=...&continuation-token=...&max-keys=...
+async function browseList(env, prefix, token, perPage) {
   // 与附件主流程一致：密钥/地域/endpoint 必须 trim（粘贴进 CF 的环境变量常带尾随空格/换行）
   const host = new URL((env.S3_ENDPOINT || '').trim()).host;
   const region = (env.REGION || '').trim();
   const ak = (env.AWS_ACCESS_KEY_ID || '').trim();
   const sk = (env.AWS_SECRET_ACCESS_KEY || '').trim();
-  // max-keys=100：每页最多 100 条（文件夹+文件），配合前端「加载更多」翻页，
+  // max-keys 由前端每页条数（per_page）决定：默认 100，支持 30/60/100 分页器，
   // 避免一次拉回上千条导致页面渲染卡顿、响应过大
-  const params = { 'list-type': '2', 'encoding-type': 'url', delimiter: '/', 'max-keys': '100' };
+  if (!Number.isFinite(perPage) || perPage < 1) perPage = 100;
+  if (perPage > 200) perPage = 200;
+  const params = { 'list-type': '2', 'encoding-type': 'url', delimiter: '/', 'max-keys': String(perPage) };
   if (prefix) params.prefix = prefix;
   if (token) params['continuation-token'] = token;
 
@@ -795,6 +801,24 @@ async function browseFetchFile(env, key, ctx, method, range) {
 //     也不要在内联 JS 里写反斜杠正则（如 \d）。
 // =====================================================================
 
+
+// =====================================================================
+// 【文件浏览器】/browse —— Alist 风格个人只读网盘页面（登录页 + 主界面）
+// ---------------------------------------------------------------------
+// 参照 Alist 前端（AlistGo/alist-web，SolidJS + HopeUI）的设计语言重制：
+//   - 主色 #1890ff（getMainColor 默认值），页面背景 #f7f8fa，hover 底色
+//     rgba(132,133,141,0.18)，内容容器 min(99%, 980px)，字体栈与 Alist 一致；
+//   - 文件列表放在白色圆角卡片内（Obj 卡片风格，rounded 12px + 阴影）；
+//   - 网格卡片悬停 scale(1.05) + hover 底色，图标为主色单色 SVG；
+//   - 列表三列（名称 / 大小 / 修改时间），移动端隐藏修改时间列；
+//   - 文件大小格式同 Alist getFileSize（1.02K / 1.00M / 2.00G），
+//     时间格式 YYYY-MM-DD HH:MM:SS。
+// 实现方式：本文件由 _parts/ 分块拼接（_build-pages.mjs），再由
+// _build-browse.mjs 合并进 cos-proxy-worker.js（原附件代理/签名/浏览后端
+// 逻辑保持逐字节不变）。中文/emoji 由构建器转成 <script> 内 \uXXXX、
+// 其余 HTML 实体，保证 served 页面纯 ASCII。手写模板时不要引入反引号
+// 与 ${}（页面内声明的插值除外），也不要在内联 JS 里写反斜杠正则。
+// =====================================================================
 
 // =====================================================================
 // 【文件浏览器】/browse —— Alist 风格个人只读网盘页面（登录页 + 主界面）
@@ -1083,10 +1107,14 @@ select{height:32px;border:1px solid var(--line);border-radius:8px;background:var
 .status{display:flex;flex-direction:column;align-items:center;gap:12px;padding:46px 0;color:var(--muted);font-size:14px}
 .spinner{width:26px;height:26px;border:3px solid var(--line);border-top-color:var(--primary);border-radius:50%;animation:spin .8s linear infinite}
 @keyframes spin{to{transform:rotate(360deg)}}
-.pager{display:flex;justify-content:center;padding:12px 0 6px}
-#loadmore{height:36px;padding:0 28px;border:1px solid var(--primary);border-radius:8px;background:transparent;color:var(--primary);font-size:14px;cursor:pointer;transition:background .15s}
-#loadmore:hover{background:var(--primary-weak)}
-.nomore{font-style:italic;color:var(--muted);font-size:13px}
+.pager{padding:6px 0 2px}
+.pagerbar{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;padding:10px 2px 6px}
+.pg-nav{display:flex;align-items:center;gap:4px;flex-wrap:wrap}
+.pg-btn{min-width:30px;height:30px;padding:0 8px;border:1px solid var(--line);border-radius:8px;background:var(--card);color:var(--sub);font-size:13px;cursor:pointer;transition:all .15s;line-height:1}
+.pg-btn:hover{border-color:var(--primary);color:var(--primary)}
+.pg-btn.cur{background:var(--primary);border-color:var(--primary);color:#fff;font-weight:600}
+.pg-dots{color:var(--muted);padding:0 2px;user-select:none}
+#perPageSel{height:30px;border:1px solid var(--line);border-radius:8px;background:var(--card);color:var(--text);font-size:13px;padding:0 6px;outline:none;cursor:pointer}
 .footer{text-align:center;font-size:12px;color:var(--muted);padding:20px 0 6px}
 #lightbox{position:fixed;inset:0;background:rgba(0,0,0,.94);z-index:120;display:none;flex-direction:column}
 #lightbox.show{display:flex}
@@ -1286,8 +1314,12 @@ var urlOf=function(k){return '/browse/api/file?key='+encodeURIComponent(k);};
 var typeOf=function(n){var e=ext(n);if(IMG.indexOf(e)>=0){return 'img';}if(VID.indexOf(e)>=0){return 'vid';}if(AUD.indexOf(e)>=0){return 'aud';}if(DOC.indexOf(e)>=0){return 'doc';}if(ARC.indexOf(e)>=0){return 'arc';}return 'oth';};
 var typeLabel={'img':'\\u56FE\\u7247','vid':'\\u89C6\\u9891','aud':'\\u97F3\\u9891','doc':'\\u6587\\u6863','arc':'\\u538B\\u7F29','oth':'\\u5176\\u4ED6'};
 var prefix='';
-var token='';
-var truncated=false;
+// \\u5206\\u9875\\uFF08\\u6587\\u4EF6\\u5217\\u8868\\uFF09\\uFF1ACOS continuation-token \\u987A\\u5E8F\\u7FFB\\u9875\\uFF0CpageTokens[i] \\u7F13\\u5B58\\u8FDB\\u5165\\u7B2C i \\u9875\\u6240\\u9700\\u7684 token
+var perPage=60;        // \\u6BCF\\u9875\\u6761\\u6570\\uFF0830/60/100\\uFF09
+var pageNo=1;          // \\u5F53\\u524D\\u9875
+var pageTokens=[];     // pageTokens[i] = \\u7B2C i \\u9875\\u8BF7\\u6C42\\u7528\\u7684 continuation-token\\uFF08\\u7B2C 1 \\u9875\\u4E3A ''\\uFF09
+var maxLoadedPage=1;   // \\u5DF2\\u8BBF\\u95EE\\u7684\\u6700\\u5927\\u9875
+var hasMore=false;     // \\u662F\\u5426\\u8FD8\\u6709\\u4E0B\\u4E00\\u9875\\uFF08COS IsTruncated\\uFF09
 var filter='all';
 var keyword='';
 var sortVal='name-asc';
@@ -1302,9 +1334,7 @@ var imgIdx=0;
 var curItem=null;
 var favs=loadArray('browse_fav');
 var recents=loadArray('browse_recent');
-// \\u672C\\u5730\\u9875\\u9762\\uFF08\\u6700\\u8FD1/\\u6536\\u85CF\\uFF09\\u5206\\u9875\\uFF1A\\u6BCF\\u9875 100 \\u6761
-var LOCAL_PAGE_SIZE=100;
-var localPage=1;
+var localPage=1;       // \\u672C\\u5730\\u9875\\u9762\\uFF08\\u6700\\u8FD1/\\u6536\\u85CF\\uFF09\\u5F53\\u524D\\u9875\\uFF0C\\u6BCF\\u9875 perPage \\u6761
 function loadArray(k){try{var v=JSON.parse(localStorage.getItem(k)||'[]');return v instanceof Array?v:[];}catch(e){return [];}}
 function applyFilter(list){
   if(filter!=='all'){list=list.filter(function(o){return o.type===filter;});}
@@ -1333,9 +1363,14 @@ function statusHtml(msg,spin){
 }
 function load(reset){
   if(page!=='home'){renderLocal();return;}
-  if(reset){token='';truncated=false;}
+  if(reset){pageTokens=[];pageNo=1;maxLoadedPage=1;hasMore=false;}
+  loadPage(pageNo);
+}
+// \\u52A0\\u8F7D\\u7B2C n \\u9875\\uFF08token \\u7F13\\u5B58\\u81EA pageTokens\\uFF0C\\u5DF2\\u8BBF\\u95EE\\u9875\\u53EF\\u56DE\\u7FFB\\uFF1B\\u4E0B\\u4E00\\u9875\\u65F6 maxLoadedPage+1\\uFF09
+function loadPage(n){
+  var token=pageTokens[n]||'';
   var box=$('filelist');
-  var q=new URLSearchParams({prefix:prefix});
+  var q=new URLSearchParams({prefix:prefix,per_page:String(perPage)});
   if(token){q.set('token',token);}
   box.innerHTML=statusHtml('\\u52A0\\u8F7D\\u4E2D...',true);
   var ctrl=new AbortController();
@@ -1344,7 +1379,7 @@ function load(reset){
   .then(function(res){
     if(res.status===429){
       box.innerHTML=statusHtml('\\u8BF7\\u6C42\\u8FC7\\u4E8E\\u9891\\u7E41(429)\\uFF0C\\u7A0D\\u540E\\u81EA\\u52A8\\u91CD\\u8BD5...',true);
-      setTimeout(function(){load(reset);},4000);
+      setTimeout(function(){loadPage(n);},4000);
       return null;
     }
     if(!res.ok){throw new Error('HTTP '+res.status);}
@@ -1357,23 +1392,13 @@ function load(reset){
       return;
     }
     allData=data;
-    truncated=!!data.truncated;
-    token=data.token||'';
-    var nf=data.folders||[];
-    var nfiles=data.files||[];
-    if(reset){
-      folders=nf;
-      files=nfiles;
-    }else{
-      var seenF={},m=[];
-      var both=folders.concat(nf);
-      for(var i=0;i<both.length;i++){if(!seenF[both[i]]){seenF[both[i]]=1;m.push(both[i]);}}
-      folders=m;
-      var seenK={},fm=[];
-      var fb=files.concat(nfiles);
-      for(var j=0;j<fb.length;j++){var k=fb[j].key;if(!seenK[k]){seenK[k]=1;fm.push(fb[j]);}}
-      files=fm;
-    }
+    pageTokens[n]=token;
+    pageTokens[n+1]=data.token||'';
+    hasMore=!!data.truncated;
+    folders=data.folders||[];
+    files=data.files||[];
+    pageNo=n;
+    if(n>maxLoadedPage){maxLoadedPage=n;}
     render();
   })
   .catch(function(e){
@@ -1414,7 +1439,7 @@ function renderHome(){
 }
 function renderLocal(){
   var src=(page==='recent')?recents:favs;
-  var list=sortList(applyFilter(src.slice())).slice(0,localPage*LOCAL_PAGE_SIZE);
+  var list=sortList(applyFilter(src.slice())).slice((localPage-1)*perPage,localPage*perPage);
   activeItems=list;
   imgs=list.filter(function(o){return o.type==='img';});
   var box=$('filelist');
@@ -1538,31 +1563,87 @@ function renderCrumbs(){
     go(cr.getAttribute('data-cr')||'');
   };
 }
+function perPageSelHtml(){
+  return '<select id="perPageSel" title="\\u6BCF\\u9875\\u6761\\u6570">'
+    +'<option value="30">30 / \\u9875</option>'
+    +'<option value="60">60 / \\u9875</option>'
+    +'<option value="100">100 / \\u9875</option>'
+    +'</select>';
+}
+function bindPerPageSel(){
+  var s=$('perPageSel');
+  if(!s){return;}
+  s.value=String(perPage);
+  s.onchange=function(){
+    perPage=parseInt(this.value,10);
+    if(page==='home'){load(true);}
+    else{localPage=1;renderLocal();}
+  };
+}
+// \\u6587\\u4EF6\\u5217\\u8868\\u5206\\u9875\\u5668\\uFF1ACOS \\u65E0\\u603B\\u6570\\uFF0C\\u6309\\u300C\\u5DF2\\u8BBF\\u95EE\\u9875 + \\u4E0A\\u4E00\\u9875/\\u4E0B\\u4E00\\u9875\\u300D\\u987A\\u5E8F\\u7FFB\\u9875\\uFF08token \\u7F13\\u5B58\\uFF09
 function renderPager(){
   var p=$('pager');
-  if(page!=='home'){
-    // \\u6700\\u8FD1/\\u6536\\u85CF\\uFF1A\\u524D\\u7AEF\\u672C\\u5730\\u5206\\u9875\\uFF0C\\u6BCF\\u9875 100
-    var src=(page==='recent')?recents:favs;
-    var full=sortList(applyFilter(src.slice()));
-    if(full.length>localPage*LOCAL_PAGE_SIZE){
-      p.innerHTML='<button id="loadmore">\\u52A0\\u8F7D\\u66F4\\u591A</button>';
-      var lm=document.getElementById('loadmore');
-      if(lm){lm.onclick=function(){localPage++;render();};}
-    }else{
-      p.innerHTML='';
-    }
-    return;
-  }
+  if(page!=='home'){renderLocalPager(p);return;}
   if(!allData){p.innerHTML='';return;}
-  if(truncated){
-    p.innerHTML='<button id="loadmore">\\u52A0\\u8F7D\\u66F4\\u591A</button>';
-    var lm2=document.getElementById('loadmore');
-    if(lm2){lm2.onclick=function(){load(false);};}
-  }else if(folders.length||files.length){
-    p.innerHTML='<span class="nomore">\\u6CA1\\u6709\\u66F4\\u591A\\u4E86</span>';
-  }else{
-    p.innerHTML='';
+  if(!folders.length&&!files.length){p.innerHTML='';return;}
+  var html='<div class="pagerbar">'
+    +'<div class="pg-left">'+perPageSelHtml()+'</div>'
+    +'<div class="pg-nav">';
+  if(pageNo>1){
+    html+='<button class="pg-btn" data-pg="prev" title="\\u4E0A\\u4E00\\u9875">&#x2039;</button>';
   }
+  for(var i=1;i<=maxLoadedPage;i++){
+    html+='<button class="pg-btn'+(i===pageNo?' cur':'')+'" data-pg="'+i+'">'+i+'</button>';
+  }
+  if(hasMore){
+    html+='<button class="pg-btn" data-pg="next" title="\\u4E0B\\u4E00\\u9875">&#x203A;</button>';
+  }
+  html+='</div></div>';
+  p.innerHTML=html;
+  bindPerPageSel();
+  p.onclick=function(e){
+    var b=e.target.closest('.pg-btn');
+    if(!b){return;}
+    var v=b.getAttribute('data-pg');
+    if(v==='prev'){if(pageNo>1){loadPage(pageNo-1);window.scrollTo(0,0);}}
+    else if(v==='next'){if(hasMore){loadPage(pageNo+1);window.scrollTo(0,0);}}
+    else{var n=parseInt(v,10);if(n>=1&&n<=maxLoadedPage){loadPage(n);window.scrollTo(0,0);}}
+  };
+}
+// \\u6700\\u8FD1/\\u6536\\u85CF\\u5206\\u9875\\u5668\\uFF1A\\u672C\\u5730\\u6570\\u636E\\u6709\\u603B\\u6570\\uFF0Calist \\u98CE\\u683C\\u6570\\u5B57\\u5206\\u9875\\uFF081 / \\u5F53\\u524D\\u9644\\u8FD1 / \\u672B\\u9875 + \\u7701\\u7565\\u53F7\\uFF09
+function renderLocalPager(p){
+  var src=(page==='recent')?recents:favs;
+  var full=sortList(applyFilter(src.slice()));
+  var pages=Math.max(1,Math.ceil(full.length/perPage));
+  if(localPage>pages){localPage=pages;}
+  if(full.length<=perPage){p.innerHTML='';return;}
+  var html='<div class="pagerbar">'
+    +'<div class="pg-left">'+perPageSelHtml()+'</div>'
+    +'<div class="pg-nav">';
+  if(localPage>1){html+='<button class="pg-btn" data-pg="prev" title="\\u4E0A\\u4E00\\u9875">&#x2039;</button>';}
+  var shown=[];
+  for(var i=1;i<=pages;i++){
+    if(i===1||i===pages||Math.abs(i-localPage)<=1){shown.push(i);}
+  }
+  var last=0;
+  for(var j=0;j<shown.length;j++){
+    var pg=shown[j];
+    if(pg-last>1){html+='<span class="pg-dots">&#x2026;</span>';}
+    html+='<button class="pg-btn'+(pg===localPage?' cur':'')+'" data-pg="'+pg+'">'+pg+'</button>';
+    last=pg;
+  }
+  if(localPage<pages){html+='<button class="pg-btn" data-pg="next" title="\\u4E0B\\u4E00\\u9875">&#x203A;</button>';}
+  html+='</div></div>';
+  p.innerHTML=html;
+  bindPerPageSel();
+  p.onclick=function(e){
+    var b=e.target.closest('.pg-btn');
+    if(!b){return;}
+    var v=b.getAttribute('data-pg');
+    if(v==='prev'){if(localPage>1){localPage--;renderLocal();window.scrollTo(0,0);}}
+    else if(v==='next'){if(localPage<pages){localPage++;renderLocal();window.scrollTo(0,0);}}
+    else{var n=parseInt(v,10);if(n>=1&&n<=pages){localPage=n;renderLocal();window.scrollTo(0,0);}}
+  };
 }
 function showLightbox(key){
   if(!imgs.length){return;}
