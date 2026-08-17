@@ -386,7 +386,11 @@ async function handleBrowse(request, env) {
       });
     } catch (e) {
       console.error('browse list error:', e);
-      return new Response(JSON.stringify({ error: String(e && e.message || e).slice(0, 200) }), { status: 500 });
+      const msg = String((e && e.message) || e);
+      return new Response(msg.startsWith('{') ? msg : JSON.stringify({ error: msg.slice(0, 500) }), {
+        status: 500,
+        headers: { 'Content-Type': 'application/json; charset=utf-8' },
+      });
     }
   }
 
@@ -516,9 +520,14 @@ async function browseList(env, prefix, token) {
   });
   if (!res.ok) {
     const body = await res.text();
-    // 打印我们算出的 stringToSign，便于与 COS 返回的 StringToSign 对照排错
-    console.error('browseList stringToSign:', stringToSign.replace(/\n/g, ' | '));
-    throw new Error(`list failed ${res.status}: ${body}`);
+    const cos = body.match(/<StringToSign>([\s\S]*?)<\/StringToSign>/);
+    // 把两边 StringToSign 都返回，方便直接对照（第4行=canonical request 哈希）
+    throw new Error(JSON.stringify({
+      error: `list failed ${res.status} (SignatureDoesNotMatch)` + (cos ? '' : ': ' + body.slice(0, 300)),
+      ourSTS: stringToSign,
+      cosSTS: cos ? cos[1] : '',
+      sentUrl: `https://${host}/?${qs}`,
+    }));
   }
   return parseListXml(await res.text());
 }
