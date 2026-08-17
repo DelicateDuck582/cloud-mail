@@ -945,6 +945,24 @@ async function browseFetchFile(env, key, ctx, method, range) {
 // 其余 HTML 实体，保证 served 页面纯 ASCII。手写模板时不要引入反引号
 // 与 ${}（页面内声明的插值除外），也不要在内联 JS 里写反斜杠正则。
 // =====================================================================
+
+// =====================================================================
+// 【文件浏览器】/browse —— Alist 风格个人只读网盘页面（登录页 + 主界面）
+// ---------------------------------------------------------------------
+// 参照 Alist 前端（AlistGo/alist-web，SolidJS + HopeUI）的设计语言重制：
+//   - 主色 #1890ff（getMainColor 默认值），页面背景 #f7f8fa，hover 底色
+//     rgba(132,133,141,0.18)，内容容器 min(99%, 980px)，字体栈与 Alist 一致；
+//   - 文件列表放在白色圆角卡片内（Obj 卡片风格，rounded 12px + 阴影）；
+//   - 网格卡片悬停 scale(1.05) + hover 底色，图标为主色单色 SVG；
+//   - 列表三列（名称 / 大小 / 修改时间），移动端隐藏修改时间列；
+//   - 文件大小格式同 Alist getFileSize（1.02K / 1.00M / 2.00G），
+//     时间格式 YYYY-MM-DD HH:MM:SS。
+// 实现方式：本文件由 _parts/ 分块拼接（_build-pages.mjs），再由
+// _build-browse.mjs 合并进 cos-proxy-worker.js（原附件代理/签名/浏览后端
+// 逻辑保持逐字节不变）。中文/emoji 由构建器转成 <script> 内 \uXXXX、
+// 其余 HTML 实体，保证 served 页面纯 ASCII。手写模板时不要引入反引号
+// 与 ${}（页面内声明的插值除外），也不要在内联 JS 里写反斜杠正则。
+// =====================================================================
 function browseLoginHtml(env) {
   const sitekey = (env && env.TURNSTILE_SITEKEY) || '';
   const tsScript = sitekey ? '<script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>' : '';
@@ -1133,6 +1151,11 @@ select{height:32px;border:1px solid var(--line);border-radius:8px;background:var
 .pg-btn.cur{background:var(--primary);border-color:var(--primary);color:#fff;font-weight:600}
 .pg-dots{color:var(--muted);padding:0 2px;user-select:none}
 #perPageSel{height:30px;border:1px solid var(--line);border-radius:8px;background:var(--card);color:var(--text);font-size:13px;padding:0 6px;outline:none;cursor:pointer}
+.pg-goto{display:inline-flex;align-items:center;gap:4px;color:var(--muted);font-size:13px;margin-left:6px;white-space:nowrap}
+.pg-goto input{width:52px;height:30px;border:1px solid var(--line);border-radius:8px;background:var(--card);color:var(--text);font-size:13px;text-align:center;outline:none;padding:0 4px;-moz-appearance:textfield}
+.pg-goto input::-webkit-outer-spin-button,.pg-goto input::-webkit-inner-spin-button{-webkit-appearance:none;margin:0}
+.pg-goto input:focus{border-color:var(--primary)}
+.pg-goto .pg-btn{min-width:auto;padding:0 10px}
 .footer{text-align:center;font-size:12px;color:var(--muted);padding:20px 0 6px}
 #lightbox{position:fixed;inset:0;background:rgba(0,0,0,.94);z-index:120;display:none;flex-direction:column}
 #lightbox.show{display:flex}
@@ -1626,9 +1649,15 @@ function renderPager(){
   if(hasMore){
     html+='<button class="pg-btn" data-pg="next" title="\\u4E0B\\u4E00\\u9875">&#x203A;</button>';
   }
+  // \\u8DF3\\u9875\\u8F93\\u5165\\u6846\\uFF1ACOS \\u65E0\\u603B\\u9875\\u6570\\uFF0C\\u9650\\u5236\\u5728\\u300C\\u5DF2\\u52A0\\u8F7D\\u9875\\u8303\\u56F4\\u300D\\u5185\\uFF081~maxLoadedPage\\uFF09\\uFF0C
+  // \\u8D85\\u51FA\\u63D0\\u793A\\uFF0C\\u907F\\u514D\\u8F93\\u5165\\u8FDC\\u8DDD\\u79BB\\u9875\\u53F7\\u65F6\\u65E0\\u9650\\u987A\\u5E8F\\u8BF7\\u6C42\\u89E6\\u53D1\\u9650\\u6D41
+  html+='<span class="pg-goto">\\u8DF3\\u81F3<input id="pgInput" type="number" min="1" max="'+maxLoadedPage+'" inputmode="numeric" value="'+pageNo+'" title="\\u5DF2\\u52A0\\u8F7D '+maxLoadedPage+' \\u9875"><button class="pg-btn" id="pgGo" type="button">GO</button></span>';
   html+='</div></div>';
   p.innerHTML=html;
   bindPerPageSel();
+  var gi=$('pgInput'),gb=$('pgGo');
+  if(gi){gi.addEventListener('keydown',function(e){if(e.key==='Enter'){goToFilePage(parseInt(gi.value,10));}});}
+  if(gb){gb.onclick=function(){goToFilePage(parseInt(gi.value,10));};}
   p.onclick=function(e){
     var b=e.target.closest('.pg-btn');
     if(!b){return;}
@@ -1637,6 +1666,14 @@ function renderPager(){
     else if(v==='next'){if(hasMore){loadPage(pageNo+1);window.scrollTo(0,0);}}
     else{var n=parseInt(v,10);if(n>=1&&n<=maxLoadedPage){loadPage(n);window.scrollTo(0,0);}}
   };
+}
+// \\u6587\\u4EF6\\u5217\\u8868\\u8DF3\\u9875\\uFF1A\\u53EA\\u5141\\u8BB8 1~maxLoadedPage\\uFF08COS \\u65E0\\u603B\\u6570\\uFF0C\\u672A\\u8BBF\\u95EE\\u9875\\u9700\\u987A\\u5E8F\\u7FFB\\uFF0C\\u9632\\u9650\\u6D41\\uFF09
+function goToFilePage(n){
+  if(!Number.isFinite(n)||n<1){toast('\\u8BF7\\u8F93\\u5165\\u6709\\u6548\\u9875\\u7801');return;}
+  n=Math.floor(n);
+  if(n>maxLoadedPage){toast('\\u5DF2\\u52A0\\u8F7D\\u5230\\u7B2C '+maxLoadedPage+' \\u9875\\uFF0C\\u8D85\\u51FA\\u8303\\u56F4');return;}
+  loadPage(n);
+  window.scrollTo(0,0);
 }
 // \\u6700\\u8FD1/\\u6536\\u85CF\\u5206\\u9875\\u5668\\uFF1A\\u672C\\u5730\\u6570\\u636E\\u6709\\u603B\\u6570\\uFF0Calist \\u98CE\\u683C\\u6570\\u5B57\\u5206\\u9875\\uFF081 / \\u5F53\\u524D\\u9644\\u8FD1 / \\u672B\\u9875 + \\u7701\\u7565\\u53F7\\uFF09
 function renderLocalPager(p){
@@ -1661,9 +1698,14 @@ function renderLocalPager(p){
     last=pg;
   }
   if(localPage<pages){html+='<button class="pg-btn" data-pg="next" title="\\u4E0B\\u4E00\\u9875">&#x203A;</button>';}
+  // \\u8DF3\\u9875\\u8F93\\u5165\\u6846\\uFF1A\\u672C\\u5730\\u9875\\u6709\\u603B\\u6570\\uFF0C\\u4EFB\\u610F 1~pages \\u8DF3\\u8F6C\\uFF0C\\u8D85\\u51FA\\u81EA\\u52A8\\u5C01\\u9876
+  html+='<span class="pg-goto">\\u8DF3\\u81F3<input id="pgInput" type="number" min="1" max="'+pages+'" inputmode="numeric" value="'+localPage+'" title="\\u5171 '+pages+' \\u9875"><button class="pg-btn" id="pgGo" type="button">GO</button></span>';
   html+='</div></div>';
   p.innerHTML=html;
   bindPerPageSel();
+  var gi=$('pgInput'),gb=$('pgGo');
+  if(gi){gi.addEventListener('keydown',function(e){if(e.key==='Enter'){goToLocalPage(parseInt(gi.value,10));}});}
+  if(gb){gb.onclick=function(){goToLocalPage(parseInt(gi.value,10));};}
   p.onclick=function(e){
     var b=e.target.closest('.pg-btn');
     if(!b){return;}
@@ -1672,6 +1714,18 @@ function renderLocalPager(p){
     else if(v==='next'){if(localPage<pages){localPage++;renderLocal();window.scrollTo(0,0);}}
     else{var n=parseInt(v,10);if(n>=1&&n<=pages){localPage=n;renderLocal();window.scrollTo(0,0);}}
   };
+}
+// \\u672C\\u5730\\u9875\\u8DF3\\u9875\\uFF1A1~\\u603B\\u9875\\u6570\\uFF0C\\u8D85\\u51FA\\u81EA\\u52A8\\u5C01\\u9876
+function goToLocalPage(n){
+  var src=(page==='recent')?recents:favs;
+  var total=Math.max(1,Math.ceil(sortList(applyFilter(src.slice())).length/perPage));
+  if(!Number.isFinite(n)){toast('\\u8BF7\\u8F93\\u5165\\u6709\\u6548\\u9875\\u7801');return;}
+  n=Math.floor(n);
+  if(n<1){n=1;}
+  if(n>total){n=total;}
+  localPage=n;
+  renderLocal();
+  window.scrollTo(0,0);
 }
 function showLightbox(key){
   if(!imgs.length){return;}
