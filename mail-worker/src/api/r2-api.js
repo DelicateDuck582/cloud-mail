@@ -6,7 +6,8 @@ import { t } from '../i18n/i18n';
 
 // 附件直读端点：必须携带有效签名（与代理 Worker 相同算法），防止绕过签名防伪系统
 app.get('/oss/*', async (c) => {
-	const key = decodeURIComponent((c.req.path.split('/oss/')[1] || '').split('?')[0]);
+	let key = '';
+	try { key = decodeURIComponent((c.req.path.split('/oss/')[1] || '').split('?')[0]); } catch (e) { key = ''; }
 	const { expires, sign } = c.req.query();
 
 	if (!key || !expires || !sign) {

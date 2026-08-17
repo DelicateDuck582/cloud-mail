@@ -23,7 +23,8 @@ export default {
 
 			// 附件直读必须携带有效签名，防止绕过签名防伪系统（/static/ 静态资源除外）
 			if (url.pathname.startsWith('/attachments/')) {
-				const key = decodeURIComponent(url.pathname.substring(1));
+				let key = '';
+				try { key = decodeURIComponent(url.pathname.substring(1)); } catch (e) { key = ''; }
 				const expires = url.searchParams.get('expires');
 				const sign = url.searchParams.get('sign');
 				const secret = (env?.ATT_SIGN_SECRET || '').trim();
