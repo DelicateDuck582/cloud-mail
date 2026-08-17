@@ -493,7 +493,9 @@ async function browseList(env, prefix, token) {
   const now = new Date();
   const amzDate = now.toISOString().replace(/[:-]|\.\d{3}/g, '');
   const dateStamp = amzDate.slice(0, 8);
-  const payloadHash = 'UNSIGNED-PAYLOAD';
+  // 与 AWS SDK 一致：GET 无 body，payload hash 用空串的真实 SHA256（e3b0c442…），
+  // 而不是 UNSIGNED-PAYLOAD。COS 对 ListObjectsV2 可能不接受 UNSIGNED-PAYLOAD。
+  const payloadHash = await sha256Hex('');
 
   const canonicalHeaders = `host:${host}\nx-amz-content-sha256:${payloadHash}\nx-amz-date:${amzDate}\n`;
   const signedHeadersStr = 'host;x-amz-content-sha256;x-amz-date';
@@ -513,7 +515,10 @@ async function browseList(env, prefix, token) {
     signal: AbortSignal.timeout(10000),
   });
   if (!res.ok) {
-    throw new Error(`list failed ${res.status}: ${await res.text()}`);
+    const body = await res.text();
+    // 打印我们算出的 stringToSign，便于与 COS 返回的 StringToSign 对照排错
+    console.error('browseList stringToSign:', stringToSign.replace(/\n/g, ' | '));
+    throw new Error(`list failed ${res.status}: ${body}`);
   }
   return parseListXml(await res.text());
 }
