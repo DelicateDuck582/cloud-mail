@@ -376,6 +376,18 @@ async function handleBrowse(request, env, ctx) {
   if (request.method === 'POST' && url.pathname === '/browse/login') {
     return await browseLogin(request, env);
   }
+  // 退出登录：browse_pwd 是 HttpOnly cookie，前端 JS 的 document.cookie 无法删除它，
+  // 必须由服务端 Set-Cookie 清除（服务端可以删 HttpOnly）。放在密码门控之前，
+  // 保证已登录用户一定能退出；未登录访问也无害（只是删一个不存在的 cookie）。
+  if (url.pathname === '/browse/logout') {
+    return new Response('', {
+      status: 302,
+      headers: {
+        Location: '/browse',
+        'Set-Cookie': 'browse_pwd=; Path=/; Max-Age=0; SameSite=Lax; HttpOnly; Secure',
+      },
+    });
+  }
   if (request.method !== 'GET' && request.method !== 'HEAD') {
     return new Response('Method Not Allowed', { status: 405 });
   }
@@ -841,6 +853,24 @@ async function browseFetchFile(env, key, ctx, method, range) {
 // 其余 HTML 实体，保证 served 页面纯 ASCII。手写模板时不要引入反引号
 // 与 ${}（页面内声明的插值除外），也不要在内联 JS 里写反斜杠正则。
 // =====================================================================
+
+// =====================================================================
+// 【文件浏览器】/browse —— Alist 风格个人只读网盘页面（登录页 + 主界面）
+// ---------------------------------------------------------------------
+// 参照 Alist 前端（AlistGo/alist-web，SolidJS + HopeUI）的设计语言重制：
+//   - 主色 #1890ff（getMainColor 默认值），页面背景 #f7f8fa，hover 底色
+//     rgba(132,133,141,0.18)，内容容器 min(99%, 980px)，字体栈与 Alist 一致；
+//   - 文件列表放在白色圆角卡片内（Obj 卡片风格，rounded 12px + 阴影）；
+//   - 网格卡片悬停 scale(1.05) + hover 底色，图标为主色单色 SVG；
+//   - 列表三列（名称 / 大小 / 修改时间），移动端隐藏修改时间列；
+//   - 文件大小格式同 Alist getFileSize（1.02K / 1.00M / 2.00G），
+//     时间格式 YYYY-MM-DD HH:MM:SS。
+// 实现方式：本文件由 _parts/ 分块拼接（_build-pages.mjs），再由
+// _build-browse.mjs 合并进 cos-proxy-worker.js（原附件代理/签名/浏览后端
+// 逻辑保持逐字节不变）。中文/emoji 由构建器转成 <script> 内 \uXXXX、
+// 其余 HTML 实体，保证 served 页面纯 ASCII。手写模板时不要引入反引号
+// 与 ${}（页面内声明的插值除外），也不要在内联 JS 里写反斜杠正则。
+// =====================================================================
 function browseLoginHtml(env) {
   const sitekey = (env && env.TURNSTILE_SITEKEY) || '';
   const tsScript = sitekey ? '<script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>' : '';
@@ -1100,7 +1130,9 @@ select{height:32px;border:1px solid var(--line);border-radius:8px;background:var
       <svg id="viewIc" viewBox="0 0 24 24" fill="currentColor"><path d="M3 14h4v-4H3v4zm0 5h4v-4H3v4zM3 9h4V5H3v4zm5 5h13v-4H8v4zm0 5h13v-4H8v4zM8 5v4h13V5H8z"/></svg>
     </button>
     <button class="iconbtn" id="themeBtn" title="&#x4E3B;&#x9898;">&#x1F319;</button>
-    <button class="iconbtn" id="logoutBtn" title="&#x9000;&#x51FA;">&#x23FB;</button>
+    <button class="iconbtn" id="logoutBtn" title="&#x9000;&#x51FA;">
+      <svg viewBox="0 0 24 24" fill="currentColor"><path d="M10.09 15.59L11.5 17l5-5-5-5-1.41 1.41L12.67 11H3v2h9.67l-2.58 2.59zM19 3H5c-1.11 0-2 .9-2 2v4h2V5h14v14H5v-4H3v4c0 1.1.89 2 2 2h14c1.1 0 2-.9 2-2V5c0-1.1-.9-2-2-2z"/></svg>
+    </button>
   </div>
 </header>
 <div class="layout">
@@ -1659,8 +1691,8 @@ $('themeBtn').onclick=function(){
   $('themeBtn').innerHTML=document.body.classList.contains('dark')?'&#x2600;&#xFE0F;':'&#x1F319;';
 };
 $('logoutBtn').onclick=function(){
-  document.cookie='browse_pwd=;Path=/;Max-Age=0;';
-  window.location.href='/browse';
+  // HttpOnly cookie \\u524D\\u7AEF JS \\u5220\\u4E0D\\u6389\\uFF0C\\u8D70\\u670D\\u52A1\\u7AEF /browse/logout\\uFF08Set-Cookie \\u6E05\\u9664\\u540E\\u518D\\u8DF3\\u8F6C\\uFF09
+  window.location.href='/browse/logout';
 };
 $('upBtn').onclick=function(){if(page==='home'){up();}};
 $('sort').addEventListener('change',function(){sortVal=this.value;render();});
