@@ -413,8 +413,9 @@ async function handleBrowse(request, env, ctx) {
       return new Response('Too Many Requests', { status: 429, headers: { 'Retry-After': '60' } });
     }
     try {
-      const prefix = url.searchParams.get('prefix') || '';
-      const token = url.searchParams.get('token') || '';
+      // prefix/token 限制长度：防超长参数滥用（COS 对超长 prefix 会 400，限流兜底）
+      const prefix = (url.searchParams.get('prefix') || '').slice(0, 1024);
+      const token = (url.searchParams.get('token') || '').slice(0, 2048);
       // per_page：每页条数（前端 30/60/100），限制 1~200，非法值回退 100
       let perPage = parseInt(url.searchParams.get('per_page') || '', 10);
       if (!Number.isFinite(perPage) || perPage < 1) perPage = 100;
@@ -424,9 +425,16 @@ async function handleBrowse(request, env, ctx) {
         headers: { 'Content-Type': 'application/json; charset=utf-8', 'X-Content-Type-Options': 'nosniff' },
       });
     } catch (e) {
+      // 只把 error 字段回给前端：browseList 的 throw 里带 ourSTS/cosSTS/sentUrl 等排错字段，
+      // 原样返回会泄露 COS 桶域名与签名中间值；调试细节只在服务端日志
       console.error('browse list error:', e);
       const msg = String((e && e.message) || e);
-      return new Response(msg.startsWith('{') ? msg : JSON.stringify({ error: msg.slice(0, 500) }), {
+      let errMsg = msg;
+      try {
+        const parsed = JSON.parse(msg);
+        if (parsed && parsed.error) errMsg = parsed.error;
+      } catch (e2) {}
+      return new Response(JSON.stringify({ error: errMsg.slice(0, 500) }), {
         status: 500,
         headers: { 'Content-Type': 'application/json; charset=utf-8' },
       });
@@ -439,7 +447,9 @@ async function handleBrowse(request, env, ctx) {
       return new Response('Too Many Requests', { status: 429, headers: { 'Retry-After': '60' } });
     }
     const key = url.searchParams.get('key') || '';
-    if (!key || key.startsWith('/') || key.includes('../')) {
+    // 路径穿越拦截：绝对路径(/开头) / 反斜杠 / ../
+    // （对象存储无目录上溯，但拦截这些字符可避免奇怪的 key 与回源 URL 歧义）
+    if (!key || key.startsWith('/') || key.includes('\\') || key.includes('../')) {
       return new Response('bad key', { status: 400 });
     }
     try {
@@ -801,6 +811,42 @@ async function browseFetchFile(env, key, ctx, method, range) {
 //     也不要在内联 JS 里写反斜杠正则（如 \d）。
 // =====================================================================
 
+
+// =====================================================================
+// 【文件浏览器】/browse —— Alist 风格个人只读网盘页面（登录页 + 主界面）
+// ---------------------------------------------------------------------
+// 参照 Alist 前端（AlistGo/alist-web，SolidJS + HopeUI）的设计语言重制：
+//   - 主色 #1890ff（getMainColor 默认值），页面背景 #f7f8fa，hover 底色
+//     rgba(132,133,141,0.18)，内容容器 min(99%, 980px)，字体栈与 Alist 一致；
+//   - 文件列表放在白色圆角卡片内（Obj 卡片风格，rounded 12px + 阴影）；
+//   - 网格卡片悬停 scale(1.05) + hover 底色，图标为主色单色 SVG；
+//   - 列表三列（名称 / 大小 / 修改时间），移动端隐藏修改时间列；
+//   - 文件大小格式同 Alist getFileSize（1.02K / 1.00M / 2.00G），
+//     时间格式 YYYY-MM-DD HH:MM:SS。
+// 实现方式：本文件由 _parts/ 分块拼接（_build-pages.mjs），再由
+// _build-browse.mjs 合并进 cos-proxy-worker.js（原附件代理/签名/浏览后端
+// 逻辑保持逐字节不变）。中文/emoji 由构建器转成 <script> 内 \uXXXX、
+// 其余 HTML 实体，保证 served 页面纯 ASCII。手写模板时不要引入反引号
+// 与 ${}（页面内声明的插值除外），也不要在内联 JS 里写反斜杠正则。
+// =====================================================================
+
+// =====================================================================
+// 【文件浏览器】/browse —— Alist 风格个人只读网盘页面（登录页 + 主界面）
+// ---------------------------------------------------------------------
+// 参照 Alist 前端（AlistGo/alist-web，SolidJS + HopeUI）的设计语言重制：
+//   - 主色 #1890ff（getMainColor 默认值），页面背景 #f7f8fa，hover 底色
+//     rgba(132,133,141,0.18)，内容容器 min(99%, 980px)，字体栈与 Alist 一致；
+//   - 文件列表放在白色圆角卡片内（Obj 卡片风格，rounded 12px + 阴影）；
+//   - 网格卡片悬停 scale(1.05) + hover 底色，图标为主色单色 SVG；
+//   - 列表三列（名称 / 大小 / 修改时间），移动端隐藏修改时间列；
+//   - 文件大小格式同 Alist getFileSize（1.02K / 1.00M / 2.00G），
+//     时间格式 YYYY-MM-DD HH:MM:SS。
+// 实现方式：本文件由 _parts/ 分块拼接（_build-pages.mjs），再由
+// _build-browse.mjs 合并进 cos-proxy-worker.js（原附件代理/签名/浏览后端
+// 逻辑保持逐字节不变）。中文/emoji 由构建器转成 <script> 内 \uXXXX、
+// 其余 HTML 实体，保证 served 页面纯 ASCII。手写模板时不要引入反引号
+// 与 ${}（页面内声明的插值除外），也不要在内联 JS 里写反斜杠正则。
+// =====================================================================
 
 // =====================================================================
 // 【文件浏览器】/browse —— Alist 风格个人只读网盘页面（登录页 + 主界面）
