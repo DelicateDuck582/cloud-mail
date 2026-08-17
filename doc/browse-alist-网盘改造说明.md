@@ -70,7 +70,7 @@
 | `ATT_SIGN_SECRET` | 附件签名密钥（与 mail-worker 一致） | ✅ |
 | `S3_ENDPOINT` | COS 桶默认访问域名（`https://<BUCKET>.cos.<REGION>.myqcloud.com`）。⚠️ **真实桶地址/密钥属于敏感配置，不要提交到公开仓库**，只在 CF 环境变量里配置 | ✅ |
 | `REGION` | COS 桶所在地域（如 `ap-guangzhou`，按桶实际所在地配置） | ✅ |
-| `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` | `cos-worker-readonly` 只读子账号（GetObject + GetBucket）。⚠️ **SecretKey 绝不可出现在任何文档** | ✅ |
+| `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` | COS **只读子账号**（权限仅 GetObject + GetBucket，与上传子账号隔离）。⚠️ **SecretId/SecretKey 绝不可出现在任何文档** | ✅ |
 | `BROWSE_PASS` | 网盘访问密码。⚠️ **绝不可提交到公开仓库** | ✅ |
 | `ATT_SIGN_MAX_TTL` | 可选，默认 3600（非法值自动回退默认） | 否 |
 | `BROWSE_ALLOW_COUNTRY` | 可选，如 `CN` | 否 |
