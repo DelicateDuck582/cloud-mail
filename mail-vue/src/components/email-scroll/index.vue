@@ -884,6 +884,7 @@ function handleList(list) {
       4: { icon: 'bi:send-exclamation-fill', color: '#FBBD08', content: t('complained') },
       5: { icon: 'bi:send-arrow-up-fill',  color: '#FBBD08', content: t('delayed') },
       7: { icon: 'ic:round-mark-email-read', color: '#FBBD08', content: t('noRecipient') },
+      9: { icon: 'bi:eye-fill',            color: '#51C76B', content: t('opened') },
     };
 
     if (email.isDel) {

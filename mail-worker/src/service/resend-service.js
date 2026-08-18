@@ -1,41 +1,56 @@
 import emailService from './email-service';
 import { emailConst } from '../const/entity-const';
 import BizError from '../error/biz-error';
+import orm from '../entity/orm';
+import email from '../entity/email';
+import { eq } from 'drizzle-orm';
 
 const resendService = {
 
 	async webhooks(c, body) {
 
-		const params = {
-			resendEmailId: body.data.email_id,
-			status: emailConst.status.SENT
+		// 状态事件映射：只有这里列出的事件才会更新邮件状态
+		const statusMap = {
+			'email.delivered': emailConst.status.DELIVERED,
+			'email.complained': emailConst.status.COMPLAINED,
+			'email.bounced': emailConst.status.BOUNCED,
+			'email.delivery_delayed': emailConst.status.DELAYED,
+			'email.failed': emailConst.status.FAILED,
+			'email.opened': emailConst.status.OPENED,	// 已读回执（Resend 打开追踪）
+			'email.clicked': emailConst.status.OPENED,	// 点击链接同样视为已读
 		}
 
-		if (body.type === 'email.delivered') {
-			params.status = emailConst.status.DELIVERED
-			params.message = null
+		const status = statusMap[body.type];
+
+		// 未处理的事件（如 email.received、email.sent 等）直接忽略，不碰邮件状态
+		if (status === undefined) {
+			return;
 		}
 
-		if (body.type === 'email.complained') {
-			params.status = emailConst.status.COMPLAINED
-			params.message = null
-		}
-
+		let message = null;
 		if (body.type === 'email.bounced') {
-			let bounce = body.data.bounce
-			bounce = JSON.stringify(bounce);
-			params.status = emailConst.status.BOUNCED
-			params.message = bounce
-		}
-
-		if (body.type === 'email.delivery_delayed') {
-			params.status = emailConst.status.DELAYED
-			params.message = null
+			message = JSON.stringify(body.data.bounce);
 		}
 
 		if (body.type === 'email.failed') {
-			params.status = emailConst.status.FAILED
-			params.message = body.data.failed.reason
+			message = body.data.failed?.reason;
+		}
+
+		const params = {
+			resendEmailId: body.data.email_id,
+			status,
+			message
+		}
+
+		// 状态只允许升级（例如已读 9 后，迟到的 delivered 2 不得把状态回退）
+		const currentRow = await orm(c).select({ status: email.status }).from(email).where(eq(email.resendEmailId, params.resendEmailId)).get();
+
+		if (!currentRow) {
+			throw new BizError('更新邮件状态记录失败');
+		}
+
+		if (Number(currentRow.status) >= Number(params.status)) {
+			return;
 		}
 
 		const emailRow = await emailService.updateEmailStatus(c, params)

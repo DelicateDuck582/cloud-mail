@@ -49,7 +49,8 @@ export const emailConst = {
 		DELAYED: 5,
 		SAVING: 6,
 		NOONE: 7,
-		FAILED: 8
+		FAILED: 8,
+		OPENED: 9
 	},
 	unread: {
 		UNREAD: 0,
