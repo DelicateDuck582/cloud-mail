@@ -146,9 +146,22 @@ const emailService = {
 			return;
 		}
 		const emailIdList = emailIds.split(',').map(Number);
-		const now = dayjs().format('YYYY-MM-DD HH:mm:ss');
+		const { syncDelete } = await settingService.query(c);
+
+		// 上游 v3.1.0：开启「同步删除」时，删除 = 直接物理删除（服务器/本地同步清理）
+		if (syncDelete === settingConst.syncDelete.OPEN) {
+			const owned = await orm(c).select({ emailId: email.emailId }).from(email)
+				.where(and(eq(email.userId, userId), inArray(email.emailId, emailIdList)))
+				.all();
+			const ownedIds = owned.map(row => row.emailId);
+			if (ownedIds.length) {
+				await this.physicsDelete(c, { emailIds: ownedIds.join(',') });
+			}
+			return;
+		}
 
 		// 邮件软删除：进垃圾桶（trash=1，记录删除时间），与附件垃圾桶机制一致（7 天后自动清理）
+		const now = dayjs().format('YYYY-MM-DD HH:mm:ss');
 		await orm(c).update(email).set({ trash: 1, trashTime: now }).where(
 			and(
 				eq(email.userId, userId),

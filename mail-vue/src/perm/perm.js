@@ -86,7 +86,7 @@ const routers = {
         }
     }],
     'setting:query': [{
-        path: '/system-setting',
+        path: '/system-settings',
         name: 'sys-setting',
         component: () => import('@/views/sys-setting/index.vue'),
         meta: {

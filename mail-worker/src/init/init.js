@@ -40,6 +40,7 @@ const dbInit = {
 		await this.v3_6DB(c);
 		await this.v3_7DB(c);
 		await this.v3_8DB(c);
+		await this.v3_9DB(c);
 		await settingService.refresh(c);
 		return c.text('success');
 	},
@@ -120,6 +121,15 @@ const dbInit = {
 	async v3_1DB(c) {
 		try {
 			await c.env.db.prepare(`ALTER TABLE user ADD COLUMN html_signature TEXT NOT NULL DEFAULT '';`).run();
+		} catch (e) {
+			console.warn(`跳过字段：${e.message}`);
+		}
+	},
+
+	// 上游 v3.1.0：setting 表新增 sync_delete 列（同步删除开关）
+	async v3_9DB(c) {
+		try {
+			await c.env.db.prepare(`ALTER TABLE setting ADD COLUMN sync_delete INTEGER NOT NULL DEFAULT 0;`).run();
 		} catch (e) {
 			console.warn(`跳过字段：${e.message}`);
 		}
