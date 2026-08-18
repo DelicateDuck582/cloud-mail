@@ -41,6 +41,7 @@ const dbInit = {
 		await this.v3_7DB(c);
 		await this.v3_8DB(c);
 		await this.v3_9DB(c);
+		await this.v4_0DB(c);
 		await settingService.refresh(c);
 		return c.text('success');
 	},
@@ -127,11 +128,31 @@ const dbInit = {
 	},
 
 	// 上游 v3.1.0：setting 表新增 sync_delete 列（同步删除开关）
+	// 注意默认值用 1（CLOSE）：与实体 syncDelete.default(1) 保持一致，避免迁移后
+	// 默认开启同步删除而绕过 fork 的垃圾桶机制（删除=物理删除）
 	async v3_9DB(c) {
 		try {
-			await c.env.db.prepare(`ALTER TABLE setting ADD COLUMN sync_delete INTEGER NOT NULL DEFAULT 0;`).run();
+			await c.env.db.prepare(`ALTER TABLE setting ADD COLUMN sync_delete INTEGER NOT NULL DEFAULT 1;`).run();
 		} catch (e) {
 			console.warn(`跳过字段：${e.message}`);
+		}
+	},
+
+	// 性能：高频查询补索引（幂等）
+	//   email(resend_email_id) —— Resend webhook 状态回写（delivered/bounced/opened）按此列查找
+	//   att(email_id)          —— 附件列表/删除/垃圾桶关联
+	//   att(key)               —— 附件引用计数/去重/批量删除
+	//   star(user_id,email_id) —— 收藏列表分页
+	async v4_0DB(c) {
+		try {
+			await c.env.db.batch([
+				c.env.db.prepare(`CREATE INDEX IF NOT EXISTS idx_email_resend_email_id ON email(resend_email_id);`),
+				c.env.db.prepare(`CREATE INDEX IF NOT EXISTS idx_att_email_id ON att(email_id);`),
+				c.env.db.prepare(`CREATE INDEX IF NOT EXISTS idx_att_key ON att(key);`),
+				c.env.db.prepare(`CREATE INDEX IF NOT EXISTS idx_star_user_email ON star(user_id, email_id);`)
+			]);
+		} catch (e) {
+			console.warn(`跳过索引创建：${e.message}`);
 		}
 	},
 
