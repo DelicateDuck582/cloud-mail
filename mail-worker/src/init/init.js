@@ -5,10 +5,13 @@ import {emailConst} from "../const/entity-const";
 const dbInit = {
 	async init(c) {
 
-		const secret = c.req.param('secret');
+		// 安全：secret 校验由 /init 接口层完成（POST + 独立 INIT_SECRET，已限流）；
+		// 此处防御性再校验，避免直接调用本函数绕过接口层
+		const secret = c.get('initSecret');
+		const initSecret = c.env.INIT_SECRET;
 
-		if (secret !== c.env.jwt_secret) {
-			return c.text('❌ JWT secret mismatch');
+		if (!initSecret || secret !== initSecret) {
+			return c.text('❌ INIT_SECRET mismatch');
 		}
 
 		await this.intDB(c);
