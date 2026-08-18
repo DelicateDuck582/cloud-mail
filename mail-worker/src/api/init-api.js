@@ -29,7 +29,8 @@ app.post('/init', async (c) => {
 
 	const body = await c.req.json().catch(() => ({}));
 
-	if (body.secret !== c.env.INIT_SECRET) {
+	// 健壮性：比较时两端都 trim —— CF 控制台粘贴密钥常带尾随空格/换行，严格相等会误判 mismatch
+	if ((body.secret || '').trim() !== (c.env.INIT_SECRET || '').trim()) {
 		initRecord(ip);
 		return c.text('❌ INIT_SECRET mismatch', 403);
 	}

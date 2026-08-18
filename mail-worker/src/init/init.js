@@ -6,11 +6,11 @@ const dbInit = {
 	async init(c) {
 
 		// 安全：secret 校验由 /init 接口层完成（POST + 独立 INIT_SECRET，已限流）；
-		// 此处防御性再校验，避免直接调用本函数绕过接口层
+		// 此处防御性再校验，避免直接调用本函数绕过接口层（比较时两端 trim，兼容粘贴带空格）
 		const secret = c.get('initSecret');
 		const initSecret = c.env.INIT_SECRET;
 
-		if (!initSecret || secret !== initSecret) {
+		if (!initSecret || !secret || secret.trim() !== String(initSecret).trim()) {
 			return c.text('❌ INIT_SECRET mismatch');
 		}
 
