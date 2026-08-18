@@ -86,6 +86,11 @@
   - COS 用量遍历增加页数上限，错误响应不泄露内部信息
   - 附件直读代理 Worker（cos-exchange）修复含空格 / Unicode 文件名的签名校验，并对已签名请求放宽 Referer / Sec-Fetch 校验（兼容邮件客户端）
   - **邮件内容 XSS 防护**：邮件 HTML 在入库时用白名单清洗（linkedom）：移除 `script` / `iframe` / `object` / `embed` / `svg` / `math` / 表单控件、所有 `on*` 事件属性、`javascript:` / `vbscript:` / `data:text/html` 等危险 URL 与危险 CSS；前端渲染（ShadowHtml 详情、回复/转发注入、TG 预览页、签名预览）再做一次同规则清洗兜底旧数据
+- **📋 安全审计记录（2026-08-18 第三轮）**：
+  - **🔴 高危（已修复）**：Resend Webhook Svix 验签解析 bug —— 原实现 `sigHeader.split(' ').includes(sigB64)` 把 `"v1,<签名>"` 整体与裸签名比较，配置 `RESEND_SIGNING_SECRET` 后**所有 webhook 均 401**（送达/退信/已读回执等状态更新全部失效）；已修复为解析 `v1,` 前缀 + `.some()` 支持多签名 token（密钥轮换）+ **恒定时间比较**（`timingSafeEqual`，防时序侧信道）
+  - **📧 已读回执（新功能）**：webhook 支持 `email.opened` / `email.clicked` → 邮件状态标记「已读」（`OPENED=9`），前端已发送列表新增「已读 👁」图标；**未处理事件**（`email.received` / `email.sent` 等）直接忽略、不再误改状态；**状态只升不降**（已读 9 之后迟到的 delivered 2 不会回退覆盖）
+  - **✅ 复核确认安全**：CORS 白名单、`/init` 独立 INIT_SECRET + per-IP 限流、`/oss` + `/attachments` 附件直读 HMAC 签名、TG 预览 token 7 天 TTL + `Cache-Control: no-store`、public token 24h TTL 仅超管签发、登录防爆破（5 次/10 分钟 + 延迟）、`crypto.getRandomValues` 密码学随机、注册/加号 Turnstile + per-IP 验证记录、入站邮件 25MB/20 附件上限、发信前附件数量限制、发信限额/账号归属/域名权限校验、SQL 全参数化（drizzle / `prepare().bind()`）、全局错误脱敏、邮件 XSS 入库清洗 + 前端渲染兜底
+  - **⚠️ 部署要求**：**必须在 Cloudflare 环境变量配置 `RESEND_SIGNING_SECRET`**（= Resend Webhooks 的 Signing secret），否则 webhook 未验签、邮件状态可被伪造；**所有密钥类环境变量不要写入 `wrangler.toml` / 不要提交到 git**（本地开发用 `wrangler-dev.toml`，已被 gitignore）
 
 ## 技术栈
 

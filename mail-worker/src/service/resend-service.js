@@ -66,7 +66,7 @@ const resendService = {
 		const secret = c.env.RESEND_SIGNING_SECRET;
 
 		if (!secret) {
-			// 未配置签名密钥：记录警告并放行（强烈建议在 Resend 配置 signing secret 并设置该环境变量）
+			// 未配置签名密钥：记录警告并放行（⚠️ 强烈建议在 Resend 配置 signing secret 并设置该环境变量，否则 webhook 可被伪造）
 			console.warn('webhook: RESEND_SIGNING_SECRET 未配置，未校验签名');
 			return true;
 		}
@@ -92,8 +92,24 @@ const resendService = {
 		const sig = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(signedContent));
 		const sigB64 = btoa(String.fromCharCode(...new Uint8Array(sig)));
 
-		return sigHeader.split(' ').includes(sigB64);
+		// Svix 签名头格式："v1,<base64签名>"；密钥轮换时以空格分隔多个 token。
+		// 必须剥离 "v1," 前缀再与计算值比较（恒定时间比较，防时序侧信道）。
+		return sigHeader.split(' ').some(token => {
+			const [version, signature] = token.split(',');
+			if (version !== 'v1' || !signature) return false;
+			return timingSafeEqual(signature, sigB64);
+		});
 	},
+}
+
+// 恒定时间字符串比较（长度不一致立即失败，长度一致时逐字节异或）
+function timingSafeEqual(a, b) {
+	if (a.length !== b.length) return false;
+	let diff = 0;
+	for (let i = 0; i < a.length; i++) {
+		diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+	}
+	return diff === 0;
 }
 
 export default resendService
