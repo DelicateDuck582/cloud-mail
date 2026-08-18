@@ -38,12 +38,19 @@ export async function email(message, env, ctx) {
 			return;
 		}
 
+		const MAX_RAW_SIZE = 25 * 1024 * 1024; // 入站邮件原始大小上限 25MB，防超大邮件耗尽 Worker 内存
 		const reader = message.raw.getReader();
 		let content = '';
+		let rawSize = 0;
 
 		while (true) {
 			const { done, value } = await reader.read();
 			if (done) break;
+			rawSize += value.byteLength;
+			if (rawSize > MAX_RAW_SIZE) {
+				message.setReject('Message too large');
+				return;
+			}
 			content += new TextDecoder().decode(value);
 		}
 
@@ -118,10 +125,19 @@ export async function email(message, env, ctx) {
 		const attachments = [];
 		const cidAttachments = [];
 
+		const MAX_ATT_TOTAL = 25 * 1024 * 1024; // 附件总大小上限 25MB
+		const MAX_ATT_COUNT = 20;               // 附件数量上限，防入站附件盗刷存储/流量
+		let attTotalSize = 0;
 		for (let item of email.attachments) {
+			const attSize = item.content.byteLength || item.content.length || 0;
+			attTotalSize += attSize;
+			if (attTotalSize > MAX_ATT_TOTAL || attachments.length >= MAX_ATT_COUNT) {
+				message.setReject('Attachments too large');
+				return;
+			}
 			let attachment = { ...item };
 			attachment.key = constant.ATTACHMENT_PREFIX + await fileUtils.getBuffHash(attachment.content) + fileUtils.getExtFileName(item.filename);
-			attachment.size = item.content.length ?? item.content.byteLength;
+			attachment.size = attSize;
 			attachments.push(attachment);
 			if (attachment.contentId) {
 				cidAttachments.push(attachment);
