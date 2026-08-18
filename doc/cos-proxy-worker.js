@@ -181,7 +181,7 @@ export default {
         // TTL 设为 7 天，同文件最多每 7 天回源一次（文件被删除时最迟 7 天失效）
         // 只缓存 GET：HEAD 首次请求如果把空 body 写入缓存，会污染同路径的
         // GET 命中（Cache API 对 GET/HEAD 按同一 key 匹配）→ 附件下载/预览返回空内容
-        newHeaders.set('Cache-Control', 'public, max-age=604800');
+        newHeaders.set('Cache-Control', 'private, max-age=604800');
         const cacheResp = new Response(response.body, {
           status: response.status,
           statusText: response.statusText,
@@ -708,7 +708,7 @@ async function browseFetchFile(env, key, ctx) {
   // 非 200 时标记上游状态：X-Upstream-Status 存在 = 429 来自 COS；不存在 = 429 来自 CF（worker 前被拒）
   if (!final.ok) newHeaders.set('X-Upstream-Status', String(final.status));
   if (final.ok) {
-    newHeaders.set('Cache-Control', 'public, max-age=604800');
+    newHeaders.set('Cache-Control', 'private, max-age=604800');
     const cacheResp = new Response(final.body, { status: final.status, statusText: final.statusText, headers: newHeaders });
     ctx.waitUntil(caches.default.put(cacheKey, cacheResp.clone()));
     return cacheResp;

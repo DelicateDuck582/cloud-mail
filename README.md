@@ -91,6 +91,8 @@
   - **📧 已读回执（新功能）**：webhook 支持 `email.opened` / `email.clicked` → 邮件状态标记「已读」（`OPENED=9`），前端已发送列表新增「已读 👁」图标；**未处理事件**（`email.received` / `email.sent` 等）直接忽略、不再误改状态；**状态只升不降**（已读 9 之后迟到的 delivered 2 不会回退覆盖）
   - **✅ 复核确认安全**：CORS 白名单、`/init` 独立 INIT_SECRET + per-IP 限流、`/oss` + `/attachments` 附件直读 HMAC 签名、TG 预览 token 7 天 TTL + `Cache-Control: no-store`、public token 24h TTL 仅超管签发、登录防爆破（5 次/10 分钟 + 延迟）、`crypto.getRandomValues` 密码学随机、注册/加号 Turnstile + per-IP 验证记录、入站邮件 25MB/20 附件上限、发信前附件数量限制、发信限额/账号归属/域名权限校验、SQL 全参数化（drizzle / `prepare().bind()`）、全局错误脱敏、邮件 XSS 入库清洗 + 前端渲染兜底
   - **⚠️ 部署要求**：**必须在 Cloudflare 环境变量配置 `RESEND_SIGNING_SECRET`**（= Resend Webhooks 的 Signing secret），否则 webhook 未验签、邮件状态可被伪造；**所有密钥类环境变量不要写入 `wrangler.toml` / 不要提交到 git**（本地开发用 `wrangler-dev.toml`，已被 gitignore）
+  - **☁️ COS 专项审计（2026-08-18）**：附件直读三层防护复核通过（COS 私有桶 + HMAC 短期签名 + 代理 Worker 路径白名单）；修复**中风险**：`/attachments/*` 与 `/browse/api/file` 响应原带 `Cache-Control: public, max-age=604800`，会让 Cloudflare 边缘 HTTP 缓存按完整 URL（含 query）缓存 → 签名过期后 7 天内旧 URL 仍可**直接命中边缘缓存，绕过 Worker 验签 / 网盘密码**。已改为 `private`（仅浏览器缓存、禁用共享缓存），内部 Cache API 7 天缓存不受影响；另给 mail-worker `/oss/*` 直读加 **per-IP 限流（120 次/分）**，防已登录用户反复拉取自己附件刷 COS 下行流量。⚠️ 部署注意：COS 桶必须保持**私有读写**；`ATT_SIGN_SECRET` / `BROWSE_PASS` 不得泄露；旧版 `cos-browser-worker`（files.* 子域名）若未下线，请确认已设置 `BROWSE_PASS`
+
 
 ## 技术栈
 

@@ -4,6 +4,29 @@ import signUtils from '../utils/sign-utils';
 import BizError from '../error/biz-error';
 import { t } from '../i18n/i18n';
 
+// 附件直读限流（per-IP）：已登录用户可拿到自己附件的有效签名后反复请求，
+// 直读路径不走代理缓存，会直接产生 COS 下行流量 -> 用限流防盗刷
+const ossLimitMap = new Map();
+const OSS_LIMIT_PER_MIN = 120;
+function ossRateLimited(ip) {
+	const now = Date.now();
+	const rec = ossLimitMap.get(ip);
+	if (!rec || now - rec.t > 60000) {
+		ossLimitMap.set(ip, { c: 1, t: now });
+		return false;
+	}
+	rec.c++;
+	if (rec.c > OSS_LIMIT_PER_MIN) {
+		return true;
+	}
+	if (ossLimitMap.size > 10000) {
+		for (const [k, v] of ossLimitMap) {
+			if (now - v.t > 60000) ossLimitMap.delete(k);
+		}
+	}
+	return false;
+}
+
 // 附件直读端点：必须携带有效签名（与代理 Worker 相同算法），防止绕过签名防伪系统
 app.get('/oss/*', async (c) => {
 	let key = '';
@@ -28,6 +51,12 @@ app.get('/oss/*', async (c) => {
 	const expected = await signUtils.hmacHex(secret, `/${key}:${expires}`);
 	if (expected !== sign) {
 		throw new BizError(t('unauthorized'), 403);
+	}
+
+	// 验签通过后再限流（签名有效才算一次合法请求，避免无签名刷子占限流额度）
+	const ip = c.req.header('CF-Connecting-IP') || c.req.header('x-forwarded-for') || 'unknown';
+	if (ossRateLimited(ip)) {
+		throw new BizError('Too Many Requests', 429);
 	}
 
 	const obj = await r2Service.getObj(c, key);
