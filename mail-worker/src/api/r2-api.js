@@ -61,8 +61,12 @@ app.get('/oss/*', async (c) => {
 
 	const obj = await r2Service.getObj(c, key);
 
-	// 回退 KV 后，历史对象可能仍在 COS（故障前写入），KV 中不存在 → 404
+	// 回退 KV 后，历史对象可能仍在 COS（故障前写入），KV 中不存在 → 明确提示
 	if (!obj) {
+		const cosDown = await r2Service.isCosFallback(c);
+		if (cosDown) {
+			throw new BizError('文件暂时无法访问--COS错误', 503);
+		}
 		throw new BizError('Not Found', 404);
 	}
 

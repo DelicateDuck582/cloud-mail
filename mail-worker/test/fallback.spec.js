@@ -47,4 +47,24 @@ describe('r2Service COS 故障自动回退 KV', () => {
 	it('无 COS 配置 + 有 R2 → R2（原逻辑）', async () => {
 		expect(await r2Service.storageType(makeC(false, true))).toBe('R2');
 	});
+
+	it('COS 故障回退期间 isCosFallback = true', async () => {
+		r2Service.markS3Failed();
+		expect(await r2Service.isCosFallback(makeC(true))).toBe(true);
+	});
+
+	it('COS 恢复后 isCosFallback = false', async () => {
+		vi.useFakeTimers();
+		try {
+			r2Service.markS3Failed();
+			vi.setSystemTime(Date.now() + 5 * 60 * 1000 + 1000);
+			expect(await r2Service.isCosFallback(makeC(true))).toBe(false);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it('未配置 COS 时 isCosFallback = false', async () => {
+		expect(await r2Service.isCosFallback(makeC(false))).toBe(false);
+	});
 });

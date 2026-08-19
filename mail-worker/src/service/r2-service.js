@@ -20,6 +20,14 @@ const r2Service = {
 		console.warn(`[storage] COS(S3) 不可用或验证失败，${S3_FAIL_WINDOW_MS / 60000} 分钟内自动回退 KV 存储`);
 	},
 
+	// 当前是否处于 COS 故障自动回退状态（用于给历史 COS 附件返回明确提示「文件暂时无法访问--COS错误」）
+	async isCosFallback(c) {
+		const setting = await settingService.query(c);
+		const { bucket, endpoint, s3AccessKey, s3SecretKey } = setting;
+		const s3Configured = !!(bucket && endpoint && s3AccessKey && s3SecretKey);
+		return s3Configured && !this.isS3Healthy();
+	},
+
 	async storageType(c) {
 
 		const setting = await settingService.query(c);
