@@ -360,6 +360,55 @@ export { verifySignature, hmacSha256Hex, timingSafeEqual };
 //                                  复用上面的只读子账号（策略需含 GetObject + GetBucket）
 // 说明：/browse 是独立密码门控的个人浏览入口，不参与附件签名体系
 // =====================================================================
+// =====================================================================
+// COS 健康探测：COS 关闭/验证失败时，在登录界面/首页直接提示，
+// 避免用户输入密码后才在文件列表看到报错。
+// 带 30 秒缓存，避免每个页面请求都去打一次 COS。
+// =====================================================================
+let cosProbeCache = { at: 0, ok: true };
+const COS_PROBE_WINDOW = 30 * 1000;
+
+async function probeCosHealth(env) {
+  const now = Date.now();
+  if (now - cosProbeCache.at < COS_PROBE_WINDOW) return cosProbeCache.ok;
+  cosProbeCache.at = now;
+  try {
+    // 复用列表接口做一次最小探测（MaxKeys=1），签名逻辑与浏览列表完全一致
+    await browseList(env, '', '', 1);
+    cosProbeCache.ok = true;
+  } catch (e) {
+    cosProbeCache.ok = false;
+  }
+  return cosProbeCache.ok;
+}
+
+// COS 不可用提示页（纯 ASCII，中文用 HTML 实体）
+function cosDownHtml() {
+  return `<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>&#x670D;&#x52A1;&#x6682;&#x65F6;&#x4E0D;&#x53EF;&#x7528;</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body { min-height:100vh; display:flex; align-items:center; justify-content:center; background:#f7f8fa; font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,'PingFang SC','Microsoft YaHei',sans-serif; }
+  .box { text-align:center; padding:48px 32px; background:#fff; border-radius:12px; box-shadow:0 4px 20px rgba(0,0,0,.06); max-width:420px; }
+  .box .icon { font-size:48px; }
+  .box h1 { font-size:18px; color:#333; margin:16px 0 8px; font-weight:600; }
+  .box p { font-size:13px; color:#888; }
+</style>
+</head>
+<body>
+  <div class="box">
+    <div class="icon">&#x1F4E5;</div>
+    <h1>COS&#x5BF9;&#x8C61;&#x5B58;&#x50A8;&#x9519;&#x8BEF;&#xFF0C;&#x6682;&#x65F6;&#x5173;&#x95ED;&#x670D;&#x52A1;</h1>
+    <p>&#x8BF7;&#x7A0D;&#x540E;&#x518D;&#x8BD5;&#x6216;&#x8054;&#x7CFB;&#x7BA1;&#x7406;&#x5458;</p>
+  </div>
+</body>
+</html>`;
+}
+
 async function handleBrowse(request, env, ctx) {
   const url = new URL(request.url);
 
@@ -390,6 +439,18 @@ async function handleBrowse(request, env, ctx) {
   }
   if (request.method !== 'GET' && request.method !== 'HEAD') {
     return new Response('Method Not Allowed', { status: 405 });
+  }
+
+  // COS 健康探测：COS 关闭/错误时，登录界面与首页直接提示（30 秒缓存）
+  // 仅对页面请求探测；/browse/api/* 由列表/下载接口自身报错兜底
+  if (url.pathname === '/browse' || url.pathname === '/browse/') {
+    const cosOk = await probeCosHealth(env);
+    if (!cosOk) {
+      return new Response(cosDownHtml(), {
+        status: 503,
+        headers: { 'Content-Type': 'text/html; charset=utf-8', 'X-Content-Type-Options': 'nosniff', 'Cache-Control': 'no-store' },
+      });
+    }
   }
 
   // 密码门控：未配置 BROWSE_PASS 时直接拒绝，防止误配导致整桶裸奔
