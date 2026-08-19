@@ -60,6 +60,12 @@ app.get('/oss/*', async (c) => {
 	}
 
 	const obj = await r2Service.getObj(c, key);
+
+	// 回退 KV 后，历史对象可能仍在 COS（故障前写入），KV 中不存在 → 404
+	if (!obj) {
+		throw new BizError('Not Found', 404);
+	}
+
 	return new Response(obj.body, {
 		headers: {
 			'Content-Type': obj.httpMetadata?.contentType || 'application/octet-stream',

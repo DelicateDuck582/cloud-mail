@@ -600,6 +600,8 @@ const attService = {
 			}
 		} catch (e) {
 			console.error('COS usage error:', e);
+			// COS 不可用时同样标记故障，让后续附件读写自动回退 KV
+			r2Service.markS3Failed();
 		}
 
 		return {
