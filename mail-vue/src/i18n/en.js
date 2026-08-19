@@ -171,6 +171,7 @@ const en = {
     delayed: 'Delayed',
     bounced: 'Bounced',
     opened: 'Opened',
+    attCosDown: 'Temporarily unavailable - COS error',
     attachments: 'Attachments',
     attCount: 'Total {total}',
     emailCount: 'Total {total}',

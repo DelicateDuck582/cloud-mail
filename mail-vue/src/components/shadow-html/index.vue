@@ -6,7 +6,11 @@
 
 <script setup>
 import { ref, onMounted, watch } from 'vue'
+import { ElMessage } from 'element-plus'
+import { useI18n } from 'vue-i18n'
 import { sanitizeHtml, sanitizeCss } from '@/utils/sanitize-html'
+
+const { t } = useI18n()
 
 const props = defineProps({
   html: {
@@ -18,6 +22,24 @@ const props = defineProps({
 const container = ref(null)
 const contentBox = ref(null)
 let shadowRoot = null
+
+// 附件图片加载失败（如 COS 故障回退导致历史附件 503）→ 透明占位防反复请求 + toast 提示（防刷屏）
+let cosToastShown = false
+function bindAttachmentImgError(root) {
+  const imgs = root ? root.querySelectorAll('img') : []
+  for (const img of imgs) {
+    const src = img.getAttribute('src') || ''
+    if (!src.includes('/attachments/')) continue
+    img.onerror = () => {
+      img.onerror = null
+      img.src = 'data:image/gif;base64,R0lGODlhAQABAAAAACH5BAEKAAEALAAAAAABAAEAAAICTAEAOw=='
+      if (cosToastShown) return
+      cosToastShown = true
+      ElMessage.error(t('attCosDown'))
+      setTimeout(() => { cosToastShown = false }, 3000)
+    }
+  }
+}
 
 function updateContent() {
   if (!shadowRoot) return;
@@ -82,6 +104,9 @@ function updateContent() {
       ${cleanedHtml}
     </div>
   `;
+
+  // 附件图片加载失败（COS 故障等）→ 透明占位 + toast 提示
+  bindAttachmentImgError(shadowRoot);
 }
 
 function autoScale() {
