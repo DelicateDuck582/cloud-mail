@@ -64,6 +64,12 @@ export default {
 	},
 	email: email,
 	async scheduled(c, env, ctx) {
+		if (c.cron === '*/5 * * * *') {
+			// COS 恢复后自动把回退附件批量迁回 COS（每次一批，幂等；释放 KV 空间）
+			await r2Service.migrateFallbackBatch({ env });
+			return;
+		}
+
 		if (c.cron === '*/30 * * * *') {
 			await analysisService.refreshEchartsCache({ env })
 			return;
