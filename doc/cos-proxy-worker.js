@@ -377,6 +377,8 @@ async function probeCosHealth(env) {
     await browseList(env, '', '', 1);
     cosProbeCache.ok = true;
   } catch (e) {
+    // 仅记录状态，不泄露 COS 排错细节（bucket 域名/签名中间值只在 browseList 的 throw 里）
+    console.warn('cos-proxy: COS 探测失败，网盘暂时关闭服务');
     cosProbeCache.ok = false;
   }
   return cosProbeCache.ok;
@@ -532,7 +534,7 @@ async function browseAuthed(request, pass) {
   const cookies = (request.headers.get('Cookie') || '').split(';');
   for (const c of cookies) {
     const [k, v] = c.trim().split('=');
-    if (k === 'browse_pwd' && v === fingerprint) {
+    if (k === 'browse_pwd' && timingSafeEqual(v, fingerprint)) {
       return true;
     }
   }
