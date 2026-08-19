@@ -170,6 +170,7 @@ const en = {
     complained: 'Complained',
     delayed: 'Delayed',
     bounced: 'Bounced',
+    attCosDown: 'Temporarily unavailable - COS error',
     attachments: 'Attachments',
     attCount: 'Total {total}',
     emailCount: 'Total {total}',

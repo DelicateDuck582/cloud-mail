@@ -1,4 +1,5 @@
 import domainUtils from './domain-uitls';
+import r2Service from '../service/r2-service';
 
 /**
  * 附件/图片 URL 短期签名工具
@@ -61,7 +62,28 @@ const signUtils = {
 		return map;
 	},
 
+	// 按当前存储类型返回附件 URL 基础地址（配合 COS 故障自动回退 KV）：
+	//   S3（COS 正常）           → r2Domain（cos-exchange 代理 Worker）
+	//   R2                       → 本 Worker 的 /api/oss
+	//   KV（含 COS 故障回退）     → 本 Worker 的 /attachments（index.js 直读 KV）
+	async getBase(c, r2Domain) {
+		const type = await r2Service.storageType(c);
+		if (type === 'S3') {
+			return domainUtils.toOssDomain(r2Domain) || '';
+		}
+		let origin = '';
+		try {
+			origin = new URL(c.req.url).origin;
+		} catch (e) {}
+		if (type === 'R2') {
+			return origin ? `${origin}/api/oss` : domainUtils.toOssDomain(r2Domain) || '';
+		}
+		return origin ? `${origin}/attachments` : '';
+	},
+
 	// 给邮件正文中的 {{domain}}attachments/<key> 占位符追加签名参数
+	// 并把 {{domain}} 直接替换为当前存储的基础地址（S3→代理域名；KV/R2 回退→本 Worker）
+	// 注：不再保留 {{domain}} 占位符，前端 replace 找不到时无副作用
 	async signContent(c, content, r2Domain) {
 		if (!content) {
 			return content;
@@ -80,14 +102,14 @@ const signUtils = {
 		}
 
 		const signMap = await this.signKeys(c, keys);
-		const base = domainUtils.toOssDomain(r2Domain) || '';
+		const base = await this.getBase(c, r2Domain);
 
 		return str.replace(pattern, (match, key) => {
 			const sp = signMap.get(key);
 			if (!sp) {
 				return match;
 			}
-			return `{{domain}}${key}?expires=${sp.expires}&sign=${sp.sign}`;
+			return `${base}/${key}?expires=${sp.expires}&sign=${sp.sign}`;
 		});
 	},
 
@@ -99,7 +121,7 @@ const signUtils = {
 
 		const keys = attList.filter(a => a && a.key).map(a => a.key);
 		const signMap = await this.signKeys(c, keys);
-		const base = domainUtils.toOssDomain(r2Domain) || '';
+		const base = await this.getBase(c, r2Domain);
 
 		for (const att of attList) {
 			if (!att || !att.key || !signMap.has(att.key)) {

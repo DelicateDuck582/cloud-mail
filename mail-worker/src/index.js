@@ -4,6 +4,7 @@ import userService from './service/user-service';
 import verifyRecordService from './service/verify-record-service';
 import emailService from './service/email-service';
 import kvObjService from './service/kv-obj-service';
+import r2Service from './service/r2-service';
 import oauthService from "./service/oauth-service";
 import analysisService from './service/analysis-service';
 import attService from './service/att-service';
@@ -44,13 +45,31 @@ export default {
 				}
 			}
 
-			 return await kvObjService.toObjResp( { env }, url.pathname.substring(1));
-		 }
+			 const resp = await kvObjService.toObjResp( { env }, url.pathname.substring(1));
 
+			 // 对象不存在：COS 故障回退期间，历史 COS 附件不可达 → 返回明确提示；否则 404
+			 if (!resp) {
+				 const cosDown = await r2Service.isCosFallback({ env });
+				 return new Response(
+					 JSON.stringify(cosDown
+						 ? { code: 503, message: '文件暂时无法访问--COS错误' }
+						 : { code: 404, message: 'Not Found' }),
+					 { status: cosDown ? 503 : 404, headers: { 'Content-Type': 'application/json; charset=utf-8' } }
+				 );
+			 }
+
+			 return resp;
+		 }
 		return env.assets.fetch(req);
 	},
 	email: email,
 	async scheduled(c, env, ctx) {
+		if (c.cron === '*/5 * * * *') {
+			// COS 恢复后自动把回退附件批量迁回 COS（每次一批，幂等；释放 KV 空间）
+			await r2Service.migrateFallbackBatch({ env });
+			return;
+		}
+
 		if (c.cron === '*/30 * * * *') {
 			await analysisService.refreshEchartsCache({ env })
 			return;
