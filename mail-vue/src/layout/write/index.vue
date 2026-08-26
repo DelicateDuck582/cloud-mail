@@ -106,6 +106,7 @@ import {getIconByName} from "@/utils/icon-utils.js";
 import sendPercent from "@/components/send-percent/index.vue"
 import {toOssDomain} from "@/utils/convert.js";
 import {formatDetailDate} from "@/utils/day.js";
+import {sanitizeHtml} from "@/utils/sanitize-html.js";
 import {useSettingStore} from "@/store/setting.js";
 import {userDraftStore} from "@/store/draft.js";
 import {useWriterStore} from "@/store/writer.js";
@@ -445,7 +446,7 @@ function openForward(email) {
 
   setTimeout(() => {
     defValue.value = `
-      ${formatImage(email.content) || `<pre style="font-family: inherit;word-break: break-word;white-space: pre-wrap;margin: 0">${email.text}</pre>`}
+      ${sanitizeHtml(formatImage(email.content)) || `<pre style="font-family: inherit;word-break: break-word;white-space: pre-wrap;margin: 0">${escapeHtml(email.text)}</pre>`}
     `
     open()
 
@@ -485,7 +486,7 @@ function openReply(email) {
     </div>
     <blockquote class="mceNonEditable" style="margin: 0 0 0 0.8ex;border-left: 1px solid rgb(204,204,204);padding-left: 1ex;">
       <articl>
-          ${formatImage(email.content) || `<pre style="font-family: inherit;word-break: break-word;white-space: pre-wrap;margin: 0">${email.text}</pre>`}
+          ${sanitizeHtml(formatImage(email.content)) || `<pre style="font-family: inherit;word-break: break-word;white-space: pre-wrap;margin: 0">${escapeHtml(email.text)}</pre>`}
       </article>
     </blockquote>`
     open()
@@ -504,6 +505,16 @@ function formatImage(content) {
   content = content || '';
   const domain = settingStore.settings.r2Domain;
   return content.replace(/{{domain}}/g, toOssDomain(domain) + '/');
+}
+
+// 纯文本/发件人信息注入 HTML 前的转义（防 text 内容中的标签执行）
+function escapeHtml(str) {
+  return String(str ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
 }
 
 function open() {

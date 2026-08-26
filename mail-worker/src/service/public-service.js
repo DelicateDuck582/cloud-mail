@@ -135,14 +135,18 @@ const publicService = {
 				type = roleRow ? roleRow.roleId : type;
 			}
 
-			const userSql = `INSERT INTO user (email, password, salt, type, os, browser, active_ip, create_ip, device, active_time, create_time)
-			VALUES ('${email}', '${hash}', '${salt}', '${type}', '${os}', '${browser}', '${activeIp}', '${activeIp}', '${device}', '${activeTime}', '${activeTime}')`
+			// 安全：参数化 SQL，杜绝 UA 解析值（os/browser/device）字符串拼接导致的 SQL 注入
+			const userSql = c.env.db.prepare(
+				`INSERT INTO user (email, password, salt, type, os, browser, active_ip, create_ip, device, active_time, create_time)
+				 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+			).bind(email, hash, salt, type, os, browser, activeIp, activeIp, device, activeTime, activeTime);
 
-			const accountSql = `INSERT INTO account (email, name, user_id)
-			VALUES ('${email}', '${emailUtils.getName(email)}', 0);`;
+			const accountSql = c.env.db.prepare(
+				`INSERT INTO account (email, name, user_id) VALUES (?, ?, 0)`
+			).bind(email, emailUtils.getName(email));
 
-			userList.push(c.env.db.prepare(userSql));
-			userList.push(c.env.db.prepare(accountSql));
+			userList.push(userSql);
+			userList.push(accountSql);
 
 		}
 
@@ -166,7 +170,8 @@ const publicService = {
 
 		const uuid = uuidv4();
 
-		await c.env.kv.put(KvConst.PUBLIC_KEY, uuid);
+		// 安全：public token 加 24 小时 TTL，避免长期有效导致泄露后整库可读
+		await c.env.kv.put(KvConst.PUBLIC_KEY, uuid, { expirationTtl: 86400 });
 
 		return {token: uuid}
 	},

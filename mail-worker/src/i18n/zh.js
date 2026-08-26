@@ -1,5 +1,6 @@
 const zh = {
 	IncorrectPwd: '密码输入错误',
+	loginLocked: '登录失败次数过多，请 10 分钟后再试',
 	addAccountDisabled: '添加邮箱功能已关闭',
 	regDisabled: '注册功能已关闭',
 	emptyEmail: '邮箱不能为空',

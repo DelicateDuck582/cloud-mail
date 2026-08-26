@@ -4,14 +4,28 @@ const app = new Hono();
 import result from '../model/result';
 import { cors } from 'hono/cors';
 
-app.use('*', cors());
+app.use('*', cors({
+	// 安全：CORS 白名单 —— 仅放行本机开发与 duckgame-play.top，拒绝其它任意来源
+	origin: (origin) => {
+		if (!origin) return null;
+		try {
+			const u = new URL(origin);
+			if (u.hostname === 'localhost' || u.hostname === '127.0.0.1') return origin;
+			if (u.hostname === 'duckgame-play.top' || u.hostname.endsWith('.duckgame-play.top')) return origin;
+		} catch (e) {}
+		return null;
+	},
+	allowHeaders: ['Content-Type', 'Authorization'],
+	allowMethods: ['GET', 'HEAD', 'PUT', 'POST', 'DELETE', 'OPTIONS'],
+}));
 
 app.onError((err, c) => {
 	if (err.name === 'BizError') {
 		console.log(err.message);
-	} else {
-		console.error(err);
+		return c.json(result.fail(err.message, err.code));
 	}
+
+	console.error(err);
 
 	if (err.message === `Cannot read properties of undefined (reading 'get')`) {
 		return c.json(result.fail('KV数据库未绑定 KV database not bound',502));
@@ -25,7 +39,8 @@ app.onError((err, c) => {
 		return c.json(result.fail('D1数据库未绑定 D1 database not bound',502));
 	}
 
-	return c.json(result.fail(err.message, err.code));
+	// 安全：非业务异常不把内部错误信息回给客户端，避免泄露实现细节
+	return c.json(result.fail('Internal Server Error', 500));
 });
 
 export default app;

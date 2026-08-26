@@ -6,15 +6,37 @@ import userService from "./user-service";
 import loginService from "./login-service";
 import cryptoUtils from "../utils/crypto-utils";
 import settingService from "./setting-service";
+import kvConst from '../const/kv-const';
 import {t} from '../i18n/i18n';
+
+// 密码学安全随机绑定令牌（192 bit）
+function genBindToken() {
+	const arr = new Uint8Array(24);
+	crypto.getRandomValues(arr);
+	return Array.from(arr, b => b.toString(16).padStart(2, '0')).join('');
+}
+
+// 恒定时间字符串比较，防时序侧信道
+function timingSafeEqual(a, b) {
+	if (a.length !== b.length) return false;
+	let diff = 0;
+	for (let i = 0; i < a.length; i++) {
+		diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+	}
+	return diff === 0;
+}
 
 const oauthService = {
 
 	async bindUser(c, params) {
 
-		const { email, oauthUserId, code } = params;
+		const { email, oauthUserId, code, bindToken } = params;
 
 		const oauthRow = await this.getById(c, oauthUserId);
+
+		if (!oauthRow) {
+			throw new BizError('OAuth 用户不存在')
+		}
 
 		let userRow = await userService.selectByIdIncludeDel(c, oauthRow.userId);
 
@@ -22,11 +44,22 @@ const oauthService = {
 			throw new BizError('用户已绑定有邮箱')
 		}
 
+		// 安全：绑定必须携带 OAuth 登录时签发的一次性令牌（KV，10 分钟有效），
+		// 防止攻击者拿到公开的 OAuth 平台 ID 后抢绑受害者 OAuth 身份到自己的邮箱（账号接管）
+		const stored = await c.env.kv.get(kvConst.OAUTH_BIND + oauthUserId);
+		if (!stored || !bindToken || !timingSafeEqual(stored, String(bindToken))) {
+			throw new BizError('绑定已失效，请重新通过 OAuth 登录', 403);
+		}
+
 		await loginService.register(c, { email, password: cryptoUtils.genRandomPwd(), code }, true);
 
 		userRow = await userService.selectByEmail(c, email);
 
 		orm(c).update(oauth).set({ userId: userRow.userId }).where(eq(oauth.oauthUserId, oauthUserId)).run();
+
+		// 一次性令牌：绑定成功即作废
+		await c.env.kv.delete(kvConst.OAUTH_BIND + oauthUserId);
+
 		const jwtToken = await loginService.login(c, { email, password: null }, true);
 
 		return { userInfo: oauthRow, token: jwtToken}
@@ -185,7 +218,10 @@ const oauthService = {
 		const userRow = await userService.selectByIdIncludeDel(c, oauthRow.userId);
 
 		if (!userRow) {
-			return { userInfo: oauthRow, token: null };
+			// 未绑定邮箱：签发一次性绑定令牌（10 分钟有效），绑定接口校验，防越权抢绑
+			const bindToken = genBindToken();
+			await c.env.kv.put(kvConst.OAUTH_BIND + oauthRow.oauthUserId, bindToken, { expirationTtl: 600 });
+			return { userInfo: oauthRow, token: null, bindToken };
 		}
 
 		const JwtToken = await loginService.login(c, { email: userRow.email, password: null }, true);

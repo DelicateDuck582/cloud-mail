@@ -20,6 +20,27 @@ import { toUtc } from '../utils/date-uitil';
 import { t } from '../i18n/i18n.js';
 import verifyRecordService from './verify-record-service';
 
+// ---- 登录防爆破（per-IP）：同 IP 失败 5 次/10 分钟锁定，失败时延迟 1 秒 ----
+const loginFailMap = new Map();
+const LOGIN_FAIL_MAX = 5;
+const LOGIN_FAIL_WINDOW = 10 * 60 * 1000;
+function loginLocked(ip) {
+	const rec = loginFailMap.get(ip);
+	return !!(rec && Date.now() - rec.t < LOGIN_FAIL_WINDOW && rec.c >= LOGIN_FAIL_MAX);
+}
+function loginFailRecord(ip) {
+	const rec = loginFailMap.get(ip);
+	const now = Date.now();
+	if (!rec || now - rec.t > LOGIN_FAIL_WINDOW) loginFailMap.set(ip, { c: 1, t: now });
+	else rec.c++;
+	if (loginFailMap.size > 10000) {
+		for (const [k, v] of loginFailMap) {
+			if (now - v.t > LOGIN_FAIL_WINDOW) loginFailMap.delete(k);
+		}
+	}
+}
+function loginOk(ip) { loginFailMap.delete(ip); }
+
 const loginService = {
 
 	async register(c, params, oauth = false) {
@@ -207,9 +228,17 @@ const loginService = {
 			throw new BizError(t('emailAndPwdEmpty'));
 		}
 
+		// 登录防爆破：同 IP 失败次数过多直接拒绝
+		const ip = reqUtils.getIp(c);
+		if (loginLocked(ip)) {
+			throw new BizError(t('loginLocked'), 429);
+		}
+
 		const userRow = await userService.selectByEmailIncludeDel(c, email);
 
 		if (!userRow) {
+			loginFailRecord(ip);
+			await new Promise(r => setTimeout(r, 1000));
 			throw new BizError(t('notExistUser'));
 		}
 
@@ -222,9 +251,12 @@ const loginService = {
 		}
 
 		if (!await cryptoUtils.verifyPassword(password, userRow.salt, userRow.password) && !noVerifyPwd) {
+			loginFailRecord(ip);
+			await new Promise(r => setTimeout(r, 1000));
 			throw new BizError(t('IncorrectPwd'));
 		}
 
+		loginOk(ip);
 		const uuid = uuidv4();
 		const jwt = await JwtUtils.generateToken(c,{ userId: userRow.userId, token: uuid });
 

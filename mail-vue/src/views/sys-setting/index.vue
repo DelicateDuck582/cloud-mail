@@ -511,7 +511,7 @@
                  @closed="oauthForm.clientId = ''; oauthForm.clientSecret = ''; oauthForm.switch = 1">
         <div class="dialog-content">
           <el-input type="text" :placeholder="$t('clientId')" v-model="oauthForm.clientId"/>
-          <el-input type="text" style="margin-top: 15px" :placeholder="$t('clientSecret')" v-model="oauthForm.clientSecret"/>
+          <el-input type="text" :placeholder="oauthForm.key ? (setting[oauthForm.key + 'ClientSecret'] || $t('clientSecret')) : $t('clientSecret')" style="margin-top: 15px" v-model="oauthForm.clientSecret"/>
         </div>
         <template #footer>
           <div class="dialog-footer">
@@ -1396,7 +1396,7 @@ function openOauthSetting(p) {
   oauthForm.key = p.key
   oauthForm.label = p.label
   oauthForm.clientId = setting.value[p.key + 'ClientId'] || ''
-  oauthForm.clientSecret = setting.value[p.key + 'ClientSecret'] || ''
+  oauthForm.clientSecret = '' // 密钥不回填（后端只返回遮蔽值），仅在修改时重新填写
   oauthForm.switch = setting.value[p.key + 'Switch'] ?? 1
   oauthSettingShow.value = true
 }
@@ -1404,7 +1404,9 @@ function openOauthSetting(p) {
 function saveOauth() {
   const form = {}
   form[oauthForm.key + 'ClientId'] = oauthForm.clientId
-  form[oauthForm.key + 'ClientSecret'] = oauthForm.clientSecret
+  if (oauthForm.clientSecret) {
+    form[oauthForm.key + 'ClientSecret'] = oauthForm.clientSecret
+  }
   form[oauthForm.key + 'Switch'] = oauthForm.switch
   editSetting(form)
 }

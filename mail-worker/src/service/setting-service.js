@@ -86,6 +86,9 @@ const settingService = {
 		settingRow.s3AccessKey = settingRow.s3AccessKey ? `${settingRow.s3AccessKey.slice(0, 12)}******` : null;
 		settingRow.s3SecretKey = settingRow.s3SecretKey ? `${settingRow.s3SecretKey.slice(0, 12)}******` : null;
 		settingRow.tgBotToken = settingRow.tgBotToken ? `${settingRow.tgBotToken.slice(0, 20)}******` : null;
+		settingRow.linuxdoClientSecret = settingRow.linuxdoClientSecret ? `${settingRow.linuxdoClientSecret.slice(0, 6)}******` : null;
+		settingRow.githubClientSecret = settingRow.githubClientSecret ? `${settingRow.githubClientSecret.slice(0, 6)}******` : null;
+		settingRow.googleClientSecret = settingRow.googleClientSecret ? `${settingRow.googleClientSecret.slice(0, 6)}******` : null;
 		settingRow.hasR2 = !!c.env.r2
 		settingRow.hasCfEmail = !!c.env.email
 
