@@ -48,18 +48,7 @@ const settingService = {
 		domainList = domainList.map(item => '@' + item);
 		setting.domainList = domainList;
 
-
-		let linuxdoSwitch = c.env.linuxdo_switch;
 		let projectLink = c.env.project_link;
-
-		if (typeof linuxdoSwitch === 'string' && linuxdoSwitch === 'true') {
-			linuxdoSwitch = true
-		} else if (linuxdoSwitch === true) {
-			linuxdoSwitch = true
-		} else {
-			linuxdoSwitch = false
-		}
-
 		if (typeof projectLink === 'string' && projectLink === 'false') {
 			projectLink = false
 		} else if (projectLink === false) {
@@ -69,10 +58,6 @@ const settingService = {
 		}
 
 		setting.projectLink = projectLink;
-
-		setting.linuxdoClientId = c.env.linuxdo_client_id;
-		setting.linuxdoCallbackUrl = c.env.linuxdo_callback_url;
-		setting.linuxdoSwitch = linuxdoSwitch;
 
 		setting.emailPrefixFilter = setting.emailPrefixFilter.split(",").filter(Boolean);
 
@@ -101,6 +86,9 @@ const settingService = {
 		settingRow.s3AccessKey = settingRow.s3AccessKey ? `${settingRow.s3AccessKey.slice(0, 12)}******` : null;
 		settingRow.s3SecretKey = settingRow.s3SecretKey ? `${settingRow.s3SecretKey.slice(0, 12)}******` : null;
 		settingRow.tgBotToken = settingRow.tgBotToken ? `${settingRow.tgBotToken.slice(0, 20)}******` : null;
+		settingRow.linuxdoClientSecret = settingRow.linuxdoClientSecret ? `${settingRow.linuxdoClientSecret.slice(0, 6)}******` : null;
+		settingRow.githubClientSecret = settingRow.githubClientSecret ? `${settingRow.githubClientSecret.slice(0, 6)}******` : null;
+		settingRow.googleClientSecret = settingRow.googleClientSecret ? `${settingRow.googleClientSecret.slice(0, 6)}******` : null;
 		settingRow.hasR2 = !!c.env.r2
 		settingRow.hasCfEmail = !!c.env.email
 
@@ -140,6 +128,7 @@ const settingService = {
 		}
 
 		params.resendTokens = JSON.stringify(resendTokens);
+
 		await orm(c).update(setting).set({ ...params }).returning().get();
 		await this.refresh(c);
 	},
@@ -229,8 +218,11 @@ const settingService = {
 			notice: settingRow.notice,
 			loginDomain: settingRow.loginDomain,
 			linuxdoClientId: settingRow.linuxdoClientId,
-			linuxdoCallbackUrl: settingRow.linuxdoCallbackUrl,
 			linuxdoSwitch: settingRow.linuxdoSwitch,
+			githubClientId: settingRow.githubClientId,
+			githubSwitch: settingRow.githubSwitch,
+			googleClientId: settingRow.googleClientId,
+			googleSwitch: settingRow.googleSwitch,
 			minEmailPrefix: settingRow.minEmailPrefix,
 			projectLink: settingRow.projectLink
 		};

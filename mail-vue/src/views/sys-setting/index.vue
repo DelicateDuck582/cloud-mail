@@ -397,6 +397,26 @@
             </div>
           </div>
 
+          <!-- OAuth Login Card -->
+          <div class="settings-card">
+            <div class="card-title">{{ $t('oauthLogin') }}</div>
+            <div class="card-content">
+              <div class="setting-item" v-for="p in oauthPlatforms" :key="p.key">
+                <div>
+                  <el-avatar v-if="p.iconType === 'image'" :src="p.icon" :size="22" class="oauth-icon"/>
+                  <Icon v-else :icon="p.icon" width="22" height="22" class="oauth-icon"/>
+                  <span>{{ p.label }}</span>
+                </div>
+                <div class="forward">
+                  <span>{{ setting[p.key + 'Switch'] === 0 ? $t('enabled') : $t('disabled') }}</span>
+                  <el-button class="opt-button" size="small" type="primary" @click="openOauthSetting(p)">
+                    <Icon icon="fluent:settings-48-regular" width="18" height="18"/>
+                  </el-button>
+                </div>
+              </div>
+            </div>
+          </div>
+
           <div class="settings-card about">
             <div class="card-title">{{ $t('about') }}</div>
             <div class="card-content">
@@ -486,6 +506,20 @@
           <el-input type="text" style="margin-top: 15px" placeholder="Secret Key" v-model="turnstileForm.secretKey" @keyup.enter="saveTurnstileKey"/>
           <el-button type="primary" :loading="settingLoading" @click="saveTurnstileKey">{{ $t('save') }}</el-button>
         </form>
+      </el-dialog>
+      <el-dialog v-model="oauthSettingShow" :title="$t('oauthSetting') + ' - ' + oauthForm.label" width="340"
+                 @closed="oauthForm.clientId = ''; oauthForm.clientSecret = ''; oauthForm.switch = 1">
+        <div class="dialog-content">
+          <el-input type="text" :placeholder="$t('clientId')" v-model="oauthForm.clientId"/>
+          <el-input type="text" :placeholder="oauthForm.key ? (setting[oauthForm.key + 'ClientSecret'] || $t('clientSecret')) : $t('clientSecret')" style="margin-top: 15px" v-model="oauthForm.clientSecret"/>
+        </div>
+        <template #footer>
+          <div class="dialog-footer">
+            <el-switch v-model="oauthForm.switch" :active-value="0" :inactive-value="1" :active-text="$t('enable')"
+                       :inactive-text="$t('disable')"/>
+            <el-button type="primary" :loading="settingLoading" @click="saveOauth">{{ $t('save') }}</el-button>
+          </div>
+        </template>
       </el-dialog>
       <el-dialog
           v-model="showSetBackground"
@@ -853,7 +887,7 @@ defineOptions({
   name: 'sys-setting'
 })
 
-const currentVersion = 'v3.1.0'
+const currentVersion = 'v3.2.0'
 const hasUpdate = ref(false)
 let getUpdateErrorCount = 1;
 const {t, locale} = useI18n();
@@ -901,6 +935,20 @@ const resendTokenForm = reactive({
 const turnstileForm = reactive({
   siteKey: '',
   secretKey: ''
+})
+
+const oauthPlatforms = [
+  { key: 'google', label: 'Google', icon: 'devicon:google', iconType: 'iconify' },
+  { key: 'github', label: 'GitHub', icon: 'codicon:github-inverted', iconType: 'iconify' },
+  { key: 'linuxdo', label: 'LinuxDo', icon: '/image/linuxdo.webp', iconType: 'image' },
+]
+const oauthSettingShow = ref(false)
+const oauthForm = reactive({
+  key: '',
+  label: '',
+  clientId: '',
+  clientSecret: '',
+  switch: 1,
 })
 
 const s3 = reactive({
@@ -1368,6 +1416,25 @@ function delBackground() {
   })
 }
 
+function openOauthSetting(p) {
+  oauthForm.key = p.key
+  oauthForm.label = p.label
+  oauthForm.clientId = setting.value[p.key + 'ClientId'] || ''
+  oauthForm.clientSecret = '' // 密钥不回填（后端只返回遮蔽值），仅在修改时重新填写
+  oauthForm.switch = setting.value[p.key + 'Switch'] ?? 1
+  oauthSettingShow.value = true
+}
+
+function saveOauth() {
+  const form = {}
+  form[oauthForm.key + 'ClientId'] = oauthForm.clientId
+  if (oauthForm.clientSecret) {
+    form[oauthForm.key + 'ClientSecret'] = oauthForm.clientSecret
+  }
+  form[oauthForm.key + 'Switch'] = oauthForm.switch
+  editSetting(form)
+}
+
 function saveTurnstileKey() {
   const settingForm = {}
   settingForm.siteKey = turnstileForm.siteKey
@@ -1531,6 +1598,7 @@ function editSetting(settingForm, refreshStatus = true) {
     addS3Show.value = false
     emailPrefixShow.value = false
     aiCodeFilterShow.value = false
+    oauthSettingShow.value = false
   }).catch((e) => {
     loginOpacity.value = setting.value.loginOpacity
     setting.value = {...setting.value, ...JSON.parse(backup)}
@@ -1664,6 +1732,14 @@ function editSetting(settingForm, refreshStatus = true) {
     justify-items: flex-end;
     font-weight: normal;
   }
+}
+
+.oauth-icon {
+  width: 22px !important;
+  height: 22px !important;
+  min-width: 22px;
+  flex-shrink: 0;
+  margin-right: 2px;
 }
 
 .r2domain-item {

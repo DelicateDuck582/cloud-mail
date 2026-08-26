@@ -27,3 +27,4 @@ mail-vue/dist
 .venv
 # 本地开发配置（含测试密钥），禁止提交
 mail-worker/wrangler-dev.toml
+git-tools.js

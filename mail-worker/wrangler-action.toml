@@ -32,7 +32,7 @@ not_found_handling = "single-page-application"
 run_worker_first = true
 
 [triggers]
-crons = ["0 16 * * *"]
+crons = ["0 16 * * *", "*/5 * * * *"]	#每天下午12点执行每日任务, 刷新分析缓存；每5分钟尝试将 COS 恢复后的回退附件迁回 COS
 
 
 [vars]
@@ -43,11 +43,7 @@ domain = "${DOMAIN}"
 admin = "${ADMIN}"
 jwt_secret = "${JWT_SECRET}"
 project_link = "${PROJECT_LINK}"
-
-linuxdo_client_id = "${LINUXDO_CLIENT_ID}"
-linuxdo_client_secret = "${LINUXDO_CLIENT_SECRET}"
-linuxdo_callback_url = "${LINUXDO_CALLBACK_URL}"
-linuxdo_switch = "${LINUXDO_SWITCH}"
+init_secret = "${INIT_SECRET}"
 
 [build]
 command = "pnpm --prefix ../mail-vue install && pnpm --prefix ../mail-vue run build"

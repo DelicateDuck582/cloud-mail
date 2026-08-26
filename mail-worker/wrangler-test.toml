@@ -30,7 +30,7 @@ not_found_handling = "single-page-application"
 run_worker_first = true
 
 [triggers]
-crons = ["0 16 * * *"]	#每天晚上12点执行每日任务,刷新分析缓存
+crons = ["0 16 * * *", "*/5 * * * *"]	#每天下午12点执行每日任务,刷新分析缓存；每5分钟尝试把 COS 恢复后的回退附件迁回 COS
 
 
 [vars]

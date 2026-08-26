@@ -81,6 +81,7 @@ const en = {
     signaturePreview: 'Preview',
     clearSignature: 'Clear',
     username: 'Username',
+    trustLevel: 'Level',
     password: 'Password',
     delAccount: 'Delete Account',
     delAccountMsg: 'This will permanently delete your account and data. It cannot be reactivated',
@@ -327,6 +328,7 @@ const en = {
     rulesVerify: 'Rules',
     rulesVerifyTitle: 'Trigger After {count} Daily Uses per IP',
     botVerifyMsg: 'Please verify that you are human',
+    oauthLogin: 'OAuth2',
     noticeTitle: 'Notice',
     noticePopup: 'Sign-In Popup',
     icon: 'Icon',
@@ -391,7 +393,11 @@ const en = {
     searchUser: 'Search by user',
     searchEmail: 'Search by Email',
     searchSender: 'Search by Sender',
-    userEmail: 'Email Address'
+    userEmail: 'Email Address',
+    oauthSetting: 'OAuth',
+    clientId: 'Client ID',
+    clientSecret: 'Client Secret',
+    notOwner: 'Base email does not belong to you',
 }
 
 export default en
