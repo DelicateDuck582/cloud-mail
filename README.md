@@ -72,7 +72,21 @@
 
 - **📜 更多功能**：正在开发中...
 
+## 本项目安全增强（main 分支）
 
+> 本 fork 的 `main` 分支基于上游 **v3.2.0**，额外应用了纯安全加固
+> （**不含**任何额外功能与对象存储安全改造，保持与上游功能一致，仅做安全防护）。
+
+- **🔑 `/init` 独立密钥**：不再使用 `jwt_secret`，改用独立 `INIT_SECRET`（POST + per-IP 限流 + 恒定时间比较），避免 jwt_secret 泄露后被任意重跑数据库初始化
+- **🚫 登录防爆破**：同 IP 失败 5 次/10 分钟锁定，失败时延迟 1 秒响应
+- **🧹 错误脱敏**：非业务异常不把内部错误信息回给客户端，避免泄露实现细节
+- **🌐 CORS 白名单**：仅放行本机开发与 `duckgame-play.top` 域名
+- **📬 Resend webhook 验签**：支持 Svix 标准签名校验（`RESEND_SIGNING_SECRET`），未配置时告警；webhook 状态只允许升级，忽略未处理事件
+- **⏱️ Token 时效**：公开 API token 24 小时 TTL；TG 邮件查看 token 7 天 TTL + `Cache-Control: private, no-store`
+- **📦 入站/发信限制**：入站原始 25MB、附件总量 25MB、附件数 20；发信前附件数量限制（内嵌/普通各 ≤10）
+- **🔐 OAuth 安全**：随机密码改 `crypto.getRandomValues`；`bindUser` 一次性绑定令牌（KV 10 分钟，恒定时间比较），防抢绑账号接管；Client Secret 后端遮蔽、前端不回填
+- **🛡️ 邮件内容 XSS 防护**：入库时白名单清洗（linkedom）：移除 `script`/`iframe`/`object`/`embed`/`svg`/`math`/表单控件、所有 `on*` 事件属性、`javascript:`/`vbscript:`/`data:text/html` 等危险 URL 与危险 CSS；前端渲染（ShadowHtml 详情、回复/转发注入、TG 预览页）再做一次同规则清洗兜底
+- **🧩 SQL 参数化**：公开 API 批量建用户使用 `prepare().bind()`，杜绝字符串拼接注入
 
 ## 技术栈
 
