@@ -1,11 +1,8 @@
 name: 🚀 Deploy cloud-mail to Cloudflare Workers
 
+# 已禁用 push 自动部署：生产 Worker cloud-mail 由 Workers Builds 从 attachment-manager 分支构建，
+# 若此处再自动部署 main 会覆盖生产（丢失 fork 功能）。仅在手动 workflow_dispatch 时运行。
 on:
-  push:
-    branches: [ main ]
-    paths:
-      - "mail-worker/**"
-      - "mail-vue/**"
   workflow_dispatch:
 
 jobs:
