@@ -12,6 +12,7 @@ import dayjs from 'dayjs';
 import permService from './perm-service';
 import roleService from './role-service';
 import emailUtils from '../utils/email-utils';
+import { sanitizeHtml } from '../utils/html-sanitize';
 import saltHashUtils from '../utils/crypto-utils';
 import constant from '../const/constant';
 import { t } from '../i18n/i18n'
@@ -264,11 +265,11 @@ const userService = {
 		await c.env.kv.delete(KvConst.AUTH_INFO + userId);
 	},
 
-	// 保存当前用户的自定义 HTML 签名
+	// 保存当前用户的自定义 HTML 签名（入库前白名单清洗，防存储型 XSS）
 	async setHtmlSignature(c, htmlSignature, userId) {
 		await orm(c)
 			.update(user)
-			.set({ htmlSignature: String(htmlSignature || '') })
+			.set({ htmlSignature: sanitizeHtml(String(htmlSignature || '')) })
 			.where(eq(user.userId, userId))
 			.run();
 	},
