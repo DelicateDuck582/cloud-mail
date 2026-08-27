@@ -24,8 +24,8 @@ importers:
         specifier: ^0.42.0
         version: 0.42.0
       hono:
-        specifier: 4.12.16
-        version: 4.12.16
+        specifier: ^4.12.34
+        version: 4.13.5
       i18next:
         specifier: ^25.3.2
         version: 25.10.10
@@ -1563,8 +1563,8 @@ packages:
   glob-to-regexp@0.4.1:
     resolution: {integrity: sha512-lkX1HJXwyMcprw/5YUZc2s7DrpAiHB21/V+E1rHUrVNokkvB6bqMzT0VfV6/86ZNabt1k14YOIaT7nDvOX3Iiw==}
 
-  hono@4.12.16:
-    resolution: {integrity: sha512-jN0ZewiNAWSe5khM3EyCmBb250+b40wWbwNILNfEvq84VREWwOIkuUsFONk/3i3nqkz7Oe1PcpM2mwQEK2L9Kg==}
+  hono@4.13.5:
+    resolution: {integrity: sha512-O6+/eCYRkzzzy0rPWwKLiGBR1nFuUPZynnwjxN1MBA62NNqbT0wQEzQyK2gSO5yDIDB336sXQleAhOHrzlYyKw==}
     engines: {node: '>=16.9.0'}
 
   html-escaper@3.0.3:
@@ -3188,7 +3188,7 @@ snapshots:
 
   glob-to-regexp@0.4.1: {}
 
-  hono@4.12.16: {}
+  hono@4.13.5: {}
 
   html-escaper@3.0.3: {}
 
