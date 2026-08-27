@@ -19,6 +19,7 @@ import dayjs from 'dayjs';
 import { toUtc } from '../utils/date-uitil';
 import { t } from '../i18n/i18n.js';
 import verifyRecordService from './verify-record-service';
+import reqUtils from '../utils/req-utils';
 
 // ---- 登录防爆破（per-IP）：同 IP 失败 5 次/10 分钟锁定，失败时延迟 1 秒 ----
 const loginFailMap = new Map();
