@@ -25,10 +25,5 @@
     "resend": "^6.4.1",
     "ua-parser-js": "^2.0.3",
     "uuid": "^11.1.0"
-  },
-  "pnpm": {
-    "overrides": {
-      "fast-xml-parser": "5.7.0"
-    }
   }
 }
