@@ -597,6 +597,13 @@ function formatCloudTime(iso) {
     + ' ' + p(d.getHours()) + ':' + p(d.getMinutes()) + ':' + p(d.getSeconds());
 }
 
+// CloudMail createTime（'YYYY-MM-DD HH:mm:ss'，UTC）→ ISO（JMAP receivedAt 用），非法返回 null
+function cloudTimeToISO(s) {
+  if (!s) return null;
+  const d = new Date(String(s).replace(' ', 'T') + 'Z'); // CloudMail 存 UTC，显式加 Z
+  return isNaN(d.getTime()) ? null : d.toISOString();
+}
+
 async function jmapDownload(accountId, blobId, name) {
   const base = CFG.jmapUrl.replace(/\/+$/, '');
   const url = base + '/download/' + encodeURIComponent(accountId) + '/' + encodeURIComponent(blobId) + '/' + encodeURIComponent(name);
@@ -733,7 +740,8 @@ async function syncAccount(acc, rcpt, folderId, st) {
             if (existing) {
               st.stalwartMap.set(existing, key);
             } else {
-              sid = await jmap.importEmail(raw, folderId, { seen: !m.unread });
+              // receivedAt 保真 CloudMail 时间，避免雷鸟按导入时间排序
+              sid = await jmap.importEmail(raw, folderId, { seen: !m.unread, receivedAt: cloudTimeToISO(detail.createTime) });
               st.stalwartMap.set(sid, key);
             }
           } else {

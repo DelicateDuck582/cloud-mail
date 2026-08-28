@@ -7,7 +7,7 @@ const path = require('path');
 let src = fs.readFileSync(__dirname + '/sync.js', 'utf8');
 src = src.replace(/^#!.*\n/, '');
 src = src.replace(/main\(\)\.catch[\s\S]*$/, '');
-const fn = new Function('require', src + '\nreturn { pruneState, cleanRcpt, buildMime, formatCloudTime, syncDeletes, syncRestores, syncSent, queryStalwartId, jmap, cloud, loadState, saveState, emptyState, STATE_MAX, CFG, folderFor };');
+const fn = new Function('require', src + '\nreturn { pruneState, cleanRcpt, buildMime, formatCloudTime, cloudTimeToISO, syncDeletes, syncRestores, syncSent, queryStalwartId, jmap, cloud, loadState, saveState, emptyState, STATE_MAX, CFG, folderFor };');
 const api = fn(require);
 let pass = 0, fail = 0;
 const ok = (c, n) => { if (c) { pass++; console.log('  OK ' + n); } else { fail++; console.log('  FAIL ' + n); } };
@@ -175,6 +175,10 @@ const ok = (c, n) => { if (c) { pass++; console.log('  OK ' + n); } else { fail+
   ok(api.folderFor({ email: 'contact@ciallo.sale' }) === 'contact@ciallo.sale', '默认用账户邮箱作文件夹名');
   api.CFG.folderMap = { 'contact@ciallo.sale': '联系邮箱' };
   ok(api.folderFor({ email: 'contact@ciallo.sale' }) === '联系邮箱', 'STALWART_FOLDERS 覆盖');
+
+  console.log('15) cloudTimeToISO（receivedAt 保真）');
+  ok(api.cloudTimeToISO('2026-08-28 10:20:30') === '2026-08-28T10:20:30.000Z', 'CloudMail UTC 时间转 ISO');
+  ok(api.cloudTimeToISO('') === null && api.cloudTimeToISO('bad') === null, '非法时间返回 null');
 
   try { fs.unlinkSync(path.join(__dirname, '_test_state.json')); } catch (e) {}
   console.log('\n结果：' + pass + ' 通过，' + fail + ' 失败');
