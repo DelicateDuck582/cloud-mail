@@ -494,6 +494,60 @@ const emailService = {
 		return [ emailResult ];
 	},
 
+	// 已发送记录导入（Thunderbird 经 Stalwart 发信后镜像回 CloudMail，不触发 Resend/CF 重投递）
+	// 用途：雷鸟发信 → Stalwart SMTP 投递 → 同步脚本检测 Stalwart Sent → 调本接口落库已发送记录，
+	//       避免同一封邮件被 Resend 二次投递给收件人。
+	async importSent(c, params, userId) {
+		const { accountId, sendEmail, name, subject, text, content, receiveEmail, messageId, attachments, createTime, cc, bcc } = params;
+
+		const accountRow = await accountService.selectById(c, Number(accountId));
+		if (!accountRow) {
+			throw new BizError(t('senderAccountNotExist'));
+		}
+		if (accountRow.userId !== userId) {
+			throw new BizError(t('sendEmailNotCurUser'));
+		}
+
+		const emailData = {
+			sendEmail: sendEmail || accountRow.email,
+			name: name || emailUtils.getName(accountRow.email) || '',
+			subject: subject || '',
+			text: text || '',
+			content: content || text || '',
+			cc: JSON.stringify(Array.isArray(cc) ? cc : []),
+			bcc: JSON.stringify(Array.isArray(bcc) ? bcc : []),
+			accountId: Number(accountId),
+			userId,
+			status: emailConst.status.SENT,
+			type: emailConst.type.SEND,
+		};
+
+		if (messageId) {
+			emailData.messageId = String(messageId);
+		}
+		if (createTime) {
+			emailData.createTime = String(createTime);
+		}
+		if (Array.isArray(receiveEmail) && receiveEmail.length > 0) {
+			emailData.recipient = JSON.stringify(receiveEmail.map(a => ({ address: String(a), name: '' })));
+			emailData.toEmail = receiveEmail.join(',');
+		}
+
+		const emailResult = await orm(c).insert(email).values(emailData).returning().get();
+
+		// 保存普通附件（content 为 base64，与前端发信格式一致）
+		if (Array.isArray(attachments) && attachments.length > 0) {
+			const attList = attachments
+				.filter(a => a && a.content)
+				.map(a => ({ filename: a.filename || 'attachment', type: a.mimeType || a.type || 'application/octet-stream', content: a.content }));
+			if (attList.length > 0) {
+				await attService.saveSendAtt(c, attList, userId, emailResult.accountId, emailResult.emailId);
+			}
+		}
+
+		return emailResult;
+	},
+
 	async sendByCloudflareEmail(c, params) {
 		const sendForm = {
 			from: { email: params.accountEmail, name: params.name },

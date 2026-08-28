@@ -47,6 +47,11 @@ const CFG = {
   page: Number(process.env.FETCH_PAGE || 50),
   interval: Number(process.env.POLL_INTERVAL || 30000),
   withAttachments: envBool(process.env.ATTACHMENTS),
+  // 反向同步（需 STALWART_JMAP_URL 已配置）：
+  syncDelete: envBool(process.env.SYNC_DELETE === undefined ? '1' : process.env.SYNC_DELETE), // 雷鸟删除 → CloudMail 垃圾桶
+  syncSent: envBool(process.env.SYNC_SENT === undefined ? '1' : process.env.SYNC_SENT),       // 雷鸟发信 → CloudMail 已发送
+  sentMailbox: (process.env.STALWART_SENT_MAILBOX || 'Sent').trim(),                          // Stalwart 已发送邮箱名
+  syncSentHistory: envBool(process.env.SYNC_SENT_HISTORY),                                     // 首次启用时是否追溯历史已发送（默认否）
 };
 
 if (!CFG.email || !CFG.password) {
@@ -132,33 +137,67 @@ const cloud = {
     const j = await this.api('/api/email/read', { method: 'PUT', body: { emailIds } });
     if (j.code !== 200) throw new Error('标记已读失败：' + (j.message || ''));
   },
+  // 删除同步：移入 CloudMail 垃圾桶（软删除）
+  async delete(emailIds) {
+    if (!emailIds.length) return;
+    const j = await this.api('/api/email/delete?emailIds=' + emailIds.join(','), { method: 'DELETE' });
+    if (j.code !== 200) throw new Error('删除失败：' + (j.message || ''));
+  },
+  // 发信同步：导入已发送记录（不触发 Resend 投递）
+  async importSent(body) {
+    const j = await this.api('/api/email/import-sent', { method: 'POST', body });
+    if (j.code !== 200) throw new Error('导入已发送失败：' + (j.message || ''));
+    return j.data;
+  },
 };
 
-// ---------------- 状态文件（key = accountId:emailId） ----------------
-function pruneState(set) {
-  if (set.size <= STATE_MAX) return;
-  // 保留 emailId 最大的（最新）STATE_MAX 条：旧 id 不会再次出现在最新列表，可安全裁剪
-  const arr = [...set];
-  arr.sort((a, b) => {
-    const ia = Number(a.slice(a.lastIndexOf(':') + 1));
-    const ib = Number(b.slice(b.lastIndexOf(':') + 1));
-    return ib - ia;
-  });
-  set.clear();
-  arr.slice(0, STATE_MAX).forEach((k) => set.add(k));
+// ---------------- 状态文件 ----------------
+// 结构：
+//   synced:          Set<"accountId:emailId">      已下行同步（防重复投递）
+//   stalwartMap:     Map<stalwartEmailId, key>     已登记 Stalwart 邮件 ↔ CloudMail 映射（删除检测用）
+//   sentDone:        Set<stalwartEmailId>          已导入 CloudMail 已发送的 Stalwart Sent 邮件
+//   sentQueryState:  JMAP Email/queryChanges 的增量游标
+function emptyState() {
+  return { synced: new Set(), stalwartMap: new Map(), sentDone: new Set(), sentQueryState: '' };
+}
+function pruneState(st) {
+  if (st.synced.size > STATE_MAX) {
+    // 保留 emailId 最大的（最新）STATE_MAX 条
+    const arr = [...st.synced].sort((a, b) => Number(b.slice(b.lastIndexOf(':') + 1)) - Number(a.slice(a.lastIndexOf(':') + 1)));
+    st.synced = new Set(arr.slice(0, STATE_MAX));
+  }
+  if (st.stalwartMap.size > STATE_MAX) {
+    const arr = [...st.stalwartMap.entries()]
+      .sort((a, b) => Number(b[1].slice(b[1].lastIndexOf(':') + 1)) - Number(a[1].slice(a[1].lastIndexOf(':') + 1)));
+    st.stalwartMap = new Map(arr.slice(0, STATE_MAX));
+  }
+  if (st.sentDone.size > STATE_MAX) {
+    st.sentDone = new Set([...st.sentDone].slice(-STATE_MAX));
+  }
 }
 function loadState() {
   try {
     const data = JSON.parse(fs.readFileSync(CFG.stateFile, 'utf8'));
-    return new Set(Array.isArray(data.synced) ? data.synced : []);
-  } catch (e) { return new Set(); }
+    return {
+      synced: new Set(Array.isArray(data.synced) ? data.synced : []),
+      stalwartMap: new Map(Object.entries(data.stalwartMap || {})),
+      sentDone: new Set(Array.isArray(data.sentDone) ? data.sentDone : []),
+      sentQueryState: typeof data.sentQueryState === 'string' ? data.sentQueryState : '',
+    };
+  } catch (e) { return emptyState(); }
 }
-function saveState(set) {
-  pruneState(set); // 先裁剪再落盘，控制文件大小与写盘开销
+function saveState(st) {
+  pruneState(st); // 先裁剪再落盘，控制文件大小与写盘开销
   const dir = path.dirname(CFG.stateFile);
   fs.mkdirSync(dir, { recursive: true });
   const tmp = CFG.stateFile + '.tmp';
-  fs.writeFileSync(tmp, JSON.stringify({ updatedAt: new Date().toISOString(), synced: [...set] }));
+  fs.writeFileSync(tmp, JSON.stringify({
+    updatedAt: new Date().toISOString(),
+    synced: [...st.synced],
+    stalwartMap: Object.fromEntries(st.stalwartMap),
+    sentDone: [...st.sentDone],
+    sentQueryState: st.sentQueryState,
+  }));
   fs.renameSync(tmp, CFG.stateFile);
 }
 
@@ -334,8 +373,195 @@ async function readBack(accounts) {
   }
 }
 
+// ---------------- JMAP 反向同步（删除回写 / 发信导入） ----------------
+const jmap = {
+  accountId: null,
+  mailboxIds: {}, // name -> id（进程内缓存）
+  async session() {
+    if (!this.accountId) {
+      const session = await jmapFetch('', 'GET');
+      this.accountId = session && session.primaryAccounts && session.primaryAccounts.mail;
+      if (!this.accountId) throw new Error('JMAP 无 mail 账户');
+    }
+    return this.accountId;
+  },
+  // 通用调用：methodCalls = [[name, args, tag]]，返回 { 方法名: [响应,...] }
+  async call(methodCalls) {
+    const accountId = await this.session();
+    const r = await jmapFetch('', 'POST', {
+      using: ['urn:ietf:params:jmap:core', 'urn:ietf:params:jmap:mail'],
+      methodCalls: methodCalls.map(([name, args, tag]) => [name, Object.assign({}, args, { accountId }), tag || 'm']),
+    });
+    const resp = {};
+    for (const [name, data] of (r.methodResponses || [])) {
+      if (!resp[name]) resp[name] = [];
+      resp[name].push(data);
+    }
+    return resp;
+  },
+  async mailboxId(name) {
+    if (this.mailboxIds[name] !== undefined) return this.mailboxIds[name];
+    const r = await this.call([['Mailbox/query', { filter: { name }, limit: 10 }, 'mb']]);
+    const ids = (r['Mailbox/query'] && r['Mailbox/query'][0] && r['Mailbox/query'][0].ids) || [];
+    this.mailboxIds[name] = ids[0] || null;
+    return this.mailboxIds[name];
+  },
+  // 当前收件箱全部邮件 ID（分页，上限 10000 防失控）
+  async inboxIds() {
+    const inboxId = await this.mailboxId('INBOX');
+    if (!inboxId) return new Set();
+    const ids = new Set();
+    for (let pos = 0; pos < 10000 && ids.size >= pos; pos = ids.size) {
+      const r = await this.call([['Email/query', { filter: { inMailbox: inboxId }, limit: 500, position: pos }, 'q']]);
+      const list = ((r['Email/query'] && r['Email/query'][0]) ? r['Email/query'][0].ids : []) || [];
+      if (!list.length) break;
+      for (const id of list) ids.add(id);
+      if (list.length < 500) break;
+      if (ids.size >= 10000) break;
+    }
+    return ids;
+  },
+};
+
+// 投递后登记 Stalwart 邮件 ID（通过固定 Message-ID 反查），供删除同步匹配
+async function registerStalwartId(st, key) {
+  const emailId = key.slice(key.lastIndexOf(':') + 1);
+  const mid = 'cloudmail-' + emailId + '@duckgame-play.top';
+  const r = await jmap.call([['Email/query', { filter: { messageId: mid }, limit: 1 }, 'q']]);
+  const id = ((r['Email/query'] && r['Email/query'][0]) ? r['Email/query'][0].ids : [])[0];
+  if (id) st.stalwartMap.set(id, key);
+}
+
+// 删除同步：雷鸟把邮件移出收件箱（删除/归档/移入垃圾桶）→ CloudMail 移入垃圾桶
+async function syncDeletes(st) {
+  if (!CFG.syncDelete || !st.stalwartMap.size) return;
+  const inbox = await jmap.inboxIds();
+  if (!inbox.size) return; // 查询失败/空收件箱保护
+  const toDelete = [];
+  for (const [sid, key] of st.stalwartMap) {
+    if (!inbox.has(sid)) toDelete.push({ sid, key });
+  }
+  for (const { sid, key } of toDelete) {
+    const emailId = key.slice(key.lastIndexOf(':') + 1);
+    try {
+      await cloud.delete([Number(emailId)]);
+      st.stalwartMap.delete(sid);
+      st.synced.delete(key); // 释放：若 CloudMail 端恢复，将重新镜像
+      console.log('[' + new Date().toISOString() + '] 删除同步：' + key);
+    } catch (e) {
+      console.error('  删除 ' + key + ' 失败：' + e.message); // 下轮重试
+    }
+  }
+}
+
+function formatCloudTime(iso) {
+  if (!iso) return '';
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return String(iso).slice(0, 19);
+  const p = (n) => String(n).padStart(2, '0');
+  return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate())
+    + ' ' + p(d.getHours()) + ':' + p(d.getMinutes()) + ':' + p(d.getSeconds());
+}
+
+async function jmapDownload(accountId, blobId, name) {
+  const base = CFG.jmapUrl.replace(/\/+$/, '');
+  const url = base + '/download/' + encodeURIComponent(accountId) + '/' + encodeURIComponent(blobId) + '/' + encodeURIComponent(name);
+  const auth = 'Basic ' + Buffer.from(CFG.jmapUser + ':' + CFG.jmapPass).toString('base64');
+  const r = await fetchT(url, { headers: { Authorization: auth } });
+  if (!r.ok) throw new Error('JMAP 下载 HTTP ' + r.status);
+  return Buffer.from(await r.arrayBuffer());
+}
+
+async function importSentEmails(st, ids, accountByEmail) {
+  for (let i = 0; i < ids.length; i += 50) {
+    const batch = ids.slice(i, i + 50);
+    const r = await jmap.call([['Email/get', {
+      ids: batch,
+      properties: ['messageId', 'from', 'to', 'cc', 'subject', 'textBody', 'htmlBody', 'attachments', 'date'],
+    }, 'g']]);
+    const list = ((r['Email/get'] && r['Email/get'][0]) ? r['Email/get'][0].list : []) || [];
+    for (const e of list) {
+      try {
+        const from = Array.isArray(e.from) ? e.from[0] : null;
+        if (!from || !from.email) { st.sentDone.add(e.id); console.warn('  已发送无发件人，跳过：' + e.id); continue; }
+        const acc = accountByEmail.get(from.email);
+        if (!acc) { st.sentDone.add(e.id); console.warn('  发件人 ' + from.email + ' 不是 CloudMail 账户，跳过导入'); continue; }
+        const textBody = (e.textBody || []).find(b => b.type === 'text/plain');
+        const htmlBody = (e.htmlBody || []).find(b => b.type === 'text/html');
+        const attachments = [];
+        let total = 0;
+        const MAX_SINGLE = ATTACH_MAX_MB * 1024 * 1024;
+        const MAX_TOTAL = ATTACH_TOTAL_MAX_MB * 1024 * 1024;
+        for (const a of (e.attachments || [])) {
+          if (a.disposition === 'inline' || !a.blobId) continue; // 内嵌图跳过（v1）
+          if (a.size && a.size > MAX_SINGLE) { console.warn('  附件超上限跳过：' + (a.name || a.blobId)); continue; }
+          if (total >= MAX_TOTAL) break;
+          try {
+            const buf = await jmapDownload(await jmap.session(), a.blobId, a.name);
+            total += buf.length;
+            if (total > MAX_TOTAL) break;
+            attachments.push({ filename: a.name || 'attachment', mimeType: a.type || 'application/octet-stream', content: buf.toString('base64') });
+          } catch (err) { console.warn('  附件下载失败 ' + (a.name || a.blobId) + '：' + err.message); }
+        }
+        await cloud.importSent({
+          accountId: acc.accountId,
+          sendEmail: from.email,
+          name: from.name || acc.name || '',
+          receiveEmail: (e.to || []).map(t => t.email).filter(Boolean),
+          cc: (e.cc || []).map(t => t.email).filter(Boolean),
+          subject: e.subject || '',
+          text: textBody ? textBody.value : '',
+          content: htmlBody ? htmlBody.value : '',
+          messageId: Array.isArray(e.messageId) ? e.messageId[0] : null,
+          createTime: formatCloudTime(e.date),
+          attachments,
+        });
+        st.sentDone.add(e.id);
+        console.log('[' + new Date().toISOString() + '] 发信同步：' + (e.subject || '').slice(0, 50) + ' ← ' + from.email);
+      } catch (err) {
+        console.error('  已发送导入失败 ' + (e.id || '') + '：' + err.message);
+      }
+    }
+  }
+}
+
+// 发信同步：Stalwart 已发送邮箱新增邮件 → 导入 CloudMail 已发送（不重复投递）
+async function syncSent(st, accounts) {
+  if (!CFG.syncSent) return;
+  const sentId = await jmap.mailboxId(CFG.sentMailbox);
+  if (!sentId) { console.warn('未找到 Stalwart 邮箱「' + CFG.sentMailbox + '」，发信同步跳过'); return; }
+  const accountByEmail = new Map();
+  for (const a of accounts) accountByEmail.set(a.email, a);
+
+  // 首次启用：建立基线。默认不追溯历史（SYNC_SENT_HISTORY=1 才导入）
+  if (!st.sentQueryState) {
+    const q = await jmap.call([['Email/query', { filter: { inMailbox: sentId }, limit: 500 }, 'q']]);
+    const res = q['Email/query'] && q['Email/query'][0];
+    st.sentQueryState = (res && res.queryState) || '';
+    for (const id of (res && res.ids) || []) st.sentDone.add(id);
+    if (!CFG.syncSentHistory) {
+      console.log('[' + new Date().toISOString() + '] 发信同步基线建立（历史 ' + st.sentDone.size + ' 条不追溯）');
+      return;
+    }
+    await importSentEmails(st, [...st.sentDone], accountByEmail);
+    return;
+  }
+
+  let qs = st.sentQueryState;
+  for (let round = 0; round < 5; round++) {
+    const r = await jmap.call([['Email/queryChanges', { filter: { inMailbox: sentId }, sinceQueryState: qs }, 'c']]);
+    const res = r['Email/queryChanges'] && r['Email/queryChanges'][0];
+    if (!res) break;
+    qs = res.newQueryState || qs;
+    const addedIds = (res.added || []).map(a => a.id).filter(id => !st.sentDone.has(id));
+    if (addedIds.length) await importSentEmails(st, addedIds, accountByEmail);
+    if (!res.hasMoreChanges) break;
+  }
+  st.sentQueryState = qs;
+}
+
 // ---------------- 主同步循环（多账户） ----------------
-async function syncAccount(acc, rcpt, synced) {
+async function syncAccount(acc, rcpt, st) {
   let cursor = 0, page = 0, added = 0, smtpFails = 0;
   try {
     while (true) {
@@ -345,13 +571,18 @@ async function syncAccount(acc, rcpt, synced) {
       if (!emails.length) break;
       for (const m of emails) {
         const key = acc.accountId + ':' + m.emailId;
-        if (synced.has(key)) continue;
+        if (st.synced.has(key)) continue;
         try {
           const detail = await cloud.detail(m.emailId);
           const raw = await buildMime(detail, m.emailId, rcpt);
           await smtpSend(raw, rcpt);
-          synced.add(key); added++;
+          st.synced.add(key); added++;
           smtpFails = 0;
+          // 登记 Stalwart 邮件 ID（供删除同步匹配；失败不阻塞投递）
+          if (CFG.jmapUrl && CFG.jmapUser && CFG.syncDelete) {
+            try { await registerStalwartId(st, key); }
+            catch (e) { console.warn('  [删除同步] 登记失败 ' + key + '：' + e.message); }
+          }
           console.log('  [' + acc.email + '] 同步 ' + m.emailId + '：' + (m.subject || '').slice(0, 50));
         } catch (e) {
           smtpFails++;
@@ -366,29 +597,36 @@ async function syncAccount(acc, rcpt, synced) {
       if (page > 50) break;
     }
   } finally {
-    saveState(synced); // 每账户同步完就落盘，防中途失败丢进度导致重复投递
+    saveState(st); // 每账户同步完就落盘，防中途失败丢进度导致重复投递
   }
   if (added) console.log('[' + new Date().toISOString() + '] ' + acc.email + ' 新增 ' + added + ' 封');
 }
 
 async function syncOnce() {
-  const synced = loadState();
+  const st = loadState();
   const accounts = await cloud.accounts();
   if (!accounts.length) { console.warn('CloudMail 无可用账户'); return; }
   for (const acc of accounts) {
     const rcpt = cleanRcpt(CFG.accountMap[acc.email] || CFG.defaultRcpt);
     if (!rcpt) { console.warn('账户 ' + acc.email + ' 无目标 Stalwart 邮箱（STALWART_RCPT_TO/STALWART_ACCOUNTS），跳过'); continue; }
-    try { await syncAccount(acc, rcpt, synced); }
-    catch (e) { console.error('  账户 ' + acc.email + ' 同步异常：' + e.message); saveState(synced); }
+    try { await syncAccount(acc, rcpt, st); }
+    catch (e) { console.error('  账户 ' + acc.email + ' 同步异常：' + e.message); saveState(st); }
   }
   if (CFG.jmapUrl && CFG.jmapUser) {
+    if (CFG.syncDelete) {
+      try { await syncDeletes(st); } catch (e) { console.warn('删除同步跳过（' + e.message + '）'); }
+    }
+    if (CFG.syncSent) {
+      try { await syncSent(st, accounts); } catch (e) { console.warn('发信同步跳过（' + e.message + '）'); }
+    }
     try { await readBack(accounts); } catch (e) { console.warn('已读回写跳过（' + e.message + '）'); }
+    saveState(st); // 持久化 sentQueryState / stalwartMap 变更
   }
 }
 
 async function main() {
   console.log('CloudMail→Stalwart 同步 v2 启动，轮询 ' + (CFG.interval / 1000) + 's'
-    + (CFG.jmapUrl && CFG.jmapUser ? '，已读回写开启' : ''));
+    + (CFG.jmapUrl && CFG.jmapUser ? '，已读回写/删除/发信同步开启' : ''));
   while (true) {
     try {
       await cloud.login();

@@ -181,7 +181,11 @@ export default {
         // TTL 设为 7 天，同文件最多每 7 天回源一次（文件被删除时最迟 7 天失效）
         // 只缓存 GET：HEAD 首次请求如果把空 body 写入缓存，会污染同路径的
         // GET 命中（Cache API 对 GET/HEAD 按同一 key 匹配）→ 附件下载/预览返回空内容
-        newHeaders.set('Cache-Control', 'private, max-age=604800');
+        // 浏览器 Cache-Control 与签名剩余有效期对齐：同一 URL（固定 expires/sign）
+        // 在签名过期后不应再被浏览器本地缓存命中（默认 15 分钟签名，缓存最长 5 分钟，
+        // 避免「URL 已过期但浏览器缓存仍可读」的窗口被放大）
+        const browserMaxAge = Math.max(0, Math.min(signature.remaining, 300));
+        newHeaders.set('Cache-Control', `private, max-age=${browserMaxAge}`);
         const cacheResp = new Response(response.body, {
           status: response.status,
           statusText: response.statusText,

@@ -61,6 +61,12 @@ app.post('/email/send', async (c) => {
 	return c.json(result.ok(email));
 });
 
+// 已发送记录导入（Thunderbird→Stalwart 发信镜像，不触发 Resend 投递）
+app.post('/email/import-sent', async (c) => {
+	const email = await emailService.importSent(c, await c.req.json(), userContext.getUserId(c));
+	return c.json(result.ok(email));
+});
+
 app.put('/email/read', async (c) => {
 	await emailService.read(c, await c.req.json(), userContext.getUserId(c));
 	return c.json(result.ok());
