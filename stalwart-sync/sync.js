@@ -54,6 +54,10 @@ const CFG = {
   syncSent: envBool(process.env.SYNC_SENT === undefined ? '1' : process.env.SYNC_SENT),       // 雷鸟发信 → CloudMail 已发送
   sentMailbox: (process.env.STALWART_SENT_MAILBOX || 'Sent').trim(),                          // Stalwart 已发送邮箱名
   syncSentHistory: envBool(process.env.SYNC_SENT_HISTORY),                                     // 首次启用时是否追溯历史已发送（默认否）
+  // 发信同步落库方式：
+  //   import（默认，方案 A/B）：Stalwart/第三方已投递，仅镜像记录（/api/email/import-sent，不投递）
+  //   send（方案 C）：Stalwart 只收集（哑 SMTP），真正投递走 CloudMail Resend（/api/email/send，HTTPS 不走 25）
+  sentMode: ((process.env.SYNC_SENT_MODE || 'import').trim().toLowerCase() === 'send') ? 'send' : 'import',
 };
 
 if (!CFG.email || !CFG.password) {
@@ -157,16 +161,23 @@ const cloud = {
     if (j.code !== 200) throw new Error('导入已发送失败：' + (j.message || ''));
     return j.data;
   },
+  // 发信同步（方案 C）：真正投递走 CloudMail Resend（HTTPS，不走 25）
+  async send(body) {
+    const j = await this.api('/api/email/send', { method: 'POST', body });
+    if (j.code !== 200) throw new Error('Resend 投递失败：' + (j.message || ''));
+    return j.data;
+  },
 };
 
 // ---------------- 状态文件 ----------------
 // 结构：
 //   synced:          Set<"accountId:emailId">      已下行同步（防重复投递）
 //   stalwartMap:     Map<stalwartEmailId, key>     已登记 Stalwart 邮件 ↔ CloudMail 映射（删除检测用）
-//   sentDone:        Set<stalwartEmailId>          已导入 CloudMail 已发送的 Stalwart Sent 邮件
+//   sentDone:        Set<stalwartEmailId>          已导入/已发送的 Stalwart Sent 邮件
 //   sentQueryState:  JMAP Email/queryChanges 的增量游标
+//   sentFail:        Map<stalwartEmailId, count>   发信同步失败重试计数（≥3 放弃，防确定性失败刷屏）
 function emptyState() {
-  return { synced: new Set(), stalwartMap: new Map(), sentDone: new Set(), sentQueryState: '' };
+  return { synced: new Set(), stalwartMap: new Map(), sentDone: new Set(), sentQueryState: '', sentFail: new Map() };
 }
 function pruneState(st) {
   if (st.synced.size > STATE_MAX) {
@@ -182,6 +193,9 @@ function pruneState(st) {
   if (st.sentDone.size > STATE_MAX) {
     st.sentDone = new Set([...st.sentDone].slice(-STATE_MAX));
   }
+  if (st.sentFail.size > 100) {
+    st.sentFail = new Map([...st.sentFail].slice(-100));
+  }
 }
 function loadState() {
   try {
@@ -191,6 +205,7 @@ function loadState() {
       stalwartMap: new Map(Object.entries(data.stalwartMap || {})),
       sentDone: new Set(Array.isArray(data.sentDone) ? data.sentDone : []),
       sentQueryState: typeof data.sentQueryState === 'string' ? data.sentQueryState : '',
+      sentFail: new Map(Object.entries(data.sentFail || {})),
     };
   } catch (e) { return emptyState(); }
 }
@@ -205,6 +220,7 @@ function saveState(st) {
     stalwartMap: Object.fromEntries(st.stalwartMap),
     sentDone: [...st.sentDone],
     sentQueryState: st.sentQueryState,
+    sentFail: Object.fromEntries(st.sentFail),
   }));
   fs.renameSync(tmp, CFG.stateFile);
 }
@@ -511,7 +527,11 @@ async function importSentEmails(st, ids, accountByEmail) {
             attachments.push({ filename: a.name || 'attachment', mimeType: a.type || 'application/octet-stream', content: buf.toString('base64') });
           } catch (err) { console.warn('  附件下载失败 ' + (a.name || a.blobId) + '：' + err.message); }
         }
-        await cloud.importSent({
+        // send 模式（方案 C）：CloudMail /api/email/send 限制附件 ≤10，超限截断
+        const deliverAtts = CFG.sentMode === 'send' && attachments.length > 10
+          ? (() => { console.warn('  [方案C] 附件 >10，CloudMail send 限制，仅投递前 10 个（共 ' + attachments.length + '）'); return attachments.slice(0, 10); })()
+          : attachments;
+        const body = {
           accountId: acc.accountId,
           sendEmail: from.email,
           name: from.name || acc.name || '',
@@ -522,12 +542,24 @@ async function importSentEmails(st, ids, accountByEmail) {
           content: htmlBody ? htmlBody.value : '',
           messageId: Array.isArray(e.messageId) ? e.messageId[0] : null,
           createTime: formatCloudTime(e.date),
-          attachments,
-        });
+          attachments: deliverAtts,
+        };
+        const deliver = CFG.sentMode === 'send' ? cloud.send : cloud.importSent;
+        await deliver(body);
         st.sentDone.add(e.id);
-        console.log('[' + new Date().toISOString() + '] 发信同步：' + (e.subject || '').slice(0, 50) + ' ← ' + from.email);
+        st.sentFail.delete(e.id);
+        console.log('[' + new Date().toISOString() + '] 发信同步' + (CFG.sentMode === 'send' ? '[Resend投递]' : '[镜像]') + '：' + (e.subject || '').slice(0, 50) + ' ← ' + from.email);
       } catch (err) {
-        console.error('  已发送导入失败 ' + (e.id || '') + '：' + err.message);
+        // 失败重试计数：连续 3 轮失败（多为确定性错误：附件超限/权限/账户不存在）→ 放弃防刷屏
+        const cnt = (st.sentFail.get(e.id) || 0) + 1;
+        st.sentFail.set(e.id, cnt);
+        if (cnt >= 3) {
+          st.sentDone.add(e.id);
+          st.sentFail.delete(e.id);
+          console.warn('  发信同步放弃 ' + (e.id || '') + '（连续失败 ' + cnt + ' 轮）：' + err.message);
+        } else {
+          console.warn('  发信同步失败 ' + (e.id || '') + '（第 ' + cnt + ' 轮，下轮重试）：' + err.message);
+        }
       }
     }
   }

@@ -7,7 +7,7 @@ const path = require('path');
 let src = fs.readFileSync(__dirname + '/sync.js', 'utf8');
 src = src.replace(/^#!.*\n/, '');
 src = src.replace(/main\(\)\.catch[\s\S]*$/, '');
-const fn = new Function('require', src + '\nreturn { pruneState, cleanRcpt, buildMime, formatCloudTime, syncDeletes, syncSent, registerStalwartId, jmap, cloud, loadState, saveState, emptyState, STATE_MAX };');
+const fn = new Function('require', src + '\nreturn { pruneState, cleanRcpt, buildMime, formatCloudTime, syncDeletes, syncSent, registerStalwartId, jmap, cloud, loadState, saveState, emptyState, STATE_MAX, CFG };');
 const api = fn(require);
 let pass = 0, fail = 0;
 const ok = (c, n) => { if (c) { pass++; console.log('  OK ' + n); } else { fail++; console.log('  FAIL ' + n); } };
@@ -97,6 +97,40 @@ const ok = (c, n) => { if (c) { pass++; console.log('  OK ' + n); } else { fail+
   api.cloud.importSent = async () => { skip++; return {}; };
   await api.syncSent(stX, [{ accountId: 1, email: 'u@duckgame-play.top' }]);
   ok(skip === 0 && stX.sentDone.has('c'), '跳过且标记完成（防刷）');
+
+  console.log('10) 发信同步 send 模式（方案 C）');
+  const stS = api.emptyState();
+  stS.sentQueryState = 'QS0';
+  api.CFG.sentMode = 'send';
+  api.jmap.mailboxId = async () => 'SENT-ID';
+  api.jmap.call = async (calls) => {
+    const n = calls[0][0];
+    if (n === 'Email/queryChanges') return { 'Email/queryChanges': [{ newQueryState: 'QS1', added: [{ id: 's1' }], hasMoreChanges: false }] };
+    if (n === 'Email/get') return { 'Email/get': [{ list: [{ id: 's1', from: [{ email: 'u@duckgame-play.top' }], to: [{ email: 'x@y.com' }], cc: [], subject: 'hi', textBody: [{ type: 'text/plain', value: 't' }], htmlBody: [], messageId: ['m1'], date: '2026-08-28T10:20:30Z', attachments: [] }] }] };
+    return {};
+  };
+  let sendCalls = 0, importCalls2 = 0;
+  api.cloud.send = async () => { sendCalls++; return {}; };
+  api.cloud.importSent = async () => { importCalls2++; return {}; };
+  await api.syncSent(stS, [{ accountId: 1, email: 'u@duckgame-play.top' }]);
+  ok(sendCalls === 1 && importCalls2 === 0, 'send 模式调 /api/email/send（不走 import-sent）');
+  ok(stS.sentDone.has('s1'), 'send 成功后标记完成');
+
+  console.log('11) send 失败重试 3 轮放弃');
+  const stRetry = api.emptyState();
+  stRetry.sentQueryState = 'QS0';
+  api.jmap.mailboxId = async () => 'SENT-ID';
+  let failN = 0;
+  api.jmap.call = async (calls) => {
+    const n = calls[0][0];
+    if (n === 'Email/queryChanges') return { 'Email/queryChanges': [{ newQueryState: 'QS' + (failN + 1), added: [{ id: 'f1' }], hasMoreChanges: false }] };
+    if (n === 'Email/get') return { 'Email/get': [{ list: [{ id: 'f1', from: [{ email: 'u@duckgame-play.top' }], to: [{ email: 'x@y.com' }], cc: [], subject: 's', textBody: [], htmlBody: [], attachments: [] }] }] };
+    return {};
+  };
+  api.cloud.send = async () => { failN++; throw new Error('模拟失败'); };
+  for (let round = 0; round < 3; round++) { stRetry.sentQueryState = 'QS' + round; await api.syncSent(stRetry, [{ accountId: 1, email: 'u@duckgame-play.top' }]); }
+  ok(failN === 3 && stRetry.sentDone.has('f1'), '连续失败 3 轮后放弃并标记完成');
+  ok(!stRetry.sentFail.has('f1'), '放弃后清除失败计数');
 
   try { fs.unlinkSync(path.join(__dirname, '_test_state.json')); } catch (e) {}
   console.log('\n结果：' + pass + ' 通过，' + fail + ' 失败');

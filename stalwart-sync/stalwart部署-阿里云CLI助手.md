@@ -119,13 +119,23 @@ Stalwart 管理 UI 默认监听 **localhost:8080**。先在 VPS 上做一次 SSH
 > ⚠️ 方案 B 中，Stalwart 的 **MAIL FROM 域名**必须与第三方 SMTP 的验证域名一致，
 > 否则第三方拒绝代发。多域名时要么每域一个中继凭据，要么统一用 A。
 
-**可选 C（加固预留）：雷鸟 → Stalwart 收集 → CloudMail Resend API 投递（零第三方依赖，未实现）**
-- 雷鸟发件 SMTP → Stalwart submission(587) → **Stalwart Relay 指向本机哑 SMTP 收集器
-  （127.0.0.1:2526，接受即丢弃，仅供 Stalwart 完成"投递"并存入 Sent）**
-- 同步脚本检测 Stalwart Sent 新邮件 → 调 `POST /api/email/send`（**CloudMail 的 Resend API，
-  HTTPS 投递不走 25**，多域名 resend token 已配置）→ 已发送记录直接落 CloudMail
-- 局限：CloudMail `send` 有附件数(≤10)/发信次数/角色限制；方案设计详见
-  `安全加固-雷鸟镜像.md` §四.5（本期不实现，当前用方案 A 功能完整）
+**可选 C（已实现）：雷鸟 → Stalwart 收集 → CloudMail Resend API 投递（零第三方依赖）**
+1. **Stalwart Web UI** → Server → 开启 submission 监听 `587`（TLS 证书同 IMAP）；
+   **Relay 配置指向本机哑 SMTP**：`relay.host = 127.0.0.1`、`relay.port = 2526`、
+   `relay.auth = none`、`relay.security = none`（明文，仅回环）
+2. **部署 smtp-void**（接受 Stalwart relay 即丢弃，邮件副本留在 Sent）：
+   ```bash
+   cp /tmp/cloud-mail/stalwart-sync/smtp-void.js /opt/cloudmail-sync/
+   cp /tmp/cloud-mail/stalwart-sync/smtp-void.service /etc/systemd/system/
+   systemctl daemon-reload && systemctl enable --now smtp-void
+   ```
+3. **同步脚本开启 send 模式**：env 加 `SYNC_SENT_MODE=send`（见 §5）
+4. 雷鸟发件 SMTP = `imap.duckgame-play.top:587`（Tunnel 已配，见 §6），凭据 = Stalwart 账户
+5. 同步脚本检测 Stalwart Sent 新邮件 → 调 `POST /api/email/send`（**CloudMail Resend API，
+   HTTPS 投递不走 25**，多域名 resend token 已配）→ 已发送记录直接落 CloudMail
+6. 局限：CloudMail `send` 限附件 ≤10（脚本侧截断）+ 发信次数/角色限制；连续失败 3 轮自动放弃
+   （详见 `安全加固-雷鸟镜像.md` §四.5）
+- **方案 A/B**（第三方 SMTP 中继）仍可用作备选：`SYNC_SENT_MODE=import`（默认）+ import-sent 镜像
 
 ### 多域名注意事项（本部署：delicateduck.xyz + ciallo.sale，共 5 号）
 - CloudMail 登录用户 `admin@delicateduck.xyz`（多号模式）下有 5 个邮箱账户：
@@ -154,19 +164,9 @@ cd /tmp
 git clone --depth 1 -b thunderbird-client https://github.com/DelicateDuck582/cloud-mail.git
 cp /tmp/cloud-mail/stalwart-sync/sync.js /opt/cloudmail-sync/
 cp /tmp/cloud-mail/stalwart-sync/cloudmail-sync.service /etc/systemd/system/
+cp /tmp/cloud-mail/stalwart-sync/smtp-void.js /opt/cloudmail-sync/
+cp /tmp/cloud-mail/stalwart-sync/smtp-void.service /etc/systemd/system/
 chown -R cloudsync:cloudsync /opt/cloudmail-sync /var/lib/cloudmail-sync
-
-# 环境变量（单账户最小配置）
-cat > /etc/cloudmail-sync.env <<'EOF'
-CLOUDMAIL_EMAIL=REPLACE_WITH_EMAIL
-CLOUDMAIL_PASSWORD=REPLACE_WITH_PASSWORD
-STALWART_RCPT_TO=cloudmail@local.domain
-STALWART_SMTP_HOST=127.0.0.1
-STALWART_SMTP_PORT=2525
-STATE_FILE=/var/lib/cloudmail-sync/state.json
-POLL_INTERVAL=30000
-EOF
-chmod 600 /etc/cloudmail-sync.env
 
 # 环境变量（单账户最小配置：仅镜像 admin 一个号时用）
 cat > /etc/cloudmail-sync.env <<'EOF'
@@ -192,7 +192,10 @@ chmod 600 /etc/cloudmail-sync.env
 #   STALWART_PASSWORD=Stalwart邮箱密码
 #   # STALWART_SENT_MAILBOX=Sent   # 已发送邮箱名（默认 Sent）
 #   # SYNC_SENT_HISTORY=0          # 首次启用时追溯历史已发送（默认不追溯）
+#   # SYNC_SENT_MODE=send          # 方案 C：走 CloudMail Resend API 投递（需 smtp-void + Stalwart Relay，见 §4.5）
+#                                  # 默认 import：第三方 SMTP 中继投递，仅镜像记录
 # ⚠️ 发信导入依赖 mail-worker 新端点 /api/email/import-sent，需先在 Cloudflare 重新部署 mail-worker
+# ⚠️ 方案 C（SYNC_SENT_MODE=send）还需部署 smtp-void 服务（见 §4.5），并 `systemctl enable --now smtp-void`
 
 # 启动
 systemctl daemon-reload

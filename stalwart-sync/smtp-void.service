@@ -1,0 +1,23 @@
+[Unit]
+Description=CloudMail sync void SMTP collector (方案 C 发信用)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=cloudsync
+Group=cloudsync
+Environment=SMTP_VOID_HOST=127.0.0.1
+Environment=SMTP_VOID_PORT=2526
+ExecStart=/usr/bin/node /opt/cloudmail-sync/smtp-void.js
+Restart=on-failure
+RestartSec=5
+# 安全加固
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadOnlyPaths=/opt/cloudmail-sync
+
+[Install]
+WantedBy=multi-user.target

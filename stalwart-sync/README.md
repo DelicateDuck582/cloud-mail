@@ -18,7 +18,9 @@ VPS: Stalwart (SQLite) ←── IMAP :993 ── Cloudflare Tunnel ── Thund
 | 文件 | 说明 |
 |---|---|
 | `sync.js` | 同步脚本 v3（Node 零依赖）：下行 + 删除/发信/已读 反向同步 |
-| `cloudmail-sync.service` | systemd 单元（cloudsync 用户 + 加固） |
+| `smtp-void.js` | 哑 SMTP 收集器（方案 C）：接收 Stalwart relay 即丢弃，供发信走 CloudMail Resend |
+| `cloudmail-sync.service` | 同步脚本 systemd 单元（cloudsync 用户 + 加固） |
+| `smtp-void.service` | smtp-void 的 systemd 单元 |
 | `stalwart部署-阿里云CLI助手.md` | VPS 部署文档（Stalwart + 同步 + Tunnel + 防火墙 + 发信） |
 
 ## 同步脚本（v3）
@@ -36,16 +38,18 @@ VPS: Stalwart (SQLite) ←── IMAP :993 ── Cloudflare Tunnel ── Thund
 - CloudMail 端走软删除（垃圾桶）；`SYNC_DELETE=0` 关闭；网页端恢复后自动重新镜像
 
 ### 发信导入（雷鸟发信 → CloudMail 已发送，无 25 方案）
-- **无 25**：VPS 出站 25 被封，Stalwart 不中继；投递走**第三方 SMTP 中继（465/587）**：
-  - 方案 A：雷鸟发件服务器直连第三方 SMTP（SPF/DKIM 在第三方验证发件域）
-  - 方案 B：Stalwart submission(587) + Relay 指向第三方 SMTP(465, SMTP AUTH)
-  - 无论哪种，雷鸟把**已发送副本保存到 Stalwart Sent**（IMAP「副本与文件夹」）
-- 脚本用 JMAP `Email/queryChanges` 增量扫描 Stalwart **Sent** 邮箱 → 导入 CloudMail
-  `/api/email/import-sent`（**不触发 Resend，避免重复投递**——投递已由第三方完成）
+- **无 25**：VPS 出站 25 被封，Stalwart 不直投收件方；两种投递通道（`SYNC_SENT_MODE` 选择）：
+  - `import`（默认，方案 A）：投递走**第三方 SMTP 中继（465/587）**，脚本仅镜像记录
+    （`/api/email/import-sent`，不重复投递）
+  - `send`（**方案 C，零第三方依赖**）：投递走 **CloudMail 自身 Resend API**
+    （`POST /api/email/send`，HTTPS 不走 25，多域名 resend token 已配）——Stalwart 只作收集
+- **方案 C 链路**：雷鸟 → Stalwart submission(587) → **Stalwart Relay → 本机 smtp-void(2526)**（接受即丢弃，
+  邮件留在 Stalwart Sent）→ 脚本检测 Sent 新邮件 → `cloud.send`（Resend 真正投递）→ 已发送落 CloudMail
 - **多域名**：发件人按 From 匹配 CloudMail 账户（跨域名均可）；无法匹配的跳过；
   多域名建议绑定到**同一 Stalwart 账户的多个地址**（一套 JMAP 凭据覆盖全部）
 - `SYNC_SENT=0` 关闭；首次启用默认只建基线不追溯历史（`SYNC_SENT_HISTORY=1` 可追溯）
-- 注意：`/api/email/import-sent` 是 mail-worker 新增 fork 端点，**需重新部署 mail-worker**
+- `send` 模式注意：CloudMail send 限附件 ≤10（超限截断）+ 发信次数/角色限制；失败连续 3 轮自动放弃
+- ⚠️ `/api/email/import-sent` 是 mail-worker fork 端点，**需重新部署 mail-worker**
 
 ### 已读回写（雷鸟标已读 → CloudMail）
 - 通过 Stalwart **JMAP** 读取 `$seen` 状态，按 `Message-ID`（`cloudmail-<emailId>@duckgame-play.top`）匹配
@@ -78,6 +82,8 @@ STALWART_PASSWORD=Stalwart邮箱密码
 # STALWART_SENT_MAILBOX=Sent   # Stalwart 已发送邮箱名（默认 Sent）
 # SYNC_DELETE=1                # 删除回写（默认开）
 # SYNC_SENT=1                  # 发信导入（默认开）
+# SYNC_SENT_MODE=send          # send=方案C 走 CloudMail Resend 投递（需 smtp-void + Stalwart Relay）；
+#                              # import=默认，第三方 SMTP 中继投递，仅镜像记录
 # SYNC_SENT_HISTORY=0          # 首次启用时追溯历史已发送（默认不追溯）
 
 # ATTACHMENTS=1   # 可选：同步附件（下行）
