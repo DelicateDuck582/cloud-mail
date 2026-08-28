@@ -7,7 +7,7 @@ const path = require('path');
 let src = fs.readFileSync(__dirname + '/sync.js', 'utf8');
 src = src.replace(/^#!.*\n/, '');
 src = src.replace(/main\(\)\.catch[\s\S]*$/, '');
-const fn = new Function('require', src + '\nreturn { pruneState, cleanRcpt, buildMime, formatCloudTime, syncDeletes, syncSent, registerStalwartId, jmap, cloud, loadState, saveState, emptyState, STATE_MAX, CFG };');
+const fn = new Function('require', src + '\nreturn { pruneState, cleanRcpt, buildMime, formatCloudTime, syncDeletes, syncRestores, syncSent, queryStalwartId, jmap, cloud, loadState, saveState, emptyState, STATE_MAX, CFG, folderFor };');
 const api = fn(require);
 let pass = 0, fail = 0;
 const ok = (c, n) => { if (c) { pass++; console.log('  OK ' + n); } else { fail++; console.log('  FAIL ' + n); } };
@@ -35,26 +35,26 @@ const ok = (c, n) => { if (c) { pass++; console.log('  OK ' + n); } else { fail+
   const stD = api.emptyState();
   stD.stalwartMap.set('SA', '1:100'); stD.stalwartMap.set('SB', '1:99'); stD.synced.add('1:99');
   let delCalls = [];
-  api.jmap.inboxIds = async () => new Set(['SA']);
+  api.jmap.mailboxEmailIds = async () => new Set(['SA']);
   api.cloud.delete = async (ids) => { delCalls.push(ids); return 0; };
-  await api.syncDeletes(stD);
-  ok(delCalls.length === 1 && delCalls[0][0] === 99, '仅删移出收件箱的 1:99');
+  await api.syncDeletes(stD, ['F1']);
+  ok(delCalls.length === 1 && delCalls[0][0] === 99, '仅删移出文件夹的 1:99');
   ok(!stD.stalwartMap.has('SB') && stD.stalwartMap.has('SA'), '映射清理');
   ok(!stD.synced.has('1:99'), 'synced 释放');
 
   console.log('5) syncDeletes 失败重试');
   const stF = api.emptyState();
   stF.stalwartMap.set('SC', '1:50');
-  api.jmap.inboxIds = async () => new Set([]);
+  api.jmap.mailboxEmailIds = async () => new Set([]);
   api.cloud.delete = async () => { throw new Error('x'); };
-  await api.syncDeletes(stF);
+  await api.syncDeletes(stF, ['F1']);
   ok(stF.stalwartMap.has('SC'), '失败保留映射');
 
-  console.log('6) registerStalwartId');
+  console.log('6) queryStalwartId（幂等投递检查）');
   const stR = api.emptyState();
   api.jmap.call = async (calls) => calls[0][0] === 'Email/query' ? { 'Email/query': [{ ids: ['SX'] }] } : {};
-  await api.registerStalwartId(stR, '1:42');
-  ok(stR.stalwartMap.get('SX') === '1:42', 'Message-ID 反查登记');
+  const qid = await api.queryStalwartId('1:42');
+  ok(qid === 'SX', 'Message-ID 反查返回 id');
 
   console.log('7) syncSent 基线（不追溯）');
   const stB = api.emptyState();
@@ -131,6 +131,50 @@ const ok = (c, n) => { if (c) { pass++; console.log('  OK ' + n); } else { fail+
   for (let round = 0; round < 3; round++) { stRetry.sentQueryState = 'QS' + round; await api.syncSent(stRetry, [{ accountId: 1, email: 'u@duckgame-play.top' }]); }
   ok(failN === 3 && stRetry.sentDone.has('f1'), '连续失败 3 轮后放弃并标记完成');
   ok(!stRetry.sentFail.has('f1'), '放弃后清除失败计数');
+
+  console.log('12) syncRestores 垃圾桶恢复');
+  const stR2 = api.emptyState();
+  stR2.stalwartMap.set('EXIST', '1:100'); // 已登记 → 不处理
+  console.log('[dbg] stR2.stalwartMap.size=' + stR2.stalwartMap.size + ' has EXIST=' + stR2.stalwartMap.has('EXIST'));
+  let restoreCalls = [];
+  api.jmap.mailboxEmailIds = async () => new Set(['R1', 'EXIST']);
+  api.jmap.call = async (calls) => {
+    const n = calls[0][0];
+    if (n === 'Email/get') {
+      const reqIds = (calls[0][1].ids || []);
+      const all = [
+        { id: 'R1', messageId: ['cloudmail-42@duckgame-play.top'] },
+        { id: 'EXIST', messageId: ['cloudmail-100@duckgame-play.top'] },
+        { id: 'D1', messageId: ['<native-mid@stalwart>'] },
+      ];
+      return { 'Email/get': [{ list: all.filter(x => reqIds.includes(x.id)) }] };
+    }
+    return {};
+  };
+  api.cloud.restore = async (ids) => { restoreCalls.push(ids); return 0; };
+  await api.syncRestores(stR2, ['F1']);
+  ok(restoreCalls.length === 1 && restoreCalls[0][0] === 42, '仅恢复未登记的 cloudmail-42（已有/非镜像跳过）');
+  ok(stR2.stalwartMap.has('R1'), '恢复后登记防重复');
+
+  console.log('13) jmap.importEmail（JMAP 文件夹投递核心）');
+  api.jmap.session = async () => 'ACCT';
+  api.jmap.upload = async (raw) => { ok(Buffer.isBuffer(raw) || typeof raw === 'string', 'upload 收到 raw MIME'); return 'BLOB1'; };
+  let importArgs = null;
+  const origCall = api.jmap.call;
+  api.jmap.call = async (calls) => {
+    const n = calls[0][0];
+    if (n === 'Email/import') { importArgs = calls[0][1]; return { 'Email/import': [{ created: { i0: { type: 'created', id: 'NEWID' } } }] }; }
+    return origCall(calls);
+  };
+  const newId = await api.jmap.importEmail('RAW', 'FOLDERX', { seen: true });
+  ok(newId === 'NEWID', 'import 返回创建 id');
+  ok(importArgs && importArgs.emails.i0.blobId === 'BLOB1' && importArgs.emails.i0.mailboxIds.FOLDERX === true, 'blob 与文件夹正确');
+  ok(importArgs && importArgs.emails.i0.keywords['$seen'] === true, '已读关键词正确');
+
+  console.log('14) folderFor 文件夹映射');
+  ok(api.folderFor({ email: 'contact@ciallo.sale' }) === 'contact@ciallo.sale', '默认用账户邮箱作文件夹名');
+  api.CFG.folderMap = { 'contact@ciallo.sale': '联系邮箱' };
+  ok(api.folderFor({ email: 'contact@ciallo.sale' }) === '联系邮箱', 'STALWART_FOLDERS 覆盖');
 
   try { fs.unlinkSync(path.join(__dirname, '_test_state.json')); } catch (e) {}
   console.log('\n结果：' + pass + ' 通过，' + fail + ' 失败');

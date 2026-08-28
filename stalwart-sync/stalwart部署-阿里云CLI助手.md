@@ -152,6 +152,30 @@ Stalwart 管理 UI 默认监听 **localhost:8080**。先在 VPS 上做一次 SSH
   否则按该域名 From 发信会被当垃圾邮件
 
 
+## 4.6 文件夹聚合架构（按收件人区分，JMAP 投递）
+
+> 脚本默认 `SYNC_DELIVERY=jmap`：下行用 **JMAP Email/import** 把每个 CloudMail 账户的邮件
+> 投递到**各自文件夹**（文件夹名默认 = 账户邮箱地址，`STALWART_FOLDERS` 可覆盖），
+> 雷鸟一个 IMAP 账户即可区分 5 个号。
+
+```
+cloudmail@local.domain（IMAP 单账户）
+├── contact@ciallo.sale     ← 该号收件
+├── service@ciallo.sale
+├── pgp@ciallo.sale
+├── admin@delicateduck.xyz
+├── noreply@ciallo.sale
+├── Sent                    已发送（方案 C 发信副本）
+├── Trash                   垃圾桶（删除→CloudMail 垃圾桶；恢复→CloudMail restore）
+├── Drafts                  草稿（仅雷鸟本地，CloudMail 网页草稿在浏览器 IndexedDB，互不同步）
+└── Junk                    垃圾邮件（CloudMail 无此概念，仅本地预留）
+```
+
+- 各号文件夹由脚本**自动创建**（首次同步时 `Mailbox/set`），无需手工建
+- 雷鸟：订阅各号文件夹 + 建"统一收件箱"（雷鸟统一文件夹）查看全部，或直接分看
+- 删除/恢复/已读/发信反向同步按文件夹变化驱动（详见 README v4）
+
+
 ## 5. 部署同步脚本（CloudMail → Stalwart）
 
 ```bash
@@ -175,6 +199,7 @@ CLOUDMAIL_PASSWORD=REPLACE_WITH_PASSWORD
 STALWART_RCPT_TO=cloudmail@local.domain
 STALWART_SMTP_HOST=127.0.0.1
 STALWART_SMTP_PORT=2525
+SYNC_DELIVERY=jmap   # 下行投递：jmap=文件夹聚合（默认，见 §4.6）；smtp=2525 混流 INBOX（旧）
 STATE_FILE=/var/lib/cloudmail-sync/state.json
 POLL_INTERVAL=30000
 EOF
@@ -194,6 +219,7 @@ chmod 600 /etc/cloudmail-sync.env
 #   # SYNC_SENT_HISTORY=0          # 首次启用时追溯历史已发送（默认不追溯）
 #   # SYNC_SENT_MODE=send          # 方案 C：走 CloudMail Resend API 投递（需 smtp-void + Stalwart Relay，见 §4.5）
 #                                  # 默认 import：第三方 SMTP 中继投递，仅镜像记录
+#   # STALWART_FOLDERS={"contact@ciallo.sale":"客服"}   # 可选：文件夹名覆盖（默认用账户邮箱地址）
 # ⚠️ 发信导入依赖 mail-worker 新端点 /api/email/import-sent，需先在 Cloudflare 重新部署 mail-worker
 # ⚠️ 方案 C（SYNC_SENT_MODE=send）还需部署 smtp-void 服务（见 §4.5），并 `systemctl enable --now smtp-void`
 
@@ -257,10 +283,14 @@ timeout 10 openssl s_client -connect imap.duckgame-play.top:993 -servername imap
 1. 雷鸟 → 添加邮件账户 → 手动配置
 2. 用户名/密码 = Stalwart 里建的 `cloudmail@local.domain` + 密码（§4）
 3. 收件服务器：`imap.duckgame-play.top`，端口 `993`，SSL/TLS，普通密码
-4. **发件服务器（可选，开启发信同步时，无 25 方案）**：
+4. **文件夹（聚合 5 号）**：账户创建后订阅 §4.6 的各号文件夹（contact/service/pgp/admin/noreply），
+   可选建「统一收件箱」虚拟文件夹聚合查看；删除/恢复 = 移入/移出 Trash 文件夹
+5. **发件服务器（可选，开启发信同步时，无 25 方案）**：
    - 方案 A：第三方 SMTP（如 `smtp.xxx.com:465`，SSL/TLS），凭据 = 第三方中继的，见 §4.5
-   - 方案 B：`imap.duckgame-play.top:587`（STARTTLS），凭据 = Stalwart 账户，见 §4.5
+   - 方案 C：`imap.duckgame-play.top:587`（STARTTLS），凭据 = Stalwart 账户，见 §4.5
    - **已发送副本保存到 Stalwart 的 Sent 文件夹**（雷鸟「副本与文件夹」设置），否则发信无法镜像
+6. **多身份发信切换**：雷鸟账户设置 → 管理身份 → 为每个 CloudMail 域名邮箱加一个身份，
+   发信时下拉选择（From 必须是 CloudMail 域名邮箱，发信才镜像）
 5. 收件箱应显示 CloudMail 收件；点「获取新邮件」手动刷新（最迟 30s 内看到新邮件）
 6. ⚠️ 发信时**发件人必须选 CloudMail 域名邮箱**（如 `duckgame@duckgame-play.top`），
    已发送才会镜像到 CloudMail；`local.domain` 地址发信不镜像

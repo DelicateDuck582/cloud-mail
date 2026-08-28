@@ -58,6 +58,12 @@ const CFG = {
   //   import（默认，方案 A/B）：Stalwart/第三方已投递，仅镜像记录（/api/email/import-sent，不投递）
   //   send（方案 C）：Stalwart 只收集（哑 SMTP），真正投递走 CloudMail Resend（/api/email/send，HTTPS 不走 25）
   sentMode: ((process.env.SYNC_SENT_MODE || 'import').trim().toLowerCase() === 'send') ? 'send' : 'import',
+  // 下行投递方式：
+  //   jmap（默认）：JMAP Email/import 到"按收件人划分的文件夹"（聚合 5 号 + 文件夹区分，支持垃圾桶/恢复）
+  //   smtp（兼容）：SMTP 2525 投递到 INBOX 混流（旧方式，无文件夹区分）
+  delivery: ((process.env.SYNC_DELIVERY || 'jmap').trim().toLowerCase() === 'smtp') ? 'smtp' : 'jmap',
+  // 文件夹映射（可选）：{"CloudMail账户邮箱":"Stalwart文件夹名"}，未配置时默认用账户邮箱地址作文件夹名
+  folderMap: (() => { try { return JSON.parse(process.env.STALWART_FOLDERS || '{}'); } catch (e) { return {}; } })(),
 };
 
 if (!CFG.email || !CFG.password) {
@@ -154,6 +160,12 @@ const cloud = {
     if (!emailIds.length) return;
     const j = await this.api('/api/email/delete?emailIds=' + emailIds.join(','), { method: 'DELETE' });
     if (j.code !== 200) throw new Error('删除失败：' + (j.message || ''));
+  },
+  // 恢复同步：从 CloudMail 垃圾桶恢复
+  async restore(emailIds) {
+    if (!emailIds.length) return;
+    const j = await this.api('/api/email/restore', { method: 'POST', body: { emailIds } });
+    if (j.code !== 200) throw new Error('恢复失败：' + (j.message || ''));
   },
   // 发信同步：导入已发送记录（不触发 Resend 投递）
   async importSent(body) {
@@ -434,9 +446,13 @@ const jmap = {
   async inboxIds() {
     const inboxId = await this.mailboxId('INBOX');
     if (!inboxId) return new Set();
+    return this.mailboxEmailIds(inboxId);
+  },
+  // 指定文件夹全部邮件 ID（分页，上限 10000）
+  async mailboxEmailIds(folderId) {
     const ids = new Set();
     for (let pos = 0; pos < 10000 && ids.size >= pos; pos = ids.size) {
-      const r = await this.call([['Email/query', { filter: { inMailbox: inboxId }, limit: 500, position: pos }, 'q']]);
+      const r = await this.call([['Email/query', { filter: { inMailbox: folderId }, limit: 500, position: pos }, 'q']]);
       const list = ((r['Email/query'] && r['Email/query'][0]) ? r['Email/query'][0].ids : []) || [];
       if (!list.length) break;
       for (const id of list) ids.add(id);
@@ -445,25 +461,80 @@ const jmap = {
     }
     return ids;
   },
+  // 确保文件夹存在（查询 → 不存在则创建），进程内缓存
+  async ensureMailbox(name) {
+    if (this.mailboxIds[name] !== undefined) return this.mailboxIds[name];
+    let id = await this.mailboxId(name);
+    if (!id) {
+      const r = await this.call([['Mailbox/set', { create: { m0: { name } } }, 'ms']]);
+      const created = ((r['Mailbox/set'] && r['Mailbox/set'][0]) ? r['Mailbox/set'][0].created : {}) || {};
+      id = (created.m0 && created.m0.id) || null;
+      if (!id) throw new Error('创建文件夹失败：' + name);
+    }
+    this.mailboxIds[name] = id;
+    return id;
+  },
+  // 上传 raw MIME（RFC 8621 /upload）→ blobId
+  async upload(raw) {
+    const accountId = await this.session();
+    const auth = 'Basic ' + Buffer.from(CFG.jmapUser + ':' + CFG.jmapPass).toString('base64');
+    const url = CFG.jmapUrl.replace(/\/+$/, '') + '/upload/' + encodeURIComponent(accountId);
+    const r = await fetchT(url, {
+      method: 'POST',
+      headers: { Authorization: auth, 'Content-Type': 'message/rfc822' },
+      body: raw,
+    });
+    if (!r.ok) throw new Error('JMAP upload HTTP ' + r.status);
+    const j = await r.json().catch(() => ({}));
+    if (!j.blobId) throw new Error('JMAP upload 无 blobId');
+    return j.blobId;
+  },
+  // Email/import 到指定文件夹，返回创建的 Stalwart email id
+  async importEmail(raw, folderId, { seen = false, receivedAt = null } = {}) {
+    const blobId = await this.upload(raw);
+    const r = await this.call([['Email/import', {
+      emails: {
+        i0: {
+          blobId,
+          mailboxIds: { [folderId]: true },
+          keywords: seen ? { '$seen': true } : {},
+          receivedAt: receivedAt || null,
+        },
+      },
+    }, 'imp']]);
+    const created = ((r['Email/import'] && r['Email/import'][0]) ? r['Email/import'][0].created : {}) || {};
+    const entry = created && created.i0;
+    if (!entry || entry.type !== 'created' || !entry.id) throw new Error('JMAP Email/import 失败');
+    return entry.id;
+  },
 };
 
-// 投递后登记 Stalwart 邮件 ID（通过固定 Message-ID 反查），供删除同步匹配
-async function registerStalwartId(st, key) {
+// 按固定 Message-ID 查询 Stalwart 邮件 ID（返回 id 或 null，不修改状态）
+async function queryStalwartId(key) {
   const emailId = key.slice(key.lastIndexOf(':') + 1);
   const mid = 'cloudmail-' + emailId + '@duckgame-play.top';
   const r = await jmap.call([['Email/query', { filter: { messageId: mid }, limit: 1 }, 'q']]);
-  const id = ((r['Email/query'] && r['Email/query'][0]) ? r['Email/query'][0].ids : [])[0];
-  if (id) st.stalwartMap.set(id, key);
+  return ((r['Email/query'] && r['Email/query'][0]) ? r['Email/query'][0].ids : [])[0] || null;
 }
 
-// 删除同步：雷鸟把邮件移出收件箱（删除/归档/移入垃圾桶）→ CloudMail 移入垃圾桶
-async function syncDeletes(st) {
-  if (!CFG.syncDelete || !st.stalwartMap.size) return;
-  const inbox = await jmap.inboxIds();
-  if (!inbox.size) return; // 查询失败/空收件箱保护
+// CloudMail 账户 → Stalwart 文件夹名（默认用账户邮箱地址，可用 STALWART_FOLDERS 覆盖）
+function folderFor(acc) {
+  return CFG.folderMap[acc.email] || acc.email;
+}
+
+// 删除同步（jmap 模式）：邮件移出"各号文件夹"（删除/移入垃圾桶/归档）→ CloudMail 垃圾桶
+async function syncDeletes(st, folderIds) {
+  if (!CFG.syncDelete || !st.stalwartMap.size || !folderIds.length) return;
+  const activeIds = new Set();
+  for (const fid of folderIds) {
+    const ids = await jmap.mailboxEmailIds(fid);
+    for (const id of ids) activeIds.add(id);
+    if (activeIds.size >= 10000) break;
+  }
+  if (!activeIds.size) return; // 查询失败/空文件夹保护
   const toDelete = [];
   for (const [sid, key] of st.stalwartMap) {
-    if (!inbox.has(sid)) toDelete.push({ sid, key });
+    if (!activeIds.has(sid)) toDelete.push({ sid, key });
   }
   for (const { sid, key } of toDelete) {
     const emailId = key.slice(key.lastIndexOf(':') + 1);
@@ -476,6 +547,45 @@ async function syncDeletes(st) {
       console.error('  删除 ' + key + ' 失败：' + e.message); // 下轮重试
     }
   }
+}
+
+// 恢复同步（垃圾桶/文件夹恢复 → CloudMail restore）：各号文件夹中"未登记"的 cloudmail-* 邮件，
+// 说明其 CloudMail 端曾被移入垃圾桶（stalwartMap 已释放）→ 调 restore + 重新登记
+async function syncRestores(st, folderIds) {
+  if (!CFG.syncDelete || !folderIds.length) return;
+  for (const fid of folderIds) {
+    const ids = [...await jmap.mailboxEmailIds(fid)].filter(id => !st.stalwartMap.has(id));
+    if (!ids.length) continue;
+    for (let i = 0; i < ids.length; i += 100) {
+      const batch = ids.slice(i, i + 100);
+      const r = await jmap.call([['Email/get', { ids: batch, properties: ['messageId'] }, 'g']]);
+      const list = ((r['Email/get'] && r['Email/get'][0]) ? r['Email/get'][0].list : []) || [];
+      for (const e of list) {
+        const mid = Array.isArray(e.messageId) ? e.messageId[0] : null;
+        if (!mid || !mid.startsWith('cloudmail-')) continue; // 非镜像邮件（草稿/转发等）跳过
+        const m = /^cloudmail-(\d+)@/.exec(mid);
+        if (!m) continue;
+        const emailId = Number(m[1]);
+        const key = findKeyByEmailId(st, emailId);
+        try {
+          await cloud.restore([emailId]);
+          // 登记防重复 restore（key 可能已释放；用 'r:' 虚拟 key，删除同步只取 emailId 部分）
+          st.stalwartMap.set(e.id, key || ('r:' + emailId));
+          console.log('[' + new Date().toISOString() + '] 恢复同步：' + mid);
+        } catch (err) {
+          console.error('  恢复 ' + mid + ' 失败：' + err.message);
+        }
+      }
+    }
+  }
+}
+
+// 从 stalwartMap 值（accountId:emailId）反查 key
+function findKeyByEmailId(st, emailId) {
+  for (const key of st.stalwartMap.values()) {
+    if (Number(key.slice(key.lastIndexOf(':') + 1)) === emailId) return key;
+  }
+  return null;
 }
 
 function formatCloudTime(iso) {
@@ -601,8 +711,9 @@ async function syncSent(st, accounts) {
 }
 
 // ---------------- 主同步循环（多账户） ----------------
-async function syncAccount(acc, rcpt, st) {
-  let cursor = 0, page = 0, added = 0, smtpFails = 0;
+async function syncAccount(acc, rcpt, folderId, st) {
+  let cursor = 0, page = 0, added = 0, fails = 0;
+  const useJmap = CFG.delivery === 'jmap';
   try {
     while (true) {
       let emails;
@@ -614,24 +725,36 @@ async function syncAccount(acc, rcpt, st) {
         if (st.synced.has(key)) continue;
         try {
           const detail = await cloud.detail(m.emailId);
-          const raw = await buildMime(detail, m.emailId, rcpt);
-          await smtpSend(raw, rcpt);
-          st.synced.add(key); added++;
-          smtpFails = 0;
-          // 登记 Stalwart 邮件 ID（供删除同步匹配；失败不阻塞投递）
-          if (CFG.jmapUrl && CFG.jmapUser && CFG.syncDelete) {
-            try { await registerStalwartId(st, key); }
-            catch (e) { console.warn('  [删除同步] 登记失败 ' + key + '：' + e.message); }
+          const raw = await buildMime(detail, m.emailId, useJmap ? acc.email : rcpt);
+          let sid = null;
+          if (useJmap) {
+            // 幂等投递：先查 Stalwart 是否已有该 Message-ID（如垃圾桶恢复后），有则跳过 import
+            const existing = await queryStalwartId(key);
+            if (existing) {
+              st.stalwartMap.set(existing, key);
+            } else {
+              sid = await jmap.importEmail(raw, folderId, { seen: !m.unread });
+              st.stalwartMap.set(sid, key);
+            }
+          } else {
+            await smtpSend(raw, rcpt);
+            // SMTP 模式：通过固定 Message-ID 反查登记（供删除同步匹配）
+            if (CFG.syncDelete && CFG.jmapUrl && CFG.jmapUser) {
+              try { sid = await queryStalwartId(key); } catch (e) { /* 登记失败不阻塞 */ }
+              if (sid) st.stalwartMap.set(sid, key);
+            }
           }
+          st.synced.add(key); added++;
+          fails = 0;
           console.log('  [' + acc.email + '] 同步 ' + m.emailId + '：' + (m.subject || '').slice(0, 50));
         } catch (e) {
-          smtpFails++;
+          fails++;
           console.error('  邮件 ' + m.emailId + ' 失败：' + e.message); // 下一轮重试
-          // SMTP 连续 3 次失败（如 Stalwart 停机）→ 熔断本账户，避免每封都等 15s 超时
-          if (smtpFails >= 3) { console.error('  SMTP 连续失败，暂停本账户本轮（下轮重试）'); break; }
+          // 连续 3 次失败（如 Stalwart 停机）→ 熔断本账户，避免每封都等超时
+          if (fails >= 3) { console.error('  连续失败，暂停本账户本轮（下轮重试）'); break; }
         }
       }
-      if (smtpFails >= 3) break;
+      if (fails >= 3) break;
       const last = emails[emails.length - 1].emailId;
       if (emails.length >= CFG.page && last && last !== cursor) { cursor = last; page++; } else break;
       if (page > 50) break;
@@ -646,15 +769,29 @@ async function syncOnce() {
   const st = loadState();
   const accounts = await cloud.accounts();
   if (!accounts.length) { console.warn('CloudMail 无可用账户'); return; }
+  const useJmap = CFG.delivery === 'jmap';
+  const folderIds = [];
   for (const acc of accounts) {
     const rcpt = cleanRcpt(CFG.accountMap[acc.email] || CFG.defaultRcpt);
     if (!rcpt) { console.warn('账户 ' + acc.email + ' 无目标 Stalwart 邮箱（STALWART_RCPT_TO/STALWART_ACCOUNTS），跳过'); continue; }
-    try { await syncAccount(acc, rcpt, st); }
+    let folderId = null;
+    if (useJmap) {
+      try { folderId = await jmap.ensureMailbox(folderFor(acc)); }
+      catch (e) { console.warn('  文件夹准备失败：' + e.message); }
+      if (!folderId) continue; // jmap 模式必须能拿到文件夹
+    }
+    if (folderId) folderIds.push(folderId);
+    try { await syncAccount(acc, rcpt, folderId, st); }
     catch (e) { console.error('  账户 ' + acc.email + ' 同步异常：' + e.message); saveState(st); }
   }
   if (CFG.jmapUrl && CFG.jmapUser) {
     if (CFG.syncDelete) {
-      try { await syncDeletes(st); } catch (e) { console.warn('删除同步跳过（' + e.message + '）'); }
+      if (useJmap && folderIds.length) {
+        try { await syncDeletes(st, folderIds); } catch (e) { console.warn('删除同步跳过（' + e.message + '）'); }
+        try { await syncRestores(st, folderIds); } catch (e) { console.warn('恢复同步跳过（' + e.message + '）'); }
+      } else {
+        try { await syncDeletes(st); } catch (e) { console.warn('删除同步跳过（' + e.message + '）'); }
+      }
     }
     if (CFG.syncSent) {
       try { await syncSent(st, accounts); } catch (e) { console.warn('发信同步跳过（' + e.message + '）'); }
@@ -672,8 +809,8 @@ async function main() {
     if (CFG.syncSent) features.push('发信导入');
     features.push('已读回写');
   }
-  console.log('CloudMail→Stalwart 同步 v3 启动，轮询 ' + (CFG.interval / 1000) + 's'
-    + '，投递 ' + CFG.smtpHost + ':' + CFG.smtpPort
+  console.log('CloudMail→Stalwart 同步 v4 启动，轮询 ' + (CFG.interval / 1000) + 's'
+    + (CFG.delivery === 'jmap' ? '，投递 JMAP 文件夹' : '，投递 ' + CFG.smtpHost + ':' + CFG.smtpPort)
     + (features.length ? '，反向同步：' + features.join('/') : '（未配置 JMAP，仅下行）')
     + (CFG.withAttachments ? '，附件开启' : ''));
   while (true) {

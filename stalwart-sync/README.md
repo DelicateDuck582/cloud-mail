@@ -3,15 +3,17 @@
 把 CloudMail 收件箱镜像到 **Stalwart Mail Server**（标准 IMAP/POP/JMAP 服务器），
 雷鸟用原生 IMAP 读取 —— **协议层交给 Stalwart 兜底，不再有自定义 IMAP 桥的 bug 风险**。
 
-**v3 功能**：多账户、已读回写、**删除回写（雷鸟删除 → CloudMail 垃圾桶）**、
-**发信导入（雷鸟发信 → CloudMail 已发送）**、增量、附件可选。
+**v4 功能**：多账户聚合（JMAP 文件夹投递，按收件人区分）、已读回写、
+**删除回写 + 垃圾桶恢复（双向）**、发信导入（方案 C Resend）、增量、附件可选。
 
 ## 架构
 ```
 Cloudflare Email Routing → CloudMail (D1)  ← 主数据源（网页端 / 发信）
-                                ↕ 本脚本（下行：轮询→重建 MIME→SMTP 2525 回环投递；上行：JMAP 反向同步）
+                                ↕ 本脚本（下行 JMAP 文件夹投递；上行 已读/删除/恢复/发信 反向同步）
 VPS: Stalwart (SQLite) ←── IMAP :993 ── Cloudflare Tunnel ── Thunderbird
-                         雷鸟发信 = 第三方 SMTP 中继(465/587，无 25)，副本存 Stalwart Sent
+  文件夹聚合 5 号：contact@ciallo.sale / service@ciallo.sale / pgp@ciallo.sale /
+                   admin@delicateduck.xyz / noreply@ciallo.sale / Sent / Trash
+                          雷鸟发信 = 方案 C（smtp-void 收集 → CloudMail Resend 投递）
 ```
 
 ## 文件
@@ -23,19 +25,23 @@ VPS: Stalwart (SQLite) ←── IMAP :993 ── Cloudflare Tunnel ── Thund
 | `smtp-void.service` | smtp-void 的 systemd 单元 |
 | `stalwart部署-阿里云CLI助手.md` | VPS 部署文档（Stalwart + 同步 + Tunnel + 防火墙 + 发信） |
 
-## 同步脚本（v3）
+## 同步脚本（v4）
 
-### 下行：CloudMail → Stalwart
+### 下行：CloudMail → Stalwart（JMAP 文件夹投递）
 
 - 用登录用户（如 `admin@delicateduck.xyz`）自动遍历其**全部邮箱账户**（`/api/account/list`，多号模式）
-- 投递目标：`STALWART_ACCOUNTS`（JSON 映射 `{"CloudMail账户邮箱":"Stalwart目标邮箱"}`）
-  未配置映射时，所有账户用 `STALWART_RCPT_TO` 投到同一个 Stalwart 邮箱
-- 5 号示例：contact/service/pgp/noreply@ciallo.sale + admin@delicateduck.xyz → 同一 `cloudmail@local.domain`
+- **投递 = JMAP Email/import 到"按收件人划分的文件夹"**（`SYNC_DELIVERY=jmap` 默认）：
+  - 每号一个文件夹（默认文件夹名 = 账户邮箱地址，`STALWART_FOLDERS` 可覆盖）
+  - import 直接设置 `$seen`（已读状态）并返回 Stalwart email id（登记 stalwartMap，无需反查）
+  - **幂等**：import 前按 Message-ID 查重，已存在（如垃圾桶恢复后）则跳过
+- 兼容旧方式：`SYNC_DELIVERY=smtp` 走 SMTP 2525 混流 INBOX（无文件夹区分）
+- 5 号示例：contact/service/pgp/noreply@ciallo.sale + admin@delicateduck.xyz → 各自文件夹
 
-### 删除回写（雷鸟删除 → CloudMail 垃圾桶）
-- 投递时登记 Stalwart 邮件 ID ↔ CloudMail `accountId:emailId`（按固定 Message-ID 反查）
-- 每轮对比收件箱当前 ID：**邮件移出收件箱**（删除/归档/移入垃圾桶）→ `DELETE /api/email/delete`
-- CloudMail 端走软删除（垃圾桶）；`SYNC_DELETE=0` 关闭；网页端恢复后自动重新镜像
+### 删除回写 + 垃圾桶恢复（雷鸟 ↔ CloudMail 垃圾桶）
+- **删除**：邮件移出"各号文件夹"（删除/移入垃圾桶/归档）→ `DELETE /api/email/delete`（CloudMail 垃圾桶）
+- **恢复**：邮件回到各号文件夹（从垃圾桶恢复）→ 按 Message-ID 匹配 → `POST /api/email/restore`
+  + 重新登记 stalwartMap（幂等投递保证不重复）
+- `SYNC_DELETE=0` 关闭；CloudMail 垃圾桶 7 天自动清理（附件同机制）
 
 ### 发信导入（雷鸟发信 → CloudMail 已发送，无 25 方案）
 - **无 25**：VPS 出站 25 被封，Stalwart 不直投收件方；两种投递通道（`SYNC_SENT_MODE` 选择）：
@@ -85,6 +91,8 @@ STALWART_PASSWORD=Stalwart邮箱密码
 # SYNC_SENT_MODE=send          # send=方案C 走 CloudMail Resend 投递（需 smtp-void + Stalwart Relay）；
 #                              # import=默认，第三方 SMTP 中继投递，仅镜像记录
 # SYNC_SENT_HISTORY=0          # 首次启用时追溯历史已发送（默认不追溯）
+# SYNC_DELIVERY=jmap           # 下行投递：jmap=文件夹投递（默认）；smtp=2525 混流 INBOX（旧）
+# STALWART_FOLDERS={"contact@ciallo.sale":"客服","..."}   # 可选：文件夹名覆盖（默认用账户邮箱地址）
 
 # ATTACHMENTS=1   # 可选：同步附件（下行）
 # ATTACH_MAX_MB=10        # 附件单文件上限，超限跳过（默认 10）
@@ -93,11 +101,14 @@ STALWART_PASSWORD=Stalwart邮箱密码
 # HTTP_TIMEOUT_MS=20000   # HTTP 请求超时（CloudMail/JMAP/附件，默认 20s）
 ```
 
-## 限制（v3）
-- 删除/发信回写对 **JMAP 登录账户**（`STALWART_USERNAME`）生效；多账户时每个 Stalwart 邮箱需独立实例或单账户多地址
+## 限制（v4）
+- 删除/恢复/发信回写对 **JMAP 登录账户**（`STALWART_USERNAME`）生效；多账户建议绑定到同一 Stalwart 账户的多个地址
+- **草稿**：CloudMail 网页草稿存**浏览器本地**（IndexedDB，`mail-vue/src/db/db.js`），服务端无 draft；
+  Stalwart Drafts 文件夹仅供雷鸟本地草稿，**与 CloudMail 网页草稿互不同步**
+- **垃圾邮件**：CloudMail 无 spam/junk 概念；Stalwart Junk 文件夹可自建但仅本地，不回写
+- **垃圾桶**：CloudMail 有邮件垃圾桶（trash=1，7 天清理）+ 附件管理垃圾桶（att.trash）；双向同步已实现
 - 发信导入仅匹配 From 为 CloudMail 域名邮箱的邮件；附件只导 `disposition:attachment`，内嵌图跳过
-- 只镜像收件箱（type=0）；CloudMail 网页端删除不回删 Stalwart 副本（下行因 `trash=0` 过滤停止拉取，副本由雷鸟侧删除）
-- 同步/反向同步延迟 = 轮询间隔（默认 30s）
+- 只镜像收件（type=0 邮件）；同步/反向同步延迟 = 轮询间隔（默认 30s）
 - Stalwart 是镜像副本；主数据在 CloudMail
 
 ## AGPL 合规
