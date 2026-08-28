@@ -83,20 +83,35 @@ class Session {
     this.authed = false;
     this.messages = [];      // [{emailId, subject, name, sendEmail, createTime, unread}]
     this.cacheTs = 0;
+    this.lastLoadAttempt = 0;
+    this._loading = null;
+    this.loginFails = 0;
     this.uidValidity = 1;
   }
 
   send(line) { this.socket.write(line + CRLF); }
+  writeRaw(data) { this.socket.write(data); }
   ok(tag, t) { this.send((tag || '*') + ' OK ' + t); }
   no(tag, t) { this.send((tag || '*') + ' NO ' + t); }
   bad(tag, t) { this.send((tag || '*') + ' BAD ' + t); }
 
-  async loadInbox(accountId) {
-    if (Date.now() - this.cacheTs < CACHE_TTL_MS && this.messages.length) return;
-    const list = await cloud.fetchEmails(accountId, 0);
-    this.messages = list;
-    this.cacheTs = Date.now();
-    this.uidValidity = 1;
+  // 带「进行中去重 + 失败冷却」的收件箱加载，防止并发打爆/失败重试风暴
+  loadInbox(accountId) {
+    if (Date.now() - this.cacheTs < CACHE_TTL_MS && this.messages.length) return Promise.resolve();
+    if (this._loading) return this._loading;
+    if (!this.messages.length && Date.now() - this.lastLoadAttempt < 3000) return Promise.resolve();
+    this.lastLoadAttempt = Date.now();
+    this._loading = (async () => {
+      try {
+        const list = await withApiLimit(() => cloud.fetchEmails(accountId, 0));
+        this.messages = list;
+        this.cacheTs = Date.now();
+        this.uidValidity = 1;
+      } finally {
+        this._loading = null;
+      }
+    })();
+    return this._loading;
   }
 
   uidNext() {
@@ -106,6 +121,36 @@ class Session {
 
 const cloud = new CloudMail();
 const sessions = new Map();
+
+// ---------------- 性能/安全：详情缓存 + 并发上限 + 清洗 ----------------
+const DETAIL_CACHE_MAX = 200;
+const detailCache = new Map();           // emailId -> detail
+let apiActive = 0;
+const API_MAX_ACTIVE = 4;                // 对 CloudMail 的最大并发请求数
+
+// 轻量并发限制：超过 4 个在途请求时轮询等待
+async function withApiLimit(fn) {
+  while (apiActive >= API_MAX_ACTIVE) await new Promise(r => setTimeout(r, 30));
+  apiActive++;
+  try { return await fn(); } finally { apiActive--; }
+}
+
+async function getDetail(uid) {
+  if (detailCache.has(uid)) return detailCache.get(uid);
+  const d = await withApiLimit(() => cloud.emailDetail(uid));
+  if (detailCache.size >= DETAIL_CACHE_MAX) {
+    const first = detailCache.keys().next().value;
+    if (first !== undefined) detailCache.delete(first);
+  }
+  detailCache.set(uid, d);
+  return d;
+}
+
+// 清洗可能破坏 IMAP 协议行的字符（防响应注入）
+function cleanField(v) {
+  return String(v || '').replace(/[\r\n]/g, '');
+}
+
 
 // ---------------- TLS 服务 ----------------
 const server = tls.createServer({
@@ -125,11 +170,22 @@ server.listen(PORT, '0.0.0.0', () => console.log('CloudMail IMAP bridge listenin
 
 function onData(socket, s, data) {
   s.buf += data.toString('utf8');
+  // 安全：单连接缓冲上限 64KB，防止超长无换行数据导致内存无限增长
+  if (s.buf.length > 65536) {
+    s.send('* BYE Excessive buffer, closing connection');
+    socket.destroy();
+    return;
+  }
   let idx;
   while ((idx = s.buf.indexOf(CRLF)) !== -1) {
     const line = s.buf.slice(0, idx);
     s.buf = s.buf.slice(idx + 2);
     if (line.trim() === '') continue;
+    if (line.length > 8192) { // 单行命令超长，丢弃并断开（防滥用）
+      s.bad('*', 'command too long');
+      socket.destroy();
+      return;
+    }
     try { handleLine(socket, s, line); } catch (e) { console.error(e); s.bad('*', 'internal error'); }
   }
 }
@@ -164,9 +220,15 @@ function handleLine(socket, s, line) {
     case 'LOGIN': {
       const m = rest.match(/^"?([^"\s]+)"?\s+"?([^"\s]+)"?$/);
       if (!m) return s.bad(tag, 'LOGIN failed');
-      cloud.login(m[1], m[2])
-        .then(() => { s.authed = true; s.ok(tag, 'LOGIN completed'); })
-        .catch((e) => s.no(tag, 'LOGIN failed: ' + e.message));
+      // 防爆破：单连接最多 5 次失败，超过即断开（避免把失败持续转发给 CloudMail 触发其 IP 锁定）
+      if (s.loginFails >= 5) {
+        s.send('* BYE Too many failed logins');
+        socket.end();
+        return;
+      }
+      cloud.login(cleanField(m[1]), m[2])
+        .then(() => { s.authed = true; s.loginFails = 0; s.ok(tag, 'LOGIN completed'); })
+        .catch((e) => { s.loginFails++; s.no(tag, 'LOGIN failed: ' + cleanField(e.message)); });
       break;
     }
 
@@ -257,18 +319,22 @@ function handleLine(socket, s, line) {
 async function emitFetch(s, seq, msg, items) {
   const uid = msg.emailId;
   const flags = msg.unread ? '(\\Unseen)' : '()';
-  const subject = (msg.subject || '').replace(/[\r\n]/g, ' ').replace(/\\/g, '\\\\').replace(/"/g, '\\"');
-  const senderName = (msg.name || '').replace(/[\r\n\\"]/g, ' ');
-  const from = senderName + ' <' + (msg.sendEmail || '') + '>';
+  const subject = cleanField(msg.subject || '').replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+  const senderName = cleanField(msg.name || '').replace(/\\|"/g, '');
+  const sendEmail = cleanField(msg.sendEmail || '');
+  const from = senderName + ' <' + sendEmail + '>';
   const msgId = 'cloudmail-' + uid + '@duckgame-play.top';
   const date = msg.createTime ? msg.createTime.replace(' ', 'T') + 'Z' : new Date().toISOString();
 
-  // 正文（详情接口返回已签名图片 URL 的 HTML）
+  // 性能：只有请求正文（BODY[] / BODY[TEXT]）才调详情 API；HEADER 类请求不拉正文
+  const wantsBody = /BODY(?:\.PEEK)?\[\]|BODY(?:\.PEEK)?\[TEXT\]/.test(items);
   let html = '';
-  try {
-    const detail = await cloud.emailDetail(uid);
-    if (detail && detail.content) html = detail.content;
-  } catch (e) { /* 详情失败仍返回头部 */ }
+  if (wantsBody) {
+    try {
+      const detail = await getDetail(uid); // 走 LRU 缓存 + 并发限制
+      if (detail && detail.content) html = detail.content;
+    } catch (e) { /* 详情失败仍返回头部 */ }
+  }
 
   const header =
     'From: ' + from + CRLF +
@@ -289,21 +355,22 @@ async function emitFetch(s, seq, msg, items) {
   if (items.includes('ENVELOPE')) parts.push('ENVELOPE ' + envelope(from, subject, date, msgId));
 
   let bodyData = null;
-  if (items.includes('BODY[]') || items.includes('BODY.PEEK[]')) bodyData = header + body;
-  else if (items.includes('BODY[HEADER]') || items.includes('BODY.PEEK[HEADER]')) bodyData = header;
-  else if (items.includes('BODY[TEXT]') || items.includes('BODY.PEEK[TEXT]')) bodyData = body;
-  else if (items.includes('BODY.PEEK[HEADER.FIELDS') || items.includes('BODY[HEADER.FIELDS')) bodyData = header;
-  else if (items.includes('BODY[') || items.includes('BODY.PEEK[')) bodyData = header + body;
+  if (/BODY(?:\.PEEK)?\[\]/.test(items)) bodyData = header + body;
+  else if (/BODY(?:\.PEEK)?\[TEXT\]/.test(items)) bodyData = body;
+  else if (/BODY(?:\.PEEK)?\[HEADER/.test(items)) bodyData = header;
+  else if (/BODY(?:\.PEEK)?\[/.test(items)) bodyData = header;
 
-  let base = '* ' + seq + ' FETCH (' + parts.join(' ');
+  const base = '* ' + seq + ' FETCH (' + parts.join(' ');
   if (bodyData !== null) {
+    // IMAP literal 格式：{N}\r\n + 恰好 N 字节 + )\r\n（用 writeRaw 保证字节数精确）
     s.send(base + 'BODY[] {' + bodyData.length + '}');
-    s.send(bodyData);
+    s.writeRaw(bodyData);
     s.send(')');
   } else {
     s.send(base + ')');
   }
 }
+
 
 function expandSet(set, max) {
   const out = new Set();
@@ -314,7 +381,10 @@ function expandSet(set, max) {
     if (b === '*') b = max;
     a = Number(a); b = Number(b);
     if (!isFinite(a) || !isFinite(b)) continue;
-    if (a <= b) { for (let i = a; i <= b && i <= max; i++) out.add(i); }
+    // 安全：把 a/b 都钳制到 [1, max]，杜绝任何超大范围（正/反向）导致的 CPU 打满
+    a = Math.max(1, Math.min(a, max));
+    b = Math.max(1, Math.min(b, max));
+    if (a <= b) { for (let i = a; i <= b; i++) out.add(i); }
     else { for (let i = a; i >= b; i--) out.add(i); }
   }
   return [...out].sort((x, y) => x - y);
