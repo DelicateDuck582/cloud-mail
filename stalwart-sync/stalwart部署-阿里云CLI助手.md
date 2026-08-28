@@ -82,15 +82,50 @@ Stalwart 管理 UI 默认监听 **localhost:8080**。先在 VPS 上做一次 SSH
 1. **Domains** → 新建一个本地域（避免与 CloudMail 的 duckgame-play.top 冲突），如 `local.domain`
 2. **Accounts** → 新建邮箱账户：地址 `cloudmail@local.domain`，设一个密码（稍后给雷鸟用）
 3. **Server** → 把 IMAP 监听端口设为 `993`，TLS 证书选择 Let's Encrypt 的
-   `fullchain.pem / privkey.pem`（§3 生成）；SMTP 监听确认 `127.0.0.1:25`（给同步脚本投递）
-4. **SMTP Submission**（发信用）：开启 submission 监听（建议端口 `587`，TLS 证书同 IMAP），
-   并确认中继（relay）指向公网（阿里云默认封 25 出站，需到控制台提额，否则雷鸟发不出信）
+   `fullchain.pem / privkey.pem`（§3 生成）；**SMTP 监听 `127.0.0.1:2525`（明文，仅回环，给同步脚本投递）**
+   —— 本机投递不用 25（阿里云封 25），2525 不受影响
+4. **SMTP Submission**（雷鸟发信）：见 §4.5 无 25 发信方案（第三方 SMTP 中继）
 5. 确认默认已有 **Sent / Trash / INBOX** 邮箱（发信导入与删除回写依赖 Sent/INBOX）
 6. 记下：邮箱地址 `cloudmail@local.domain`、密码 → 用于雷鸟
 
 > 若 AI 助手无法打开浏览器，也可尝试 Stalwart **管理 REST API** 创建（路径因版本而异，
 > 以 Web UI 为准）：`curl -H "Authorization: Bearer <admin_token>" -X POST http://127.0.0.1:8080/api/domain -d '{"name":"local.domain"}'`
 > 以及创建 account；失败就用上面的 Web UI 方式。
+
+## 4.5 无 25 发信方案（第三方 SMTP 中继）+ 多域名说明
+
+> 阿里云/VPS 默认**封禁出站 25**，Stalwart 无法直接中继到收件方 MX。
+> 解决方案：雷鸟发信走**第三方 SMTP 中继（465/587，不走 25）**，投递由第三方完成，
+> 已发送副本仍保存在 Stalwart **Sent**（发信导入照常镜像进 CloudMail）。
+
+**推荐 A：雷鸟直连第三方 SMTP（配置最少）**
+1. 注册一个 SMTP 中继服务并拿凭据（任选）：
+   - 腾讯云 SES / 阿里云 DirectMail / Brevo(Sendinblue) / Mailgun / SMTP2GO 等
+   - 端口 465（SSL）或 587（STARTTLS），普通密码认证
+2. 在第三方控制台**验证发件域名**（DNS 加 SPF/DKIM）——多域名场景**每个发件域名都要验证**，
+   否则会被当垃圾邮件拒收
+3. 雷鸟发件服务器直接填第三方 SMTP（`smtp.xxx.com:465`），用户名/密码 = 第三方凭据；
+   **发件身份（From）= CloudMail 域名邮箱**（如 `duckgame@duckgame-play.top`）
+4. 雷鸟「副本与文件夹」→ 发送时把副本保存到 **Stalwart 的已发送(Sent) 文件夹**（IMAP 路径）
+5. 同步脚本 `syncSent` 检测 Stalwart Sent 新邮件 → 导入 CloudMail 已发送（`/api/email/import-sent`，
+   不触发 Resend，因为投递已由第三方完成）
+
+**推荐 B：Stalwart 作为中继（雷鸟只配 Stalwart）**
+1. Stalwart Web UI → Server → 开启 submission 监听 `587`（TLS 证书同 IMAP）
+2. **Relay 配置**指向第三方 SMTP：`smtp.xxx.com:465` + SMTP AUTH 凭据（不走 25）
+3. 雷鸟发件服务器 = `imap.duckgame-play.top:587`（经 Tunnel），用户名/密码 = Stalwart 账户
+4. 其余同 A：已发送在 Stalwart Sent → syncSent 镜像到 CloudMail
+
+> ⚠️ 方案 B 中，Stalwart 的 **MAIL FROM 域名**必须与第三方 SMTP 的验证域名一致，
+> 否则第三方拒绝代发。多域名时要么每域一个中继凭据，要么统一用 A。
+
+### 多域名注意事项
+- CloudMail 支持多域名账户（每个域名独立 resend token/SPF）；雷鸟 From 可选任意 CloudMail 域名邮箱
+- `syncSent` 按 From 邮箱匹配 CloudMail 账户（跨域名均可）；无法匹配的 From 跳过导入
+- **反向同步（已读/删除/发信）绑定 JMAP 登录账户**：多域名邮箱建议绑定到**同一个 Stalwart 账户的多个地址**
+  （Stalwart 账户支持多 address），一套 JMAP 凭据即可覆盖全部域名
+- `STALWART_ACCOUNTS` 映射每个 CloudMail 域名账户 → Stalwart 地址（可同账户多地址，或分账户）
+
 
 ## 5. 部署同步脚本（CloudMail → Stalwart）
 
@@ -112,7 +147,7 @@ CLOUDMAIL_EMAIL=REPLACE_WITH_EMAIL
 CLOUDMAIL_PASSWORD=REPLACE_WITH_PASSWORD
 STALWART_RCPT_TO=cloudmail@local.domain
 STALWART_SMTP_HOST=127.0.0.1
-STALWART_SMTP_PORT=25
+STALWART_SMTP_PORT=2525
 STATE_FILE=/var/lib/cloudmail-sync/state.json
 POLL_INTERVAL=30000
 EOF
@@ -188,8 +223,10 @@ timeout 10 openssl s_client -connect imap.duckgame-play.top:993 -servername imap
 1. 雷鸟 → 添加邮件账户 → 手动配置
 2. 用户名/密码 = Stalwart 里建的 `cloudmail@local.domain` + 密码（§4）
 3. 收件服务器：`imap.duckgame-play.top`，端口 `993`，SSL/TLS，普通密码
-4. **发件服务器（可选，开启发信同步时）**：`imap.duckgame-play.top`，端口 `587`，
-   STARTTLS/SSL/TLS（与 §4 Stalwart submission 配置一致），用户名/密码同收件
+4. **发件服务器（可选，开启发信同步时，无 25 方案）**：
+   - 方案 A：第三方 SMTP（如 `smtp.xxx.com:465`，SSL/TLS），凭据 = 第三方中继的，见 §4.5
+   - 方案 B：`imap.duckgame-play.top:587`（STARTTLS），凭据 = Stalwart 账户，见 §4.5
+   - **已发送副本保存到 Stalwart 的 Sent 文件夹**（雷鸟「副本与文件夹」设置），否则发信无法镜像
 5. 收件箱应显示 CloudMail 收件；点「获取新邮件」手动刷新（最迟 30s 内看到新邮件）
 6. ⚠️ 发信时**发件人必须选 CloudMail 域名邮箱**（如 `duckgame@duckgame-play.top`），
    已发送才会镜像到 CloudMail；`local.domain` 地址发信不镜像
@@ -202,7 +239,7 @@ timeout 10 openssl s_client -connect imap.duckgame-play.top:993 -servername imap
 | 反向同步 | 雷鸟已读→CloudMail、删除→CloudMail 垃圾桶、发信→CloudMail 已发送（需配置 JMAP） |
 | 同步 | 仅收件箱、轮询 30s、增量（state.json）；删除/发信回写延迟同为 30s |
 | 附件 | 默认不同步（CloudMail 网页看）；`ATTACHMENTS=1` 可开启 |
-| 发信 | 雷鸟 SMTP→Stalwart submission 投递；镜像进 CloudMail 已发送（需重新部署 mail-worker） |
+| 发信 | 无 25 方案：第三方 SMTP 中继（465/587）投递，已发送副本存 Stalwart Sent 后镜像进 CloudMail（需重新部署 mail-worker） |
 | AGPL | Stalwart 未修改、未分发，自托管合规；本地副本哈希校验一致 |
 | 安全 | 见 `安全加固-雷鸟镜像.md`（COS 签名/COS 前置代理/传输层/数据丢失场景分析） |
 

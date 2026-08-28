@@ -9,9 +9,9 @@
 ## 架构
 ```
 Cloudflare Email Routing → CloudMail (D1)  ← 主数据源（网页端 / 发信）
-                                ↕ 本脚本（下行：轮询→重建 MIME→SMTP 投递；上行：JMAP 反向同步）
+                                ↕ 本脚本（下行：轮询→重建 MIME→SMTP 2525 回环投递；上行：JMAP 反向同步）
 VPS: Stalwart (SQLite) ←── IMAP :993 ── Cloudflare Tunnel ── Thunderbird
-                         SMTP submission :587（雷鸟发信）
+                         雷鸟发信 = 第三方 SMTP 中继(465/587，无 25)，副本存 Stalwart Sent
 ```
 
 ## 文件
@@ -35,12 +35,16 @@ VPS: Stalwart (SQLite) ←── IMAP :993 ── Cloudflare Tunnel ── Thund
 - 每轮对比收件箱当前 ID：**邮件移出收件箱**（删除/归档/移入垃圾桶）→ `DELETE /api/email/delete`
 - CloudMail 端走软删除（垃圾桶）；`SYNC_DELETE=0` 关闭；网页端恢复后自动重新镜像
 
-### 发信导入（雷鸟发信 → CloudMail 已发送）
-- 雷鸟 SMTP → Stalwart submission（Stalwart 负责投递收件人）
+### 发信导入（雷鸟发信 → CloudMail 已发送，无 25 方案）
+- **无 25**：VPS 出站 25 被封，Stalwart 不中继；投递走**第三方 SMTP 中继（465/587）**：
+  - 方案 A：雷鸟发件服务器直连第三方 SMTP（SPF/DKIM 在第三方验证发件域）
+  - 方案 B：Stalwart submission(587) + Relay 指向第三方 SMTP(465, SMTP AUTH)
+  - 无论哪种，雷鸟把**已发送副本保存到 Stalwart Sent**（IMAP「副本与文件夹」）
 - 脚本用 JMAP `Email/queryChanges` 增量扫描 Stalwart **Sent** 邮箱 → 导入 CloudMail
-  `/api/email/import-sent`（**不触发 Resend，避免重复投递**）
-- 发件人必须是 CloudMail 域名邮箱（否则跳过）；`SYNC_SENT=0` 关闭
-- 首次启用默认只建基线不追溯历史（`SYNC_SENT_HISTORY=1` 可追溯）
+  `/api/email/import-sent`（**不触发 Resend，避免重复投递**——投递已由第三方完成）
+- **多域名**：发件人按 From 匹配 CloudMail 账户（跨域名均可）；无法匹配的跳过；
+  多域名建议绑定到**同一 Stalwart 账户的多个地址**（一套 JMAP 凭据覆盖全部）
+- `SYNC_SENT=0` 关闭；首次启用默认只建基线不追溯历史（`SYNC_SENT_HISTORY=1` 可追溯）
 - 注意：`/api/email/import-sent` 是 mail-worker 新增 fork 端点，**需重新部署 mail-worker**
 
 ### 已读回写（雷鸟标已读 → CloudMail）
@@ -63,7 +67,7 @@ STALWART_RCPT_TO=cloudmail@local.domain
 STALWART_ACCOUNTS={"account1@duckgame-play.top":"cloudmail1@local.domain","account2@duckgame-play.top":"cloudmail2@local.domain"}
 
 STALWART_SMTP_HOST=127.0.0.1
-STALWART_SMTP_PORT=25
+STALWART_SMTP_PORT=2525   # 无 25 方案：本机明文 SMTP（Stalwart 监听 127.0.0.1:2525），云厂商封 25 不影响
 STATE_FILE=/var/lib/cloudmail-sync/state.json
 POLL_INTERVAL=30000
 

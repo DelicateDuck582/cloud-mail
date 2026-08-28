@@ -37,7 +37,9 @@ const CFG = {
   email: process.env.CLOUDMAIL_EMAIL || '',
   password: process.env.CLOUDMAIL_PASSWORD || '',
   smtpHost: process.env.STALWART_SMTP_HOST || '127.0.0.1',
-  smtpPort: Number(process.env.STALWART_SMTP_PORT || 25),
+  // 无 25 方案：阿里云/VPS 默认封 25，本机投递改用 2525（Stalwart 监听 127.0.0.1:2525 明文 SMTP）。
+  // 仅回环投递不涉及出站，纯明文即可（不可被外部窃听）。
+  smtpPort: Number(process.env.STALWART_SMTP_PORT || 2525),
   defaultRcpt: process.env.STALWART_RCPT_TO || '',
   accountMap: (() => { try { return JSON.parse(process.env.STALWART_ACCOUNTS || '{}'); } catch (e) { return {}; } })(),
   jmapUrl: process.env.STALWART_JMAP_URL || '',
@@ -70,6 +72,10 @@ const LOOPBACK = new Set(['127.0.0.1', 'localhost', '::1']);
 if (CFG.smtpHost && !LOOPBACK.has(CFG.smtpHost)) {
   // SMTP 目标非回环：邮件内容（含正文/主题）会发到该主机，仅建议本地 Stalwart
   console.warn('[安全] STALWART_SMTP_HOST 非回环地址，请确认目标可信（仅建议 127.0.0.1 本地 Stalwart）');
+}
+// 无 25 端口环境提醒：若仍在使用 25，多半无法投递（云厂商封 25）；建议 Stalwart 监听 2525
+if (CFG.smtpPort === 25) {
+  console.warn('[提示] STALWART_SMTP_PORT=25：云厂商通常封禁 25，若投递失败请改用 2525（无 25 方案）');
 }
 if (CFG.jmapUrl) {
   try {
@@ -625,8 +631,17 @@ async function syncOnce() {
 }
 
 async function main() {
-  console.log('CloudMail→Stalwart 同步 v2 启动，轮询 ' + (CFG.interval / 1000) + 's'
-    + (CFG.jmapUrl && CFG.jmapUser ? '，已读回写/删除/发信同步开启' : ''));
+  const jmapOn = !!(CFG.jmapUrl && CFG.jmapUser);
+  const features = [];
+  if (jmapOn) {
+    if (CFG.syncDelete) features.push('删除回写');
+    if (CFG.syncSent) features.push('发信导入');
+    features.push('已读回写');
+  }
+  console.log('CloudMail→Stalwart 同步 v3 启动，轮询 ' + (CFG.interval / 1000) + 's'
+    + '，投递 ' + CFG.smtpHost + ':' + CFG.smtpPort
+    + (features.length ? '，反向同步：' + features.join('/') : '（未配置 JMAP，仅下行）')
+    + (CFG.withAttachments ? '，附件开启' : ''));
   while (true) {
     try {
       await cloud.login();
