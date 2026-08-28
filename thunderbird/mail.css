@@ -1,0 +1,129 @@
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+:root {
+  --bg: #f7f8fa;
+  --card: #ffffff;
+  --border: #e3e5e8;
+  --text: #2c3136;
+  --muted: #8a9199;
+  --accent: #1890ff;
+  --danger: #e5484d;
+}
+
+body {
+  font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  height: 100vh;
+  overflow: hidden;
+}
+
+.hidden { display: none !important; }
+
+/* 登录 */
+#login-view {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+}
+.login-card {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 28px 32px;
+  width: 340px;
+}
+.login-card h1 { font-size: 20px; margin-bottom: 4px; color: var(--accent); }
+.login-card .sub { font-size: 12px; color: var(--muted); margin-bottom: 18px; }
+.login-card label { display: block; font-size: 13px; margin: 10px 0 4px; color: var(--text); }
+.login-card input {
+  width: 100%;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  font-size: 14px;
+}
+.login-card button {
+  width: 100%;
+  margin-top: 18px;
+  padding: 9px;
+  border: none;
+  border-radius: 4px;
+  background: var(--accent);
+  color: #fff;
+  font-size: 14px;
+  cursor: pointer;
+}
+.login-card button:disabled { opacity: 0.6; }
+.error { color: var(--danger); font-size: 13px; margin-top: 10px; }
+
+/* 主界面 */
+.toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  background: var(--card);
+  border-bottom: 1px solid var(--border);
+}
+.toolbar select { padding: 5px 8px; border: 1px solid var(--border); border-radius: 4px; font-size: 13px; max-width: 260px; }
+.toolbar button { padding: 5px 12px; border: 1px solid var(--border); border-radius: 4px; background: #fff; font-size: 13px; cursor: pointer; }
+.toolbar button:hover { background: #f0f2f5; }
+.toolbar .status { margin-left: auto; font-size: 12px; color: var(--muted); }
+
+#main-view { display: flex; flex-direction: column; height: 100%; }
+.pane { flex: 1; overflow: auto; }
+
+.email-list { list-style: none; }
+.email-item {
+  display: grid;
+  grid-template-columns: 180px 1fr 150px;
+  gap: 10px;
+  align-items: center;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--border);
+  background: var(--card);
+  cursor: pointer;
+}
+.email-item:hover { background: #f0f6ff; }
+.email-item.unread { font-weight: 600; }
+.email-item .item-subject { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.email-item .item-sender, .email-item .item-time { color: var(--muted); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+.empty, .load-more { text-align: center; color: var(--muted); font-size: 13px; padding: 16px; }
+.load-more { display: block; width: 100%; border: none; background: transparent; cursor: pointer; color: var(--accent); }
+.load-more:hover { text-decoration: underline; }
+
+/* 详情 */
+#detail-pane { padding: 16px 20px; }
+.back { background: none; border: none; color: var(--accent); font-size: 13px; cursor: pointer; padding: 0; margin-bottom: 10px; }
+#detail-subject { font-size: 17px; margin-bottom: 6px; }
+.detail-meta { font-size: 12px; color: var(--muted); margin-bottom: 12px; }
+.detail-meta span + span::before { content: " · "; }
+
+.body {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px;
+  min-height: 200px;
+}
+#body-frame { width: 100%; border: none; min-height: 360px; }
+
+.attachments { margin-top: 14px; }
+.att-title { font-size: 13px; font-weight: 600; margin-bottom: 6px; }
+.att-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 8px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  margin-bottom: 6px;
+  background: var(--card);
+  font-size: 13px;
+}
+.att-row .att-size { color: var(--muted); font-size: 12px; }
+.att-row button { margin-left: auto; padding: 3px 10px; border: 1px solid var(--border); border-radius: 4px; background: #fff; cursor: pointer; }
+.att-row button:hover { background: #f0f2f5; }

@@ -1,0 +1,55 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>CloudMail Reader</title>
+  <link rel="stylesheet" href="mail.css" />
+</head>
+<body>
+  <!-- 登录视图 -->
+  <section id="login-view" class="view hidden">
+    <div class="login-card">
+      <h1>CloudMail</h1>
+      <p class="sub">通过 Thunderbird 只读查看（手动刷新拉取）</p>
+      <form id="login-form">
+        <label>邮箱</label>
+        <input type="email" id="login-email" autocomplete="username" required placeholder="user@duckgame-play.top" />
+        <label>密码</label>
+        <input type="password" id="login-password" autocomplete="current-password" required placeholder="密码" />
+        <div id="login-error" class="error hidden"></div>
+        <button type="submit" id="login-btn">登录</button>
+      </form>
+    </div>
+  </section>
+
+  <!-- 主视图 -->
+  <section id="main-view" class="view hidden">
+    <header class="toolbar">
+      <select id="account-select" title="账户"></select>
+      <button id="refresh-btn" title="手动刷新">刷新</button>
+      <button id="logout-btn" title="退出登录">退出</button>
+      <span id="status-text" class="status"></span>
+    </header>
+
+    <div id="list-pane" class="pane">
+      <ul id="email-list" class="email-list"></ul>
+      <div id="list-empty" class="empty hidden">暂无邮件</div>
+      <button id="load-more-btn" class="load-more hidden">加载更多</button>
+    </div>
+
+    <div id="detail-pane" class="pane hidden">
+      <button id="back-btn" class="back">← 返回列表</button>
+      <h2 id="detail-subject"></h2>
+      <div class="detail-meta">
+        <span id="detail-sender"></span>
+        <span id="detail-time"></span>
+      </div>
+      <div id="detail-body" class="body"><iframe id="body-frame" sandbox=""></iframe></div>
+      <div id="detail-attachments" class="attachments"></div>
+    </div>
+  </section>
+
+  <script src="mail.js"></script>
+</body>
+</html>

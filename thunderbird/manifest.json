@@ -1,0 +1,28 @@
+{
+  "manifest_version": 2,
+  "name": "CloudMail Reader",
+  "version": "0.1.0",
+  "description": "在 Thunderbird 中只读查看 CloudMail（mail.duckgame-play.top）邮件：手动刷新拉取，复用 Web 端同款 JWT 鉴权与 COS 签名附件。",
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "cloudmail-reader@duckgame-play.top",
+      "strict_min_version": "91.0"
+    }
+  },
+  "background": {
+    "scripts": ["background.js"]
+  },
+  "permissions": [
+    "storage",
+    "https://mail.duckgame-play.top/*",
+    "https://cos.duckgame-play.top/*"
+  ],
+  "browser_action": {
+    "default_title": "CloudMail",
+    "default_icon": "icons/icon.svg"
+  },
+  "icons": {
+    "48": "icons/icon.svg",
+    "96": "icons/icon.svg"
+  }
+}
