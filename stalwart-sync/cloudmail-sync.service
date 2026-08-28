@@ -1,0 +1,24 @@
+[Unit]
+Description=CloudMail → Stalwart 邮件同步
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=cloudsync
+Group=cloudsync
+EnvironmentFile=/etc/cloudmail-sync.env
+ExecStart=/usr/bin/node /opt/cloudmail-sync/sync.js
+Restart=on-failure
+RestartSec=10
+# 安全加固
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadOnlyPaths=/opt/cloudmail-sync
+ReadWritePaths=/var/lib/cloudmail-sync
+# 状态文件写在 /var/lib/cloudmail-sync/state.json
+
+[Install]
+WantedBy=multi-user.target
