@@ -26,12 +26,11 @@
 ### 需填写的占位符（执行前准备）
 | 占位符 | 填写值 | 出现位置 |
 |---|---|---|
-| `CF_API_TOKEN` | CF 控制台 API 令牌（Zone:DNS:Edit，区域 duckgame-play.top） | §3 |
-| `LE_EMAIL` | Let's Encrypt 通知邮箱 | §3 |
-| `TUNNEL_TOKEN` | CF Zero Trust 隧道令牌 | §6 |
-| `REPLACE_WITH_PASSWORD` | CloudMail admin@delicateduck.xyz 的登录密码 | §5 |
-| Stalwart 邮箱密码 | 雷鸟登录用的 Stalwart 账户密码 | §4 / §5 / §9 |
-| 第三方 SMTP 凭据 | 仅方案 A/B 需要（§4.5）；方案 C 无需任何第三方 | §4.5 |
+| `CF_API_TOKEN` | **可选**：能手动设置 CF DNS 就用 §3 方式 A（无需 token）；有 token 用方式 B | §3 |
+| `LE_EMAIL` | `server@ciallo.sale` | §3 |
+| `TUNNEL_TOKEN` | CF → Zero Trust → Networks → Tunnels → 创建隧道 → 安装命令里的 `eyJ...`（隧道详情页 Configuration → Token） | §6 |
+| `REPLACE_WITH_PASSWORD` | CloudMail `admin@delicateduck.xyz` 登录密码（部署后手动填进 VPS `/etc/cloudmail-sync.env`，勿给 AI/勿进仓库） | §5 |
+| Stalwart 邮箱密码 | §4 创建 `cloudmail@local.domain` 时设置（雷鸟登录用）；**建议独立于 CloudMail 密码**，也可按你的选择复用 admin 密码 | §4 / §5 / §9 |
 
 ### 执行检查表（助手逐节打勾，失败即停并回报）
 - [ ] §1 系统准备
@@ -77,23 +76,41 @@ systemctl status stalwart-mail --no-pager | head -10
 
 ## 3. 签发 TLS 证书（imap.duckgame-play.top，DNS-01，不暴露端口）
 
-```bash
-apt-get install -y certbot python3-certbot-dns-cloudflare 2>/dev/null \
-  || pip3 install --break-system-packages certbot-dns-cloudflare 2>/dev/null || true
+> **方式 A（推荐，无需 CF API Token）—— 手动 DNS 验证**：certbot 给出 TXT 值，
+> 用户在 CF 控制台手动添加记录（你已确认可以自己设置 DNS）。
+> **方式 B —— CF API Token 自动验证**（若你有 token 则更省事）。
 
+**方式 A：手动 DNS（无 Token）**
+```bash
+apt-get install -y certbot 2>/dev/null || pip3 install --break-system-packages certbot 2>/dev/null || true
+
+certbot certonly --manual --preferred-challenges dns \
+  -d imap.duckgame-play.top \
+  --agree-tos -m server@ciallo.sale
+# → 交互提示：在 CF 控制台给 _acme-challenge.imap.duckgame-play.top 添加 TXT 记录，
+#   值填 certbot 显示的内容；生效后回车继续。签发完成后可删除该 TXT 记录。
+```
+
+**方式 B：CF API Token 自动验证（可选）**
+```bash
+apt-get install -y python3-certbot-dns-cloudflare 2>/dev/null \
+  || pip3 install --break-system-packages certbot-dns-cloudflare 2>/dev/null || true
 mkdir -p /root/.secrets && chmod 700 /root/.secrets
 cat > /root/.secrets/cloudflare.ini <<'EOF'
-dns_cloudflare_api_token = 这里填CF_API_TOKEN
+dns_cloudflare_api_token = 这里填CF_API_TOKEN（可选）
 EOF
 chmod 600 /root/.secrets/cloudflare.ini
 
 certbot certonly \
   --dns-cloudflare --dns-cloudflare-credentials /root/.secrets/cloudflare.ini \
   -d imap.duckgame-play.top \
-  --non-interactive --agree-tos -m 这里填LE_EMAIL
+  --non-interactive --agree-tos -m server@ciallo.sale
 
 ls -l /etc/letsencrypt/live/imap.duckgame-play.top/
 ```
+
+> 签发完成后：方式 A 删除临时 TXT 记录；方式 B 删除 `/root/.secrets/cloudflare.ini`。
+> 证书路径：`/etc/letsencrypt/live/imap.duckgame-play.top/{fullchain.pem,privkey.pem}`。
 
 > Stalwart 的 IMAP/TLS 证书在下面配置（把 fullchain/privkey 路径填给 Stalwart 的
 > `server.tls` / listener 配置；详见 §4 交互配置）。
@@ -245,7 +262,7 @@ chmod 600 /etc/cloudmail-sync.env
 # 反向同步（可选）：加上以下三项后自动开启 已读回写 / 删除回写 / 发信导入
 #   STALWART_JMAP_URL=https://127.0.0.1:8080/jmap
 #   STALWART_USERNAME=cloudmail@local.domain
-#   STALWART_PASSWORD=Stalwart邮箱密码
+#   STALWART_PASSWORD=Stalwart邮箱密码（§4 创建 cloudmail@local.domain 时设置；可复用 admin 密码）
 #   # STALWART_SENT_MAILBOX=Sent   # 已发送邮箱名（默认 Sent）
 #   # SYNC_SENT_HISTORY=0          # 首次启用时追溯历史已发送（默认不追溯）
 #   # SYNC_SENT_MODE=send          # 方案 C：走 CloudMail Resend API 投递（需 smtp-void + Stalwart Relay，见 §4.5）
