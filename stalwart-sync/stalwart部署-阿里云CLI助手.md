@@ -30,7 +30,7 @@
 | `LE_EMAIL` | `server@ciallo.sale` | §3 |
 | `TUNNEL_TOKEN` | CF → Zero Trust → Networks → Tunnels → 创建隧道 → 安装命令里的 `eyJ...`（隧道详情页 Configuration → Token） | §6 |
 | `REPLACE_WITH_PASSWORD` | CloudMail `admin@delicateduck.xyz` 登录密码（部署后手动填进 VPS `/etc/cloudmail-sync.env`，勿给 AI/勿进仓库） | §5 |
-| Stalwart 邮箱密码 | §4 创建 `cloudmail@local.domain` 时设置（雷鸟登录用）；**建议独立于 CloudMail 密码**，也可按你的选择复用 admin 密码 | §4 / §5 / §9 |
+| Stalwart 邮箱密码 | §4 创建 `cloudmail@local.domain` 时设置（雷鸟登录用）；**已确认：独立密码**（不复用 admin，降低连带泄露风险） | §4 / §5 / §9 |
 
 ### 执行检查表（助手逐节打勾，失败即停并回报）
 - [ ] §1 系统准备
@@ -127,7 +127,7 @@ Stalwart 管理 UI 默认监听 **localhost:8080**。先在 VPS 上做一次 SSH
 
 在 Web UI 里完成（3 分钟）：
 1. **Domains** → 新建一个本地域（避免与 CloudMail 的 duckgame-play.top 冲突），如 `local.domain`
-2. **Accounts** → 新建邮箱账户：地址 `cloudmail@local.domain`，设一个密码（稍后给雷鸟用）
+2. **Accounts** → 新建邮箱账户：地址 `cloudmail@local.domain`，设一个**独立密码**（与 CloudMail admin 密码不同，稍后给雷鸟用）
 3. **Server** → 把 IMAP 监听端口设为 `993`，TLS 证书选择 Let's Encrypt 的
    `fullchain.pem / privkey.pem`（§3 生成）；**SMTP 监听 `127.0.0.1:2525`（明文，仅回环，给同步脚本投递）**
    —— 本机投递不用 25（阿里云封 25），2525 不受影响
@@ -262,7 +262,7 @@ chmod 600 /etc/cloudmail-sync.env
 # 反向同步（可选）：加上以下三项后自动开启 已读回写 / 删除回写 / 发信导入
 #   STALWART_JMAP_URL=https://127.0.0.1:8080/jmap
 #   STALWART_USERNAME=cloudmail@local.domain
-#   STALWART_PASSWORD=Stalwart邮箱密码（§4 创建 cloudmail@local.domain 时设置；可复用 admin 密码）
+#   STALWART_PASSWORD=Stalwart邮箱独立密码（§4 创建 cloudmail@local.domain 时设置，不复用 admin）
 #   # STALWART_SENT_MAILBOX=Sent   # 已发送邮箱名（默认 Sent）
 #   # SYNC_SENT_HISTORY=0          # 首次启用时追溯历史已发送（默认不追溯）
 #   # SYNC_SENT_MODE=send          # 方案 C：走 CloudMail Resend API 投递（需 smtp-void + Stalwart Relay，见 §4.5）
