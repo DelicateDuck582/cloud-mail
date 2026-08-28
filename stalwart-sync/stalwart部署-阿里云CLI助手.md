@@ -119,6 +119,14 @@ Stalwart 管理 UI 默认监听 **localhost:8080**。先在 VPS 上做一次 SSH
 > ⚠️ 方案 B 中，Stalwart 的 **MAIL FROM 域名**必须与第三方 SMTP 的验证域名一致，
 > 否则第三方拒绝代发。多域名时要么每域一个中继凭据，要么统一用 A。
 
+**可选 C（加固预留）：雷鸟 → Stalwart 收集 → CloudMail Resend API 投递（零第三方依赖，未实现）**
+- 雷鸟发件 SMTP → Stalwart submission(587) → **Stalwart Relay 指向本机哑 SMTP 收集器
+  （127.0.0.1:2526，接受即丢弃，仅供 Stalwart 完成"投递"并存入 Sent）**
+- 同步脚本检测 Stalwart Sent 新邮件 → 调 `POST /api/email/send`（**CloudMail 的 Resend API，
+  HTTPS 投递不走 25**，多域名 resend token 已配置）→ 已发送记录直接落 CloudMail
+- 局限：CloudMail `send` 有附件数(≤10)/发信次数/角色限制；方案设计详见
+  `安全加固-雷鸟镜像.md` §四.5（本期不实现，当前用方案 A 功能完整）
+
 ### 多域名注意事项（本部署：delicateduck.xyz + ciallo.sale，共 5 号）
 - CloudMail 登录用户 `admin@delicateduck.xyz`（多号模式）下有 5 个邮箱账户：
   `contact@ciallo.sale`、`service@ciallo.sale`、`pgp@ciallo.sale`、`admin@delicateduck.xyz`、`noreply@ciallo.sale`
