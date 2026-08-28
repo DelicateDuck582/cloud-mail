@@ -18,6 +18,36 @@
 
 > ⚠️ token 敏感，勿写入仓库/日志；部署完成后删除 `/root/.secrets/cloudflare.ini`。
 
+## 0.5 CLI 执行总览与占位符清单
+
+> AI 助手：按 §1→§10 **顺序执行**；遇到「需 Web UI 交互」的步骤（§4、§4.5、§9）停下，
+> 把浏览器操作交给用户完成后再继续。所有 `REPLACE_WITH_*`/占位符在执行前由用户确认。
+
+### 需填写的占位符（执行前准备）
+| 占位符 | 填写值 | 出现位置 |
+|---|---|---|
+| `CF_API_TOKEN` | CF 控制台 API 令牌（Zone:DNS:Edit，区域 duckgame-play.top） | §3 |
+| `LE_EMAIL` | Let's Encrypt 通知邮箱 | §3 |
+| `TUNNEL_TOKEN` | CF Zero Trust 隧道令牌 | §6 |
+| `REPLACE_WITH_PASSWORD` | CloudMail admin@delicateduck.xyz 的登录密码 | §5 |
+| Stalwart 邮箱密码 | 雷鸟登录用的 Stalwart 账户密码 | §4 / §5 / §9 |
+| 第三方 SMTP 凭据 | 仅方案 A/B 需要（§4.5）；方案 C 无需任何第三方 | §4.5 |
+
+### 执行检查表（助手逐节打勾，失败即停并回报）
+- [ ] §1 系统准备
+- [ ] §2 安装 Stalwart（记录 admin token）
+- [ ] §3 签发 imap.duckgame-play.top 证书（DNS-01）
+- [ ] §4 Web UI 交互（用户：建域/账户/2525/993/587/Trash）
+- [ ] §4.5 发信方案确认（推荐 C：smtp-void + Relay）
+- [ ] §4.6 文件夹聚合确认（脚本自动建各号文件夹）
+- [ ] §5 部署同步脚本 + smtp-void + env（SYNC_DELIVERY=jmap）
+- [ ] §6 Cloudflare Tunnel（993 + 587）
+- [ ] §7 防火墙（incoming deny）
+- [ ] §8 验证（IMAP 握手 + JMAP 文件夹 + 同步日志）
+- [ ] §9 雷鸟配置（用户：订阅文件夹 + 多身份）
+- [ ] §10 限制确认
+
+
 ## 1. 系统准备
 
 ```bash
@@ -205,10 +235,11 @@ POLL_INTERVAL=30000
 EOF
 chmod 600 /etc/cloudmail-sync.env
 
-# 【多号模式：5 个邮箱全镜像】把 STALWART_ACCOUNTS 换成下面的映射（admin 登录，遍历 5 账户）
+# 【多号模式：5 个邮箱全镜像（推荐，v4 文件夹聚合）】admin 登录，遍历 5 账户，
+#   下行自动用 JMAP 投递到各自文件夹（默认文件夹名 = 账户邮箱，见 §4.6），无需 STALWART_ACCOUNTS
 #   contact@ciallo.sale / service@ciallo.sale / pgp@ciallo.sale / admin@delicateduck.xyz / noreply@ciallo.sale
-#   → 全部投递到 Stalwart 账户 cloudmail@local.domain（同一 INBOX 混流，按 emailId 回写各账户）
-# STALWART_ACCOUNTS={"contact@ciallo.sale":"cloudmail@local.domain","service@ciallo.sale":"cloudmail@local.domain","pgp@ciallo.sale":"cloudmail@local.domain","admin@delicateduck.xyz":"cloudmail@local.domain","noreply@ciallo.sale":"cloudmail@local.domain"}
+#   可选覆盖文件夹名：STALWART_FOLDERS={"contact@ciallo.sale":"客服","service@ciallo.sale":"服务"}
+#   （旧 smtp 模式才需要：STALWART_ACCOUNTS 映射 {"CloudMail账户":"Stalwart地址"}，混流 INBOX）
 # ⚠️ 若想在雷鸟隔离 5 个号（各一个 IMAP 账户）：建 5 个 Stalwart 邮箱账户（如 c1@local.domain … ），
 #    映射各自地址；反向同步需为每账户配 JMAP 凭据（当前脚本单套凭据，见 §4.5 局限说明）
 # 反向同步（可选）：加上以下三项后自动开启 已读回写 / 删除回写 / 发信导入
@@ -276,6 +307,23 @@ journalctl -u cloudmail-sync --no-pager -n 20
 
 # 通过公网域名测 IMAPS 握手（应看到 * OK Stalwart ...）
 timeout 10 openssl s_client -connect imap.duckgame-play.top:993 -servername imap.duckgame-play.top </dev/null 2>/dev/null | grep -E 'subject=|* OK' | head -5
+```
+
+**JMAP 文件夹投递验证**（§4.6 架构；AI 助手执行）：
+```bash
+# 1. 同步脚本日志：应看到「投递 JMAP 文件夹」+ 各账户「同步 <emailId>」
+journalctl -u cloudmail-sync --no-pager -n 50 | grep -E '投递|同步|删除|恢复|发信|已读'
+
+# 2. JMAP 会话 + 各号文件夹存在（用雷鸟密码登录，拿 mail 账户 id）
+TOKEN=$(curl -s -u "cloudmail@local.domain:Stalwart邮箱密码" http://127.0.0.1:8080/jmap -X POST \
+  -H 'Content-Type: application/json' \
+  -d '{"using":["urn:ietf:params:jmap:core"],"methodCalls":[["Core/echo",{},"c0"]]}' | jq -r '.accountId // "check-session"')
+
+# 3. 列文件夹，应包含 5 个号 + Sent + Trash
+curl -s -u "cloudmail@local.domain:Stalwart邮箱密码" http://127.0.0.1:8080/jmap -X POST \
+  -H 'Content-Type: application/json' \
+  -d "{\"using\":[\"urn:ietf:params:jmap:core\",\"urn:ietf:params:jmap:mail\"],\"methodCalls\":[[\"Mailbox/query\",{\"accountId\":\"\$TOKEN\"},\"m0\"]]}" \
+  | jq -r '.methodResponses[0][1].ids[0] as $x | "Mailbox/query OK"' 2>/dev/null || echo '按需用 jq 解析文件夹列表'
 ```
 
 ## 9. Thunderbird 添加账户

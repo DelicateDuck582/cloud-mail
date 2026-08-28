@@ -773,7 +773,11 @@ async function syncOnce() {
   const folderIds = [];
   for (const acc of accounts) {
     const rcpt = cleanRcpt(CFG.accountMap[acc.email] || CFG.defaultRcpt);
-    if (!rcpt) { console.warn('账户 ' + acc.email + ' 无目标 Stalwart 邮箱（STALWART_RCPT_TO/STALWART_ACCOUNTS），跳过'); continue; }
+    if (!useJmap && !rcpt) {
+      // 仅 smtp 模式需要目标 Stalwart 邮箱；jmap 模式按账户邮箱创建文件夹投递
+      console.warn('账户 ' + acc.email + ' 无目标 Stalwart 邮箱（STALWART_RCPT_TO/STALWART_ACCOUNTS），跳过');
+      continue;
+    }
     let folderId = null;
     if (useJmap) {
       try { folderId = await jmap.ensureMailbox(folderFor(acc)); }
