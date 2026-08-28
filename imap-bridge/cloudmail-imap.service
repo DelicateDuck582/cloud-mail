@@ -1,0 +1,24 @@
+[Unit]
+Description=CloudMail IMAP bridge
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=cloudmail
+Group=cloudmail
+WorkingDirectory=/opt/cloudmail-imap
+EnvironmentFile=/etc/cloudmail-imap.env
+ExecStart=/usr/bin/node /opt/cloudmail-imap/server.js
+Restart=on-failure
+RestartSec=5
+# 安全：最小权限 + 只读 + 无新权限
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadOnlyPaths=/opt/cloudmail-imap
+# 证书在 /opt/cloudmail-imap/certs（部署时复制并 chown cloudmail）
+
+[Install]
+WantedBy=multi-user.target
