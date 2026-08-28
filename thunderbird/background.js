@@ -8,6 +8,11 @@ const LIST_SIZE = 30;
 // 邮件类型：与后端 emailConst.type 对应（0=收件 1=发件）
 const TYPE_MAP = { receive: 0, send: 1 };
 
+// 点击工具栏图标 → 打开 CloudMail 阅读页
+browser.browserAction.onClicked.addListener(() => {
+  browser.tabs.create({ url: browser.runtime.getURL('mail.html') });
+});
+
 async function getToken() {
   const { token } = await browser.storage.local.get('token');
   return token || null;
