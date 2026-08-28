@@ -54,11 +54,44 @@ if (!CFG.email || !CFG.password) {
   process.exit(1);
 }
 
+// 性能：状态最多保留最新 STATE_MAX 条（旧 emailId 不会再出现在最新列表，可安全裁剪）
+const STATE_MAX = Number(process.env.STATE_MAX || 10000);
+// 附件上限：单文件 / 整封，超限跳过（防内存撑爆与 COS 流量）
+const ATTACH_MAX_MB = Number(process.env.ATTACH_MAX_MB || 10);
+const ATTACH_TOTAL_MAX_MB = Number(process.env.ATTACH_TOTAL_MAX_MB || 25);
+
+// ---------------- 安全守卫 ----------------
+const LOOPBACK = new Set(['127.0.0.1', 'localhost', '::1']);
+if (CFG.smtpHost && !LOOPBACK.has(CFG.smtpHost)) {
+  // SMTP 目标非回环：邮件内容（含正文/主题）会发到该主机，仅建议本地 Stalwart
+  console.warn('[安全] STALWART_SMTP_HOST 非回环地址，请确认目标可信（仅建议 127.0.0.1 本地 Stalwart）');
+}
+if (CFG.jmapUrl) {
+  try {
+    const u = new URL(CFG.jmapUrl);
+    if (u.protocol === 'http:' && !LOOPBACK.has(u.hostname)) {
+      console.error('[安全] STALWART_JMAP_URL 使用明文 http 且非本地回环，密码会明文外发，已拒绝启动');
+      process.exit(1);
+    }
+  } catch (e) {
+    console.error('STALWART_JMAP_URL 非法：' + CFG.jmapUrl);
+    process.exit(1);
+  }
+}
+
+// HTTP 统一超时（Node fetch 默认无超时，防止网络卡死整轮）
+const HTTP_TIMEOUT_MS = Number(process.env.HTTP_TIMEOUT_MS || 20000);
+function fetchT(url, opts) { return fetch(url, Object.assign({}, opts, { signal: AbortSignal.timeout(HTTP_TIMEOUT_MS) })); }
+// 严格清洗邮箱地址，防 SMTP 命令注入（rcpt 来自 CloudMail 账户名，不可信）
+function cleanRcpt(v) { return String(v || '').replace(/[^A-Za-z0-9._@\-]/g, ''); }
+
+
+
 // ---------------- CloudMail API ----------------
 const cloud = {
   token: null,
   async login() {
-    const r = await fetch(CFG.base + '/api/login', {
+    const r = await fetchT(CFG.base + '/api/login', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ email: CFG.email, password: CFG.password }),
@@ -71,7 +104,7 @@ const cloud = {
     const h = {};
     if (body) h['Content-Type'] = 'application/json';
     if (this.token) h['Authorization'] = this.token;
-    const r = await fetch(CFG.base + p, { method, headers: h, body: body ? JSON.stringify(body) : undefined });
+    const r = await fetchT(CFG.base + p, { method, headers: h, body: body ? JSON.stringify(body) : undefined });
     const j = await r.json().catch(() => ({}));
     if (j.code === 401 && retry) { await this.login(); return this.api(p, { method, body, retry: false }); }
     return j;
@@ -102,6 +135,18 @@ const cloud = {
 };
 
 // ---------------- 状态文件（key = accountId:emailId） ----------------
+function pruneState(set) {
+  if (set.size <= STATE_MAX) return;
+  // 保留 emailId 最大的（最新）STATE_MAX 条：旧 id 不会再次出现在最新列表，可安全裁剪
+  const arr = [...set];
+  arr.sort((a, b) => {
+    const ia = Number(a.slice(a.lastIndexOf(':') + 1));
+    const ib = Number(b.slice(b.lastIndexOf(':') + 1));
+    return ib - ia;
+  });
+  set.clear();
+  arr.slice(0, STATE_MAX).forEach((k) => set.add(k));
+}
 function loadState() {
   try {
     const data = JSON.parse(fs.readFileSync(CFG.stateFile, 'utf8'));
@@ -109,6 +154,7 @@ function loadState() {
   } catch (e) { return new Set(); }
 }
 function saveState(set) {
+  pruneState(set); // 先裁剪再落盘，控制文件大小与写盘开销
   const dir = path.dirname(CFG.stateFile);
   fs.mkdirSync(dir, { recursive: true });
   const tmp = CFG.stateFile + '.tmp';
@@ -159,16 +205,23 @@ async function buildMime(detail, emailId, rcptTo) {
   if (CFG.withAttachments && atts.length) {
     const boundaryMix = rndBoundary();
     let mix = '--' + boundaryMix + '\r\n' + altPart + '\r\n';
+    let totalBytes = 0;
+    const MAX_SINGLE = ATTACH_MAX_MB * 1024 * 1024;
+    const MAX_TOTAL = ATTACH_TOTAL_MAX_MB * 1024 * 1024;
     for (const a of atts) {
+      if (a.size && a.size > MAX_SINGLE) { console.warn('  附件超单文件上限跳过：' + (a.filename || a.key)); continue; }
+      if (totalBytes >= MAX_TOTAL) { console.warn('  附件总量超限，剩余跳过'); break; }
       let bytes;
       try {
-        const res = await fetch(a.url); // 签名 URL（COS 私有桶）
+        const res = await fetchT(a.url); // 签名 URL（COS 私有桶）
         if (!res.ok) throw new Error('HTTP ' + res.status);
         bytes = Buffer.from(await res.arrayBuffer());
       } catch (e) {
         console.warn('  附件拉取失败 ' + (a.filename || a.key) + '：' + e.message);
         continue;
       }
+      totalBytes += bytes.length;
+      if (totalBytes > MAX_TOTAL) { console.warn('  附件总量超限，剩余跳过'); break; }
       mix += '--' + boundaryMix + '\r\n' +
         'Content-Type: ' + (a.mimeType || 'application/octet-stream') + '\r\n' +
         'Content-Disposition: attachment; filename="' + cleanHeaderField(a.filename || 'attachment').replace(/"/g, '\\"') + '"\r\n' +
@@ -199,8 +252,8 @@ function smtpSend(raw, rcptTo) {
         const line = buf.slice(0, idx); buf = buf.slice(idx + 2);
         const code = Number(line.slice(0, 3));
         if (step === 0) { if (code !== 220) return fail(new Error('SMTP banner ' + line)); step = 1; sock.write('EHLO localhost\r\n'); }
-        else if (step === 1) { if (code === 250) { step = 2; sock.write('MAIL FROM:<' + CFG.email + '>\r\n'); } }
-        else if (step === 2) { if (code !== 250) return fail(new Error('MAIL FROM ' + line)); step = 3; sock.write('RCPT TO:<' + rcptTo + '>\r\n'); }
+        else if (step === 1) { if (code === 250) { step = 2; sock.write('MAIL FROM:<' + cleanRcpt(CFG.email) + '>\r\n'); } }
+        else if (step === 2) { if (code !== 250) return fail(new Error('MAIL FROM ' + line)); step = 3; sock.write('RCPT TO:<' + cleanRcpt(rcptTo) + '>\r\n'); }
         else if (step === 3) { if (code !== 250 && code !== 251) return fail(new Error('RCPT TO ' + line)); step = 4; sock.write('DATA\r\n'); }
         else if (step === 4) { if (code !== 354) return fail(new Error('DATA ' + line)); step = 5; sock.write(raw + '\r\n.\r\n'); }
         else if (step === 5) { if (code !== 250) return fail(new Error('DATA body ' + line)); step = 6; sock.write('QUIT\r\n'); }
@@ -216,7 +269,7 @@ async function jmapFetch(path, method, body) {
   const auth = 'Basic ' + Buffer.from(CFG.jmapUser + ':' + CFG.jmapPass).toString('base64');
   const opts = { headers: { Authorization: auth, 'Content-Type': 'application/json' }, method };
   if (body) opts.body = JSON.stringify(body);
-  const r = await fetch(CFG.jmapUrl + path, opts);
+  const r = await fetchT(CFG.jmapUrl + path, opts);
   if (!r.ok) throw new Error('JMAP HTTP ' + r.status);
   return r.json();
 }
@@ -283,26 +336,37 @@ async function readBack(accounts) {
 
 // ---------------- 主同步循环（多账户） ----------------
 async function syncAccount(acc, rcpt, synced) {
-  let cursor = 0, page = 0, added = 0;
-  while (true) {
-    const emails = await cloud.list(acc.accountId, cursor);
-    if (!emails.length) break;
-    for (const m of emails) {
-      const key = acc.accountId + ':' + m.emailId;
-      if (synced.has(key)) continue;
-      try {
-        const detail = await cloud.detail(m.emailId);
-        const raw = await buildMime(detail, m.emailId, rcpt);
-        await smtpSend(raw, rcpt);
-        synced.add(key); added++;
-        console.log('  [' + acc.email + '] 同步 ' + m.emailId + '：' + (m.subject || '').slice(0, 50));
-      } catch (e) {
-        console.error('  邮件 ' + m.emailId + ' 失败：' + e.message); // 下一轮重试
+  let cursor = 0, page = 0, added = 0, smtpFails = 0;
+  try {
+    while (true) {
+      let emails;
+      try { emails = await cloud.list(acc.accountId, cursor); }
+      catch (e) { console.error('  列表失败（进度已保留，下轮重试）：' + e.message); break; }
+      if (!emails.length) break;
+      for (const m of emails) {
+        const key = acc.accountId + ':' + m.emailId;
+        if (synced.has(key)) continue;
+        try {
+          const detail = await cloud.detail(m.emailId);
+          const raw = await buildMime(detail, m.emailId, rcpt);
+          await smtpSend(raw, rcpt);
+          synced.add(key); added++;
+          smtpFails = 0;
+          console.log('  [' + acc.email + '] 同步 ' + m.emailId + '：' + (m.subject || '').slice(0, 50));
+        } catch (e) {
+          smtpFails++;
+          console.error('  邮件 ' + m.emailId + ' 失败：' + e.message); // 下一轮重试
+          // SMTP 连续 3 次失败（如 Stalwart 停机）→ 熔断本账户，避免每封都等 15s 超时
+          if (smtpFails >= 3) { console.error('  SMTP 连续失败，暂停本账户本轮（下轮重试）'); break; }
+        }
       }
+      if (smtpFails >= 3) break;
+      const last = emails[emails.length - 1].emailId;
+      if (emails.length >= CFG.page && last && last !== cursor) { cursor = last; page++; } else break;
+      if (page > 50) break;
     }
-    const last = emails[emails.length - 1].emailId;
-    if (emails.length >= CFG.page && last && last !== cursor) { cursor = last; page++; } else break;
-    if (page > 50) break;
+  } finally {
+    saveState(synced); // 每账户同步完就落盘，防中途失败丢进度导致重复投递
   }
   if (added) console.log('[' + new Date().toISOString() + '] ' + acc.email + ' 新增 ' + added + ' 封');
 }
@@ -312,11 +376,11 @@ async function syncOnce() {
   const accounts = await cloud.accounts();
   if (!accounts.length) { console.warn('CloudMail 无可用账户'); return; }
   for (const acc of accounts) {
-    const rcpt = CFG.accountMap[acc.email] || CFG.defaultRcpt;
+    const rcpt = cleanRcpt(CFG.accountMap[acc.email] || CFG.defaultRcpt);
     if (!rcpt) { console.warn('账户 ' + acc.email + ' 无目标 Stalwart 邮箱（STALWART_RCPT_TO/STALWART_ACCOUNTS），跳过'); continue; }
-    await syncAccount(acc, rcpt, synced);
+    try { await syncAccount(acc, rcpt, synced); }
+    catch (e) { console.error('  账户 ' + acc.email + ' 同步异常：' + e.message); saveState(synced); }
   }
-  saveState(synced);
   if (CFG.jmapUrl && CFG.jmapUser) {
     try { await readBack(accounts); } catch (e) { console.warn('已读回写跳过（' + e.message + '）'); }
   }

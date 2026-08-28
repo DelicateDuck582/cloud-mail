@@ -55,6 +55,10 @@ STALWART_USERNAME=cloudmail@local.domain
 STALWART_PASSWORD=Stalwart邮箱密码
 
 # ATTACHMENTS=1   # 可选：同步附件
+# ATTACH_MAX_MB=10        # 附件单文件上限，超限跳过（默认 10）
+# ATTACH_TOTAL_MAX_MB=25  # 单封附件总量上限，超限跳过（默认 25）
+# STATE_MAX=10000         # 状态集上限，超出自动裁剪最旧（默认 10000）
+# HTTP_TIMEOUT_MS=20000   # HTTP 请求超时（CloudMail/JMAP/附件，默认 20s）
 ```
 
 ## 限制（v2）
