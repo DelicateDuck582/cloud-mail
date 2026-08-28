@@ -122,12 +122,14 @@ const cloud = {
   },
   // 多账户：用户全部邮箱账户
   async accounts() {
-    const j = await this.api('/api/account/list?size=30');
+    const j = await this.api('/api/account/list?size=50');
     if (j.code !== 200) throw new Error('获取账户失败：' + (j.message || ''));
     return (j.data || []).filter(a => !a.isDel);
   },
   async list(accountId, cursor) {
-    const qs = new URLSearchParams({ accountId: accountId || 0, emailId: cursor || 0, size: CFG.page, type: 0, full: 0, timeSort: 0 });
+    // allReceive=0 强制按 accountId 过滤：若账户设了「接收所有邮件」，
+    // 不显式传 0 会导致拉取到全部账户邮件 → 多号模式下重复投递
+    const qs = new URLSearchParams({ accountId: accountId || 0, emailId: cursor || 0, size: CFG.page, type: 0, full: 0, timeSort: 0, allReceive: 0 });
     const j = await this.api('/api/email/list?' + qs.toString());
     if (j.code !== 200) throw new Error('拉取列表失败：' + (j.message || ''));
     return j.data.list || [];

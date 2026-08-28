@@ -119,12 +119,19 @@ Stalwart 管理 UI 默认监听 **localhost:8080**。先在 VPS 上做一次 SSH
 > ⚠️ 方案 B 中，Stalwart 的 **MAIL FROM 域名**必须与第三方 SMTP 的验证域名一致，
 > 否则第三方拒绝代发。多域名时要么每域一个中继凭据，要么统一用 A。
 
-### 多域名注意事项
-- CloudMail 支持多域名账户（每个域名独立 resend token/SPF）；雷鸟 From 可选任意 CloudMail 域名邮箱
-- `syncSent` 按 From 邮箱匹配 CloudMail 账户（跨域名均可）；无法匹配的 From 跳过导入
-- **反向同步（已读/删除/发信）绑定 JMAP 登录账户**：多域名邮箱建议绑定到**同一个 Stalwart 账户的多个地址**
-  （Stalwart 账户支持多 address），一套 JMAP 凭据即可覆盖全部域名
-- `STALWART_ACCOUNTS` 映射每个 CloudMail 域名账户 → Stalwart 地址（可同账户多地址，或分账户）
+### 多域名注意事项（本部署：delicateduck.xyz + ciallo.sale，共 5 号）
+- CloudMail 登录用户 `admin@delicateduck.xyz`（多号模式）下有 5 个邮箱账户：
+  `contact@ciallo.sale`、`service@ciallo.sale`、`pgp@ciallo.sale`、`admin@delicateduck.xyz`、`noreply@ciallo.sale`
+- **推荐拓扑：单 Stalwart 账户 `cloudmail@local.domain` 承接全部 5 号**
+  - 下行：`STALWART_ACCOUNTS` 把 5 号全部映射到 `cloudmail@local.domain`（同一 INBOX 混流）
+  - 反向同步：一套 JMAP 凭据覆盖全部 5 号（删除/发信/已读按 `emailId` 全局唯一回写各号）
+  - 雷鸟：1 个 IMAP 账户 + 5 个发信身份（From 可选任一 CloudMail 域名邮箱）
+- **若要在雷鸟隔离 5 个号（各一个 IMAP 账户）**：需建 5 个 Stalwart 账户（如
+  `c1@local.domain`…`c5@local.domain`），`STALWART_ACCOUNTS` 各映射其地址；
+  ⚠️ **局限**：当前脚本反向同步只支持一套 JMAP 凭据——仅对 JMAP 登录账户（推荐 `cloudmail@local.domain`
+  绑定全部 5 地址）生效；多 Stalwart 账户隔离场景需扩展脚本（多 JMAP 凭据），本期未实现
+- 每个发件域名（`ciallo.sale`、`delicateduck.xyz`）都需在第三方 SMTP 中继验证 **SPF/DKIM**，
+  否则按该域名 From 发信会被当垃圾邮件
 
 
 ## 5. 部署同步脚本（CloudMail → Stalwart）
@@ -153,8 +160,24 @@ POLL_INTERVAL=30000
 EOF
 chmod 600 /etc/cloudmail-sync.env
 
-# 多账户（可选）：把 STALWART_ACCOUNTS 加上，映射每个 CloudMail 账户到对应 Stalwart 邮箱
-#   STALWART_ACCOUNTS={"account1@duckgame-play.top":"cloudmail1@local.domain","account2@duckgame-play.top":"cloudmail2@local.domain"}
+# 环境变量（单账户最小配置：仅镜像 admin 一个号时用）
+cat > /etc/cloudmail-sync.env <<'EOF'
+CLOUDMAIL_EMAIL=admin@delicateduck.xyz
+CLOUDMAIL_PASSWORD=REPLACE_WITH_PASSWORD
+STALWART_RCPT_TO=cloudmail@local.domain
+STALWART_SMTP_HOST=127.0.0.1
+STALWART_SMTP_PORT=2525
+STATE_FILE=/var/lib/cloudmail-sync/state.json
+POLL_INTERVAL=30000
+EOF
+chmod 600 /etc/cloudmail-sync.env
+
+# 【多号模式：5 个邮箱全镜像】把 STALWART_ACCOUNTS 换成下面的映射（admin 登录，遍历 5 账户）
+#   contact@ciallo.sale / service@ciallo.sale / pgp@ciallo.sale / admin@delicateduck.xyz / noreply@ciallo.sale
+#   → 全部投递到 Stalwart 账户 cloudmail@local.domain（同一 INBOX 混流，按 emailId 回写各账户）
+# STALWART_ACCOUNTS={"contact@ciallo.sale":"cloudmail@local.domain","service@ciallo.sale":"cloudmail@local.domain","pgp@ciallo.sale":"cloudmail@local.domain","admin@delicateduck.xyz":"cloudmail@local.domain","noreply@ciallo.sale":"cloudmail@local.domain"}
+# ⚠️ 若想在雷鸟隔离 5 个号（各一个 IMAP 账户）：建 5 个 Stalwart 邮箱账户（如 c1@local.domain … ），
+#    映射各自地址；反向同步需为每账户配 JMAP 凭据（当前脚本单套凭据，见 §4.5 局限说明）
 # 反向同步（可选）：加上以下三项后自动开启 已读回写 / 删除回写 / 发信导入
 #   STALWART_JMAP_URL=https://127.0.0.1:8080/jmap
 #   STALWART_USERNAME=cloudmail@local.domain

@@ -25,10 +25,10 @@ VPS: Stalwart (SQLite) ←── IMAP :993 ── Cloudflare Tunnel ── Thund
 
 ### 下行：CloudMail → Stalwart
 
-### 多账户
-- 自动遍历 CloudMail 全部邮箱账户（`/api/account/list`）
+- 用登录用户（如 `admin@delicateduck.xyz`）自动遍历其**全部邮箱账户**（`/api/account/list`，多号模式）
 - 投递目标：`STALWART_ACCOUNTS`（JSON 映射 `{"CloudMail账户邮箱":"Stalwart目标邮箱"}`）
   未配置映射时，所有账户用 `STALWART_RCPT_TO` 投到同一个 Stalwart 邮箱
+- 5 号示例：contact/service/pgp/noreply@ciallo.sale + admin@delicateduck.xyz → 同一 `cloudmail@local.domain`
 
 ### 删除回写（雷鸟删除 → CloudMail 垃圾桶）
 - 投递时登记 Stalwart 邮件 ID ↔ CloudMail `accountId:emailId`（按固定 Message-ID 反查）
@@ -62,9 +62,9 @@ VPS: Stalwart (SQLite) ←── IMAP :993 ── Cloudflare Tunnel ── Thund
 CLOUDMAIL_EMAIL=REPLACE_WITH_EMAIL
 CLOUDMAIL_PASSWORD=REPLACE_WITH_PASSWORD
 
-# 投递：单账户用 RCPT_TO；多账户用 ACCOUNTS 映射
+# 投递：单账户用 RCPT_TO；多号模式用 ACCOUNTS 映射（admin 登录遍历全部号）
 STALWART_RCPT_TO=cloudmail@local.domain
-STALWART_ACCOUNTS={"account1@duckgame-play.top":"cloudmail1@local.domain","account2@duckgame-play.top":"cloudmail2@local.domain"}
+STALWART_ACCOUNTS={"contact@ciallo.sale":"cloudmail@local.domain","service@ciallo.sale":"cloudmail@local.domain","pgp@ciallo.sale":"cloudmail@local.domain","admin@delicateduck.xyz":"cloudmail@local.domain","noreply@ciallo.sale":"cloudmail@local.domain"}
 
 STALWART_SMTP_HOST=127.0.0.1
 STALWART_SMTP_PORT=2525   # 无 25 方案：本机明文 SMTP（Stalwart 监听 127.0.0.1:2525），云厂商封 25 不影响
