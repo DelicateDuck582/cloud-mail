@@ -325,6 +325,27 @@ function guessImageMime(url) {
   const map = { png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif', webp: 'image/webp', svg: 'image/svg+xml', bmp: 'image/bmp', ico: 'image/x-icon', avif: 'image/avif' };
   return map[ext] || null;
 }
+// 魔数嗅探：COS 存储的 Content-Type 可能是 octet-stream（Webmail 靠浏览器内容嗅探显示，
+// 雷鸟/网盘严格按 Content-Type → 不渲染）。读文件头魔数判断真实图片类型，最可靠。
+function sniffImageType(buf) {
+  if (!buf || buf.length < 12) return null;
+  if (buf[0] === 0xFF && buf[1] === 0xD8 && buf[2] === 0xFF) return 'image/jpeg';
+  if (buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4E && buf[3] === 0x47) return 'image/png';
+  if (buf[0] === 0x47 && buf[1] === 0x49 && buf[2] === 0x46 && buf[3] === 0x38) return 'image/gif';
+  if (buf[0] === 0x42 && buf[1] === 0x4D) return 'image/bmp';
+  if (buf[0] === 0x52 && buf[1] === 0x49 && buf[2] === 0x46 && buf[3] === 0x46 &&
+      buf[8] === 0x57 && buf[9] === 0x45 && buf[10] === 0x42 && buf[11] === 0x50) return 'image/webp';
+  if (buf.length >= 5 && String(buf.slice(0, 5)) === '<svg' || String(buf.slice(0, 5)).toLowerCase() === '<?xml') return 'image/svg+xml';
+  return null;
+}
+// 最终 MIME 判定：魔数 > 响应头 > URL 扩展名
+function resolveMime(bytes, headerType, url) {
+  const sniff = sniffImageType(bytes);
+  if (sniff) return sniff;
+  const ht = (headerType || '').split(';')[0].trim();
+  if (ht && ht.startsWith('image/')) return ht;
+  return guessImageMime(url) || (ht || 'application/octet-stream');
+}
 
 // Message-ID 固定为 cloudmail-<emailId>@duckgame-play.top，便于已读回写按 Message-ID 匹配
 async function buildMime(detail, emailId, rcptTo) {
@@ -382,14 +403,14 @@ async function buildMime(detail, emailId, rcptTo) {
     let rel = '--' + boundaryRel + '\r\n' + altPart + '\r\n';
     const MAX_INLINE = ATTACH_MAX_MB * 1024 * 1024;
     for (const img of inlineImgs) {
-      let bytes, imgType;
+      let bytes, imgType, respType = '';
       try {
         const res = await fetchT(img.url); // 现场签名 URL（同步时 15min 内有效）
         if (!res.ok) throw new Error('HTTP ' + res.status);
-        // 关键：COS key 无文件扩展名（如 <hash>.58D8796A00000000），不能用 URL 猜 MIME。
-        // 用响应头 Content-Type（COS 存储的原始类型，浏览器/Web 端就是靠它渲染）
-        imgType = ((res.headers.get('content-type') || '').split(';')[0].trim()) || guessImageMime(img.url) || 'application/octet-stream';
+        respType = res.headers.get('content-type') || '';
         bytes = Buffer.from(await res.arrayBuffer());
+        // COS 存储的 Content-Type 可能是 octet-stream → 用魔数嗅探真实图片类型（最可靠）
+        imgType = resolveMime(bytes, respType, img.url);
       } catch (e) {
         console.warn('  内嵌图拉取失败 ' + String(img.url).slice(0, 70) + '：' + e.message);
         continue; // 失败则 HTML 仍引用 cid（无 part）→ 客户端忽略显示，不影响邮件
@@ -414,11 +435,12 @@ async function buildMime(detail, emailId, rcptTo) {
       for (const a of restAtts) {
         if (a.size && a.size > MAX_SINGLE) { console.warn('  附件超单文件上限跳过：' + (a.filename || a.key)); continue; }
         if (totalBytes >= MAX_TOTAL) { console.warn('  附件总量超限，剩余跳过'); break; }
-        let bytes;
+        let bytes, attType = a.mimeType || '';
         try {
           const res = await fetchT(a.url); // 签名 URL（COS 私有桶）
           if (!res.ok) throw new Error('HTTP ' + res.status);
           bytes = Buffer.from(await res.arrayBuffer());
+          if (!attType) attType = resolveMime(bytes, res.headers.get('content-type') || '', a.url);
         } catch (e) {
           console.warn('  附件拉取失败 ' + (a.filename || a.key) + '：' + e.message);
           continue;
@@ -426,7 +448,7 @@ async function buildMime(detail, emailId, rcptTo) {
         totalBytes += bytes.length;
         if (totalBytes > MAX_TOTAL) { console.warn('  附件总量超限，剩余跳过'); break; }
         mix += '--' + boundaryMix + '\r\n' +
-          'Content-Type: ' + (a.mimeType || 'application/octet-stream') + '\r\n' +
+          'Content-Type: ' + (attType || 'application/octet-stream') + '\r\n' +
           'Content-Disposition: attachment; filename="' + cleanHeaderField(a.filename || 'attachment').replace(/"/g, '\\"') + '"\r\n' +
           'Content-Transfer-Encoding: base64\r\n\r\n' + b64buf(bytes) + '\r\n';
       }
@@ -446,11 +468,12 @@ async function buildMime(detail, emailId, rcptTo) {
       if (inlineUrlSet.has(a.url)) continue; // 内嵌图已进 related，避免重复
       if (a.size && a.size > MAX_SINGLE) { console.warn('  附件超单文件上限跳过：' + (a.filename || a.key)); continue; }
       if (totalBytes >= MAX_TOTAL) { console.warn('  附件总量超限，剩余跳过'); break; }
-      let bytes;
+      let bytes, attType = a.mimeType || '';
       try {
         const res = await fetchT(a.url); // 签名 URL（COS 私有桶）
         if (!res.ok) throw new Error('HTTP ' + res.status);
         bytes = Buffer.from(await res.arrayBuffer());
+        if (!attType) attType = resolveMime(bytes, res.headers.get('content-type') || '', a.url);
       } catch (e) {
         console.warn('  附件拉取失败 ' + (a.filename || a.key) + '：' + e.message);
         continue;
@@ -458,7 +481,7 @@ async function buildMime(detail, emailId, rcptTo) {
       totalBytes += bytes.length;
       if (totalBytes > MAX_TOTAL) { console.warn('  附件总量超限，剩余跳过'); break; }
       mix += '--' + boundaryMix + '\r\n' +
-        'Content-Type: ' + (a.mimeType || 'application/octet-stream') + '\r\n' +
+        'Content-Type: ' + (attType || 'application/octet-stream') + '\r\n' +
         'Content-Disposition: attachment; filename="' + cleanHeaderField(a.filename || 'attachment').replace(/"/g, '\\"') + '"\r\n' +
         'Content-Transfer-Encoding: base64\r\n\r\n' + b64buf(bytes) + '\r\n';
     }
