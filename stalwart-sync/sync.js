@@ -382,10 +382,13 @@ async function buildMime(detail, emailId, rcptTo) {
     let rel = '--' + boundaryRel + '\r\n' + altPart + '\r\n';
     const MAX_INLINE = ATTACH_MAX_MB * 1024 * 1024;
     for (const img of inlineImgs) {
-      let bytes;
+      let bytes, imgType;
       try {
         const res = await fetchT(img.url); // 现场签名 URL（同步时 15min 内有效）
         if (!res.ok) throw new Error('HTTP ' + res.status);
+        // 关键：COS key 无文件扩展名（如 <hash>.58D8796A00000000），不能用 URL 猜 MIME。
+        // 用响应头 Content-Type（COS 存储的原始类型，浏览器/Web 端就是靠它渲染）
+        imgType = ((res.headers.get('content-type') || '').split(';')[0].trim()) || guessImageMime(img.url) || 'application/octet-stream';
         bytes = Buffer.from(await res.arrayBuffer());
       } catch (e) {
         console.warn('  内嵌图拉取失败 ' + String(img.url).slice(0, 70) + '：' + e.message);
@@ -393,7 +396,7 @@ async function buildMime(detail, emailId, rcptTo) {
       }
       if (bytes.length > MAX_INLINE) { console.warn('  内嵌图超上限跳过（' + bytes.length + ' B）'); continue; }
       rel += '--' + boundaryRel + '\r\n' +
-        'Content-Type: ' + (guessImageMime(img.url) || 'application/octet-stream') + '\r\n' +
+        'Content-Type: ' + imgType + '\r\n' +
         'Content-Transfer-Encoding: base64\r\n' +
         'Content-ID: <img' + img.n + '>\r\n' +
         'Content-Disposition: inline\r\n\r\n' + b64buf(bytes) + '\r\n';
