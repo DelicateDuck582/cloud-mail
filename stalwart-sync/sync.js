@@ -267,6 +267,39 @@ function cleanHeaderField(v) {
 }
 function b64(s) { return Buffer.from(String(s), 'utf8').toString('base64'); }
 function b64buf(b) { return Buffer.from(b).toString('base64'); }
+// RFC 2047：非 ASCII 邮件头字段（Subject/发件人名字）必须用 encoded-word 编码，否则中文客户端乱码
+function encodeHeader(v) {
+  const s = String(v || '').trim();
+  if (!s || /^[\x20-\x7E]*$/.test(s)) return s; // 纯 ASCII 原样保留
+  return '=?UTF-8?B?' + b64(s) + '?=';
+}
+
+// 邮件客户端（雷鸟/手机）不执行 JS、可能阻止远程 CSS：给 HTML 注入内联基础样式，
+// 保证排版（img 消除"基线空白"/自适应、body 基础排版、p 紧凑间距），不破坏原有 style 属性
+function inlineEmailStyles(html) {
+  if (!html) return html;
+  return String(html)
+    .replace(/<img([^>]*)>/gi, (all, attrs) => {
+      const base = 'max-width:100%;height:auto;vertical-align:bottom';
+      if (/style=/i.test(attrs)) {
+        return '<img' + attrs.replace(/style="([^"]*)"/i, (m, s) => 'style="' + base + ';' + s + '"') + '>';
+      }
+      return '<img style="' + base + '"' + attrs + '>';
+    })
+    .replace(/<body([^>]*)>/gi, (all, attrs) => {
+      const base = "margin:0;padding:12px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;font-size:14px;line-height:1.5;color:#333;word-break:break-word";
+      if (/style=/i.test(attrs)) {
+        return '<body' + attrs.replace(/style="([^"]*)"/i, (m, s) => 'style="' + base + ';' + s + '"') + '>';
+      }
+      return '<body style="' + base + '"' + attrs + '>';
+    })
+    .replace(/<p([^>]*)>/gi, (all, attrs) => {
+      if (/style=/i.test(attrs)) {
+        return '<p' + attrs.replace(/style="([^"]*)"/i, (m, s) => 'style="margin:0 0 12px;' + s + '"') + '>';
+      }
+      return '<p style="margin:0 0 12px"' + attrs + '>';
+    });
+}
 function rndBoundary() { return '----=_cloudmail_' + crypto.randomBytes(16).toString('hex') + Date.now().toString(36); }
 function guessImageMime(url) {
   const ext = ((String(url).split('?')[0].match(/\.([a-zA-Z0-9]+)$/) || [])[1] || '').toLowerCase();
@@ -298,11 +331,13 @@ async function buildMime(detail, emailId, rcptTo) {
       return pre + 'cid:img' + n + post;
     });
   }
+  // 注入内联基础样式（雷鸟/手机不执行 JS、可能阻止远程 CSS → 靠内联 style 保证排版）
+  html = inlineEmailStyles(html);
 
   const headers =
-    'From: ' + (fromName ? fromName + ' <' + fromAddr + '>' : fromAddr) + '\r\n' +
+    'From: ' + (fromName ? encodeHeader(fromName) + ' <' + fromAddr + '>' : fromAddr) + '\r\n' +
     'To: ' + cleanHeaderField(rcptTo) + '\r\n' +
-    'Subject: ' + subject + '\r\n' +
+    'Subject: ' + encodeHeader(subject) + '\r\n' +
     'Date: ' + (date ? date : new Date().toUTCString()) + '\r\n' +
     'Message-ID: <' + msgId + '>' + '\r\n' +
     'MIME-Version: 1.0' + '\r\n';
