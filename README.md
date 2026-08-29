@@ -92,6 +92,13 @@
   - **✅ 复核确认安全**：CORS 白名单、`/init` 独立 INIT_SECRET + per-IP 限流、`/oss` + `/attachments` 附件直读 HMAC 签名、TG 预览 token 7 天 TTL + `Cache-Control: no-store`、public token 24h TTL 仅超管签发、登录防爆破（5 次/10 分钟 + 延迟）、`crypto.getRandomValues` 密码学随机、注册/加号 Turnstile + per-IP 验证记录、入站邮件 25MB/20 附件上限、发信前附件数量限制、发信限额/账号归属/域名权限校验、SQL 全参数化（drizzle / `prepare().bind()`）、全局错误脱敏、邮件 XSS 入库清洗 + 前端渲染兜底
   - **⚠️ 部署要求**：**必须在 Cloudflare 环境变量配置 `RESEND_SIGNING_SECRET`**（= Resend Webhooks 的 Signing secret），否则 webhook 未验签、邮件状态可被伪造；**所有密钥类环境变量不要写入 `wrangler.toml` / 不要提交到 git**（本地开发用 `wrangler-dev.toml`，已被 gitignore）
   - **☁️ COS 专项审计（2026-08-18）**：附件直读三层防护复核通过（COS 私有桶 + HMAC 短期签名 + 代理 Worker 路径白名单）；修复**中风险**：`/attachments/*` 与 `/browse/api/file` 响应原带 `Cache-Control: public, max-age=604800`，会让 Cloudflare 边缘 HTTP 缓存按完整 URL（含 query）缓存 → 签名过期后 7 天内旧 URL 仍可**直接命中边缘缓存，绕过 Worker 验签 / 网盘密码**。已改为 `private`（仅浏览器缓存、禁用共享缓存），内部 Cache API 7 天缓存不受影响；另给 mail-worker `/oss/*` 直读加 **per-IP 限流（120 次/分）**，防已登录用户反复拉取自己附件刷 COS 下行流量。⚠️ 部署注意：COS 桶必须保持**私有读写**；`ATT_SIGN_SECRET` / `BROWSE_PASS` 不得泄露；旧版 `cos-browser-worker`（files.* 子域名）若未下线，请确认已设置 `BROWSE_PASS`
+- **📬 邮件镜像（Thunderbird / IMAP 客户端）**：`stalwart-sync/` 同步脚本把 CloudMail 收件箱镜像到自托管 **Stalwart Mail Server**，雷鸟 / 手机邮件客户端用标准 IMAP/SMTP 收发：
+  - **多账户文件夹聚合**：每个 CloudMail 邮箱账户对应一个 IMAP 文件夹（JMAP Email/import 投递），支持 Sent / Trash
+  - **双向同步**：已读回写、删除回写 + 垃圾桶恢复、发信镜像（方案 C：经 CloudMail Resend API 投递，不依赖出站 25 端口）
+  - **按需同步**：默认由雷鸟打开 / 切换文件夹时经 HTTP 触发服务即时同步，仅保留低频兜底轮询——大幅降低 Cloudflare Worker 调用（适合免费额度）
+  - **附件可选镜像**：`ATTACHMENTS=1` 时同步附件到本地 Stalwart（雷鸟直接查看 / 下载，无需 web 端）
+  - **健壮性**：状态文件幂等（防重复投递）、失败熔断与退避重试、原子写；触发服务仅回环 + token 校验；MIME boundary 使用密码学随机
+  - 详见 [`stalwart-sync/README.md`](stalwart-sync/README.md)（含完整环境变量说明）；部署与凭据说明见本地部署文档（**不含在仓库中**）
 
 
 ## 技术栈

@@ -27,10 +27,13 @@
  */
 'use strict';
 const net = require('node:net');
+const http = require('node:http');
 const fs = require('node:fs');
 const path = require('node:path');
+const crypto = require('node:crypto');
 
 function envBool(v) { return v === '1' || v === 'true'; }
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 const CFG = {
   base: process.env.CLOUDMAIL_BASE || 'https://mail.duckgame-play.top',
@@ -48,6 +51,11 @@ const CFG = {
   stateFile: process.env.STATE_FILE || '/var/lib/cloudmail-sync/state.json',
   page: Number(process.env.FETCH_PAGE || 50),
   interval: Number(process.env.POLL_INTERVAL || 30000),
+  // 按需同步：默认由雷鸟打开时经 Tunnel HTTP 触发，仅保留低频兜底（省 Cloudflare Worker 调用）
+  triggerPort: Number(process.env.SYNC_TRIGGER_PORT || 0),      // 触发服务端口（仅监听回环）；0=关闭
+  triggerToken: process.env.SYNC_TRIGGER_TOKEN || '',           // 触发 token（未设置一律 403）
+  idleInterval: Number(process.env.IDLE_INTERVAL || 3600000),   // 兜底自动轮询毫秒；0=仅靠触发
+  minTriggerGap: Number(process.env.MIN_TRIGGER_GAP_MS || 15000), // 触发防抖最小间隔
   withAttachments: envBool(process.env.ATTACHMENTS),
   // 反向同步（需 STALWART_JMAP_URL 已配置）：
   syncDelete: envBool(process.env.SYNC_DELETE === undefined ? '1' : process.env.SYNC_DELETE), // 雷鸟删除 → CloudMail 垃圾桶
@@ -140,14 +148,21 @@ const cloud = {
     // allReceive=0 强制按 accountId 过滤：若账户设了「接收所有邮件」，
     // 不显式传 0 会导致拉取到全部账户邮件 → 多号模式下重复投递
     const qs = new URLSearchParams({ accountId: accountId || 0, emailId: cursor || 0, size: CFG.page, type: 0, full: 0, timeSort: 0, allReceive: 0 });
-    const j = await this.api('/api/email/list?' + qs.toString());
-    if (j.code !== 200) throw new Error('拉取列表失败：' + (j.message || ''));
-    return j.data.list || [];
+    // CloudMail 初次全量高频调用偶发 500：带退避重试 3 次
+    for (let t = 0; t < 3; t++) {
+      const j = await this.api('/api/email/list?' + qs.toString());
+      if (j.code === 200) return j.data.list || [];
+      if (t < 2) await sleep(800 * (t + 1));
+    }
+    throw new Error('拉取列表失败：CloudMail 返回异常');
   },
   async detail(emailId) {
-    const j = await this.api('/api/email/detail?emailId=' + encodeURIComponent(emailId));
-    if (j.code !== 200) throw new Error('拉取详情失败：' + (j.message || ''));
-    return j.data;
+    for (let t = 0; t < 3; t++) {
+      const j = await this.api('/api/email/detail?emailId=' + encodeURIComponent(emailId));
+      if (j.code === 200) return j.data;
+      if (t < 2) await sleep(800 * (t + 1));
+    }
+    throw new Error('拉取详情失败：CloudMail 返回异常');
   },
   // 已读回写：批量标记已读
   async markRead(emailIds) {
@@ -161,10 +176,10 @@ const cloud = {
     const j = await this.api('/api/email/delete?emailIds=' + emailIds.join(','), { method: 'DELETE' });
     if (j.code !== 200) throw new Error('删除失败：' + (j.message || ''));
   },
-  // 恢复同步：从 CloudMail 垃圾桶恢复
+  // 恢复同步：从 CloudMail 垃圾桶恢复（API 期望逗号分隔字符串）
   async restore(emailIds) {
     if (!emailIds.length) return;
-    const j = await this.api('/api/email/restore', { method: 'POST', body: { emailIds } });
+    const j = await this.api('/api/email/restore', { method: 'POST', body: { emailIds: emailIds.join(',') } });
     if (j.code !== 200) throw new Error('恢复失败：' + (j.message || ''));
   },
   // 发信同步：导入已发送记录（不触发 Resend 投递）
@@ -188,8 +203,10 @@ const cloud = {
 //   sentDone:        Set<stalwartEmailId>          已导入/已发送的 Stalwart Sent 邮件
 //   sentQueryState:  JMAP Email/queryChanges 的增量游标
 //   sentFail:        Map<stalwartEmailId, count>   发信同步失败重试计数（≥3 放弃，防确定性失败刷屏）
+//   keyToSid:        Map<cloudmailKey, stalwartId> 下行幂等反向映射（Stalwart query 不支持 messageId filter，
+//                                                  故用本映射防重复导入，不依赖反查）
 function emptyState() {
-  return { synced: new Set(), stalwartMap: new Map(), sentDone: new Set(), sentQueryState: '', sentFail: new Map() };
+  return { synced: new Set(), stalwartMap: new Map(), keyToSid: new Map(), sentDone: new Set(), sentQueryState: '', sentFail: new Map() };
 }
 function pruneState(st) {
   if (st.synced.size > STATE_MAX) {
@@ -208,6 +225,11 @@ function pruneState(st) {
   if (st.sentFail.size > 100) {
     st.sentFail = new Map([...st.sentFail].slice(-100));
   }
+  if (st.keyToSid.size > STATE_MAX) {
+    const arr = [...st.keyToSid.entries()]
+      .sort((a, b) => Number(b[0].slice(b[0].lastIndexOf(':') + 1)) - Number(a[0].slice(a[0].lastIndexOf(':') + 1)));
+    st.keyToSid = new Map(arr.slice(0, STATE_MAX));
+  }
 }
 function loadState() {
   try {
@@ -218,6 +240,7 @@ function loadState() {
       sentDone: new Set(Array.isArray(data.sentDone) ? data.sentDone : []),
       sentQueryState: typeof data.sentQueryState === 'string' ? data.sentQueryState : '',
       sentFail: new Map(Object.entries(data.sentFail || {})),
+      keyToSid: new Map(Object.entries(data.keyToSid || {})),
     };
   } catch (e) { return emptyState(); }
 }
@@ -233,6 +256,7 @@ function saveState(st) {
     sentDone: [...st.sentDone],
     sentQueryState: st.sentQueryState,
     sentFail: Object.fromEntries(st.sentFail),
+    keyToSid: Object.fromEntries(st.keyToSid),
   }));
   fs.renameSync(tmp, CFG.stateFile);
 }
@@ -243,7 +267,7 @@ function cleanHeaderField(v) {
 }
 function b64(s) { return Buffer.from(String(s), 'utf8').toString('base64'); }
 function b64buf(b) { return Buffer.from(b).toString('base64'); }
-function rndBoundary() { return '----=_cloudmail_' + Math.random().toString(36).slice(2) + Date.now().toString(36); }
+function rndBoundary() { return '----=_cloudmail_' + crypto.randomBytes(16).toString('hex') + Date.now().toString(36); }
 
 // Message-ID 固定为 cloudmail-<emailId>@duckgame-play.top，便于已读回写按 Message-ID 匹配
 async function buildMime(detail, emailId, rcptTo) {
@@ -351,8 +375,9 @@ async function jmapFetch(path, method, body) {
 
 // 返回 { messageId: true(已读)/false(未读) }
 async function jmapSeenMap() {
-  const session = await jmapFetch('', 'GET');
-  const accountId = session && session.primaryAccounts && session.primaryAccounts.mail;
+  const session = await jmapFetch('/session', 'GET');
+  const pa = (session && session.primaryAccounts) || {};
+  const accountId = pa['urn:ietf:params:jmap:mail'] || pa.mail || null;
   if (!accountId) throw new Error('JMAP 无 mail 账户');
 
   const mb = await jmapFetch('', 'POST', {
@@ -415,8 +440,11 @@ const jmap = {
   mailboxIds: {}, // name -> id（进程内缓存）
   async session() {
     if (!this.accountId) {
-      const session = await jmapFetch('', 'GET');
-      this.accountId = session && session.primaryAccounts && session.primaryAccounts.mail;
+      // RFC 8620：会话文档在 /jmap/session（GET /jmap 只接受 POST 方法调用，会 404）
+      const session = await jmapFetch('/session', 'GET');
+      // primaryAccounts 的 key 是 capability URN（RFC 8620），兼容简写 "mail"
+      const pa = (session && session.primaryAccounts) || {};
+      this.accountId = pa['urn:ietf:params:jmap:mail'] || pa.mail || null;
       if (!this.accountId) throw new Error('JMAP 无 mail 账户');
     }
     return this.accountId;
@@ -504,8 +532,10 @@ const jmap = {
     }, 'imp']]);
     const created = ((r['Email/import'] && r['Email/import'][0]) ? r['Email/import'][0].created : {}) || {};
     const entry = created && created.i0;
-    if (!entry || entry.type !== 'created' || !entry.id) throw new Error('JMAP Email/import 失败');
-    return entry.id;
+    // RFC 8621：Email/import 的 created 值是 Email 对象（含 id），不是 {type:'created',...}
+    const id = (entry && entry.id) || null;
+    if (!id) throw new Error('JMAP Email/import 失败（无 id）');
+    return id;
   },
 };
 
@@ -541,6 +571,7 @@ async function syncDeletes(st, folderIds) {
     try {
       await cloud.delete([Number(emailId)]);
       st.stalwartMap.delete(sid);
+      st.keyToSid.delete(key);
       st.synced.delete(key); // 释放：若 CloudMail 端恢复，将重新镜像
       console.log('[' + new Date().toISOString() + '] 删除同步：' + key);
     } catch (e) {
@@ -571,6 +602,7 @@ async function syncRestores(st, folderIds) {
           await cloud.restore([emailId]);
           // 登记防重复 restore（key 可能已释放；用 'r:' 虚拟 key，删除同步只取 emailId 部分）
           st.stalwartMap.set(e.id, key || ('r:' + emailId));
+          if (key) st.keyToSid.set(key, e.id);
           console.log('[' + new Date().toISOString() + '] 恢复同步：' + mid);
         } catch (err) {
           console.error('  恢复 ' + mid + ' 失败：' + err.message);
@@ -729,24 +761,22 @@ async function syncAccount(acc, rcpt, folderId, st) {
       if (!emails.length) break;
       for (const m of emails) {
         const key = acc.accountId + ':' + m.emailId;
-        if (st.synced.has(key)) continue;
+        if (st.synced.has(key) || st.keyToSid.has(key)) continue;
         try {
           const detail = await cloud.detail(m.emailId);
           const raw = await buildMime(detail, m.emailId, useJmap ? acc.email : rcpt);
           let sid = null;
           if (useJmap) {
-            // 幂等投递：先查 Stalwart 是否已有该 Message-ID（如垃圾桶恢复后），有则跳过 import
-            const existing = await queryStalwartId(key);
-            if (existing) {
-              st.stalwartMap.set(existing, key);
-            } else {
-              // receivedAt 保真 CloudMail 时间，避免雷鸟按导入时间排序
+            // 幂等投递：keyToSid 已有（如恢复后）→ 跳过 import，只补登记 stalwartMap
+            sid = st.keyToSid.get(key) || null;
+            if (!sid) {
               sid = await jmap.importEmail(raw, folderId, { seen: !m.unread, receivedAt: cloudTimeToISO(detail.createTime) });
-              st.stalwartMap.set(sid, key);
+              st.keyToSid.set(key, sid);
             }
+            st.stalwartMap.set(sid, key);
           } else {
             await smtpSend(raw, rcpt);
-            // SMTP 模式：通过固定 Message-ID 反查登记（供删除同步匹配）
+            // SMTP 模式：通过 Message-ID 反查登记（尽力而为）
             if (CFG.syncDelete && CFG.jmapUrl && CFG.jmapUser) {
               try { sid = await queryStalwartId(key); } catch (e) { /* 登记失败不阻塞 */ }
               if (sid) st.stalwartMap.set(sid, key);
@@ -813,6 +843,51 @@ async function syncOnce() {
   }
 }
 
+// ---------------- 按需触发（雷鸟打开时经 Tunnel HTTP 触发同步） ----------------
+let wakeFn = null;
+let wakeTimer = null;
+let lastSyncAt = 0;
+
+// 等待：被触发（poke）或兜底定时器到期
+function armIdle() {
+  return new Promise((resolve) => {
+    wakeFn = resolve;
+    if (CFG.idleInterval <= 0) return; // 0 = 不设兜底定时器，仅靠触发（poke）唤醒
+    wakeTimer = setTimeout(() => { wakeFn = null; wakeTimer = null; resolve(); }, CFG.idleInterval);
+  });
+}
+
+// 触发一次立即同步（受 MIN_TRIGGER_GAP_MS 防抖）
+function poke() {
+  if (!wakeFn) return; // 正在同步中则忽略（同步完会重新 armIdle）
+  const wait = Math.max(0, CFG.minTriggerGap - (Date.now() - lastSyncAt));
+  const fire = () => {
+    if (!wakeFn) return;
+    const w = wakeFn; wakeFn = null;
+    if (wakeTimer) { clearTimeout(wakeTimer); wakeTimer = null; }
+    w();
+  };
+  if (wakeTimer) clearTimeout(wakeTimer);
+  if (wait > 0) wakeTimer = setTimeout(fire, wait); else fire();
+}
+
+function startTrigger() {
+  if (!CFG.triggerPort) return;
+  const server = http.createServer((req, res) => {
+    const u = new URL(req.url, 'http://127.0.0.1');
+    const ok = req.method === 'GET' && u.pathname === '/trigger'
+      && CFG.triggerToken && u.searchParams.get('token') === CFG.triggerToken;
+    res.writeHead(ok ? 200 : 403, { 'Content-Type': 'text/plain' });
+    res.end(ok ? 'ok' : 'forbidden');
+    if (ok) {
+      console.log('[' + new Date().toISOString() + '] 收到触发信号，执行同步');
+      poke();
+    }
+  });
+  server.on('error', (e) => console.error('触发服务错误（触发将不可用，仅剩兜底轮询）：' + e.message));
+  server.listen(CFG.triggerPort, '127.0.0.1', () => console.log('触发服务 http://127.0.0.1:' + CFG.triggerPort + '/trigger'));
+}
+
 async function main() {
   const jmapOn = !!(CFG.jmapUrl && CFG.jmapUser);
   const features = [];
@@ -821,10 +896,13 @@ async function main() {
     if (CFG.syncSent) features.push('发信导入');
     features.push('已读回写');
   }
-  console.log('CloudMail→Stalwart 同步 v4 启动，轮询 ' + (CFG.interval / 1000) + 's'
+  console.log('CloudMail→Stalwart 同步 v4 启动'
+    + (CFG.triggerPort ? '，触发服务 :' + CFG.triggerPort + '（雷鸟打开时即时同步）' : '')
+    + (CFG.idleInterval > 0 ? '，兜底轮询 ' + (CFG.idleInterval / 1000) + 's' : '，无自动轮询（仅靠触发）')
     + (CFG.delivery === 'jmap' ? '，投递 JMAP 文件夹' : '，投递 ' + CFG.smtpHost + ':' + CFG.smtpPort)
     + (features.length ? '，反向同步：' + features.join('/') : '（未配置 JMAP，仅下行）')
     + (CFG.withAttachments ? '，附件开启' : ''));
+  startTrigger();
   while (true) {
     try {
       await cloud.login();
@@ -832,7 +910,8 @@ async function main() {
     } catch (e) {
       console.error('[' + new Date().toISOString() + '] 同步异常：', e.message);
     }
-    await new Promise((r) => setTimeout(r, CFG.interval));
+    lastSyncAt = Date.now();
+    await armIdle();
   }
 }
 

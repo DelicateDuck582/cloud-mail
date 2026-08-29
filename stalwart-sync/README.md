@@ -79,6 +79,13 @@ STALWART_ACCOUNTS={"contact@ciallo.sale":"cloudmail@local.domain","service@ciall
 STALWART_SMTP_HOST=127.0.0.1
 STALWART_SMTP_PORT=2525   # 无 25 方案：本机明文 SMTP（Stalwart 监听 127.0.0.1:2525），云厂商封 25 不影响
 STATE_FILE=/var/lib/cloudmail-sync/state.json
+# 按需同步（省 Cloudflare Worker 调用）：
+#   默认改为「雷鸟打开时触发」+ 低频兜底。触发走 Tunnel HTTP（sync.duckgame-play.top → 本机触发服务）。
+#   SYNC_TRIGGER_PORT=9999      触发服务端口（仅回环 127.0.0.1）；0=关闭
+#   SYNC_TRIGGER_TOKEN=xxxxx    触发 token（雷鸟插件/手测 URL 需带同值 token，未设置一律 403）
+#   IDLE_INTERVAL=3600000       兜底自动轮询毫秒（默认 1h；0=完全只靠触发，永不自动查询）
+#   MIN_TRIGGER_GAP_MS=15000    触发防抖（毫秒）
+# 旧固定轮询（想恢复 24h 自动高频轮询时用）：
 POLL_INTERVAL=30000
 
 # 反向同步（可选，配置以下三项后自动开启 已读回写/删除/发信）
@@ -113,7 +120,7 @@ STALWART_PASSWORD=Stalwart邮箱密码
 
 ## AGPL 合规
 - **不修改 Stalwart 代码**（官方二进制原样部署）。
-- 本地参考副本：`E:\DEVE 开发\stalwart`（从 `E:\数据迁移\开发\stalwart` 原样复制，哈希校验一致）。
+- 本地参考副本：官方发行版原样复制（哈希校验一致），**代码零修改**。
 - 自托管使用不涉及分发，无 AGPL 义务触发。
 
 

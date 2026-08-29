@@ -97,3 +97,28 @@ browser.runtime.onMessage.addListener(async (msg) => {
     return { ok: false, message: '网络错误：无法访问 ' + DEFAULT_BASE };
   }
 });
+
+// ---------- 按需同步触发（打开/切换文件夹 → 触发 VPS 同步，省 Worker 调用） ----------
+const DEFAULT_TRIGGER_URL = 'https://sync.duckgame-play.top/trigger';
+
+async function triggerVpsSync() {
+  const cfg = await browser.storage.local.get(['triggerUrl', 'triggerToken']);
+  const url = (cfg.triggerUrl || DEFAULT_TRIGGER_URL).trim();
+  const token = (cfg.triggerToken || '').trim();
+  if (!url || !token) return; // 未配置 token（在插件设置里填）则跳过，不打扰
+  try {
+    const sep = url.includes('?') ? '&' : '?';
+    const res = await fetch(url + sep + 'token=' + encodeURIComponent(token), { method: 'GET' });
+    if (!res.ok) console.warn('CloudMail trigger sync HTTP ' + res.status);
+  } catch (e) {
+    console.warn('CloudMail trigger sync failed:', e.message);
+  }
+}
+
+// 用户打开/切换文件夹（含启动时自动收邮件）→ 触发
+if (browser.mailTabs && browser.mailTabs.onDisplayedFolderChanged) {
+  browser.mailTabs.onDisplayedFolderChanged.addListener(() => { triggerVpsSync(); });
+}
+if (browser.accounts && browser.accounts.onFoldersOpened) {
+  browser.accounts.onFoldersOpened.addListener(() => { triggerVpsSync(); });
+}

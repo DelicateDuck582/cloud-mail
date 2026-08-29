@@ -1,0 +1,31 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <title>CloudMail Reader 设置</title>
+  <style>
+    body { font-family: sans-serif; max-width: 440px; margin: 16px auto; padding: 0 12px; color: #222; }
+    label { font-weight: 600; }
+    input { width: 100%; margin: 6px 0 14px; padding: 6px 8px; box-sizing: border-box; }
+    button { padding: 6px 18px; }
+    .hint { color: #777; font-size: 12px; margin-top: -10px; margin-bottom: 12px; }
+    #status { margin-left: 10px; color: #0a7d33; }
+  </style>
+</head>
+<body>
+  <h3>同步触发设置</h3>
+  <p>雷鸟打开 / 切换文件夹时，向 VPS 同步脚本发送即时同步信号，让 CloudMail→Stalwart 只在需要时查询（节省 Cloudflare Worker 免费额度）。</p>
+
+  <label>触发地址 URL</label>
+  <input id="url" placeholder="https://sync.duckgame-play.top/trigger">
+  <div class="hint">保持默认即可（需 Cloudflare Tunnel 已配置 sync.duckgame-play.top → VPS 触发服务）。</div>
+
+  <label>触发 Token</label>
+  <input id="token" type="password" placeholder="与 VPS 环境变量 SYNC_TRIGGER_TOKEN 保持一致">
+  <div class="hint">VPS：/etc/cloudmail-sync.env 中 SYNC_TRIGGER_TOKEN=…</div>
+
+  <button id="save">保存</button><span id="status"></span>
+
+  <script src="options.js"></script>
+</body>
+</html>
