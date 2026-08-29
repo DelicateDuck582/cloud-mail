@@ -97,7 +97,12 @@
   - **双向同步**：已读回写、删除回写 + 垃圾桶恢复、发信镜像（方案 C：经 CloudMail Resend API 投递，不依赖出站 25 端口）
   - **按需同步**：默认由雷鸟打开 / 切换文件夹时经 HTTP 触发服务即时同步，仅保留低频兜底轮询——大幅降低 Cloudflare Worker 调用（适合免费额度）
   - **附件可选镜像**：`ATTACHMENTS=1` 时同步附件到本地 Stalwart（雷鸟直接查看 / 下载，无需 web 端）
-  - **健壮性**：状态文件幂等（防重复投递）、失败熔断与退避重试、原子写；触发服务仅回环 + token 校验；MIME boundary 使用密码学随机
+  - **健壮性**：状态文件幂等（防重复投递）、失败熔断与指数退避重试、原子写、SIGTERM 优雅保存 state（防中断重复导入）；触发服务仅回环 + token 校验；MIME boundary 使用密码学随机
+  - **📌 2026-08-29 更新**：
+    - **内嵌图 cid 嵌入**：同步时把正文中的 COS 图片下载并嵌入 MIME（`multipart/related` + `Content-ID`），镜像邮件自包含——手机/雷鸟**无需插件、无需 CloudMail 账户、无需联网签名**即可显示内嵌图
+    - **中文主题乱码修复**：邮件头非 ASCII 字段（Subject/发件人名字）按 **RFC 2047**（`=?UTF-8?B?…?=`）编码，解决手机客户端中文主题乱码
+    - **KV/R2 附件 403 修复**：COS 故障回退 KV 时附件 URL 产生 `attachments/attachments/` 双前缀导致签名验签 403——`sign-utils` 按存储类型去除重复前缀（`mail-worker`）
+    - **网络抗波动**：CloudMail API 指数退避重试（600ms→12s），覆盖 VPS→CF 间歇性网络波动
   - 详见 [`stalwart-sync/README.md`](stalwart-sync/README.md)（含完整环境变量说明）；部署与凭据说明见本地部署文档（**不含在仓库中**）
 - **🔒 安全审计（2026-08-29）**：CloudMail ↔ Stalwart 镜像链路全流程安全复核通过
   - **CloudMail 用户数据**：邮件详情 / 删除 / 恢复 / 已读均按 `userId` 归属校验（越权 403）；SQL 全参数化；邮件 XSS 入库清洗 + 前端渲染兜底；登录防爆破
