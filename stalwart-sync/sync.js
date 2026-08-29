@@ -274,30 +274,49 @@ function encodeHeader(v) {
   return '=?UTF-8?B?' + b64(s) + '?=';
 }
 
-// 邮件客户端（雷鸟/手机）不执行 JS、可能阻止远程 CSS：给 HTML 注入内联基础样式，
-// 保证排版（img 消除"基线空白"/自适应、body 基础排版、p 紧凑间距），不破坏原有 style 属性
+// 邮件客户端（雷鸟/手机）不执行 JS / Shadow DOM、可能阻止远程 CSS：把 CloudMail 原始邮件的
+// 依赖 JS 的样式（:host / shadow-content）复刻为内联 style，保证排版与 Web 端一致。
+// 对齐 CloudMail 原始样式：body 字体颜色、p margin:0、h1-4、a、img max-width + 消除基线空白
 function inlineEmailStyles(html) {
   if (!html) return html;
+  const BODY_BASE = "margin:0;padding:12px;font-family:-apple-system,Inter,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;font-size:14px;line-height:1.5;color:#13181D;word-break:break-word";
+  const IMG_BASE = 'max-width:100%;height:auto;vertical-align:bottom';
   return String(html)
     .replace(/<img([^>]*)>/gi, (all, attrs) => {
-      const base = 'max-width:100%;height:auto;vertical-align:bottom';
       if (/style=/i.test(attrs)) {
-        return '<img' + attrs.replace(/style="([^"]*)"/i, (m, s) => 'style="' + base + ';' + s + '"') + '>';
+        return '<img' + attrs.replace(/style="([^"]*)"/i, (m, s) => 'style="' + IMG_BASE + ';' + s + '"') + '>';
       }
-      return '<img style="' + base + '"' + attrs + '>';
+      return '<img style="' + IMG_BASE + '"' + attrs + '>';
     })
     .replace(/<body([^>]*)>/gi, (all, attrs) => {
-      const base = "margin:0;padding:12px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;font-size:14px;line-height:1.5;color:#333;word-break:break-word";
       if (/style=/i.test(attrs)) {
-        return '<body' + attrs.replace(/style="([^"]*)"/i, (m, s) => 'style="' + base + ';' + s + '"') + '>';
+        return '<body' + attrs.replace(/style="([^"]*)"/i, (m, s) => 'style="' + BODY_BASE + ';' + s + '"') + '>';
       }
-      return '<body style="' + base + '"' + attrs + '>';
+      return '<body style="' + BODY_BASE + '"' + attrs + '>';
     })
     .replace(/<p([^>]*)>/gi, (all, attrs) => {
       if (/style=/i.test(attrs)) {
-        return '<p' + attrs.replace(/style="([^"]*)"/i, (m, s) => 'style="margin:0 0 12px;' + s + '"') + '>';
+        return '<p' + attrs.replace(/style="([^"]*)"/i, (m, s) => 'style="margin:0;' + s + '"') + '>';
       }
-      return '<p style="margin:0 0 12px"' + attrs + '>';
+      return '<p style="margin:0"' + attrs + '>';
+    })
+    .replace(/<h([1-4])([^>]*)>/gi, (all, n, attrs) => {
+      if (/style=/i.test(attrs)) {
+        return '<h' + n + attrs.replace(/style="([^"]*)"/i, (m, s) => 'style="font-size:18px;font-weight:700;' + s + '"') + '>';
+      }
+      return '<h' + n + ' style="font-size:18px;font-weight:700"' + attrs + '>';
+    })
+    .replace(/<a([^>]*)>/gi, (all, attrs) => {
+      if (/style=/i.test(attrs)) {
+        return '<a' + attrs.replace(/style="([^"]*)"/i, (m, s) => 'style="text-decoration:none;color:#0E70DF;' + s + '"') + '>';
+      }
+      return '<a style="text-decoration:none;color:#0E70DF"' + attrs + '>';
+    })
+    .replace(/<table([^>]*)>/gi, (all, attrs) => {
+      if (/style=/i.test(attrs)) {
+        return '<table' + attrs.replace(/style="([^"]*)"/i, (m, s) => 'style="max-width:100%;border-collapse:collapse;' + s + '"') + '>';
+      }
+      return '<table style="max-width:100%;border-collapse:collapse"' + attrs + '>';
     });
 }
 function rndBoundary() { return '----=_cloudmail_' + crypto.randomBytes(16).toString('hex') + Date.now().toString(36); }
