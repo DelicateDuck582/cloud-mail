@@ -103,6 +103,9 @@
     - **中文主题乱码修复**：邮件头非 ASCII 字段（Subject/发件人名字）按 **RFC 2047**（`=?UTF-8?B?…?=`）编码，解决手机客户端中文主题乱码
     - **KV/R2 附件 403 修复**：COS 故障回退 KV 时附件 URL 产生 `attachments/attachments/` 双前缀导致签名验签 403——`sign-utils` 按存储类型去除重复前缀（`mail-worker`）
     - **网络抗波动**：CloudMail API 指数退避重试（600ms→12s），覆盖 VPS→CF 间歇性网络波动
+    - **魔数嗅探（MIME 识别）**：内嵌图/附件下载后读文件头魔数判断真实类型（JPEG/PNG/GIF/WebP/BMP），解决 COS 存储 Content-Type 为 `octet-stream` 且 key 无扩展名（如 `<hash>.58D8796A00000000`）导致客户端无法渲染的问题——Web 端靠浏览器内容嗅探能显示，雷鸟/手机必须靠正确的 MIME part
+    - **内嵌图排版修复**：邮件 HTML 注入内联样式（对齐 CloudMail 原始排版：body 字体/颜色、`p{margin:0}`、h1-4、a、table 响应式），雷鸟/手机不执行 JS / Shadow DOM 也能获得与 Web 端一致的排版
+    - **附件图片 MIME 优先**：附件下载时图片魔数绝对优先（覆盖 COS/attList 错误的 octet-stream），非图片保持原类型
   - 详见 [`stalwart-sync/README.md`](stalwart-sync/README.md)（含完整环境变量说明）；部署与凭据说明见本地部署文档（**不含在仓库中**）
 - **🔒 安全审计（2026-08-29）**：CloudMail ↔ Stalwart 镜像链路全流程安全复核通过
   - **CloudMail 用户数据**：邮件详情 / 删除 / 恢复 / 已读均按 `userId` 归属校验（越权 403）；SQL 全参数化；邮件 XSS 入库清洗 + 前端渲染兜底；登录防爆破
