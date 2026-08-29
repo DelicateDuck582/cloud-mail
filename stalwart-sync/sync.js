@@ -926,6 +926,12 @@ async function syncOnce() {
 let wakeFn = null;
 let wakeTimer = null;
 let lastSyncAt = 0;
+let stopping = false;
+
+// 优雅退出：systemd restart / 手动 stop 时，完成当前账户同步并落盘 state 后再退出，
+// 避免中断导致 keyToSid 丢失 → 下一轮重复导入（Stalwart 不支持 messageId 查询去重，靠 state 幂等）
+process.on('SIGTERM', () => { stopping = true; console.log('[' + new Date().toISOString() + '] 收到 SIGTERM，完成当前同步后保存退出'); });
+process.on('SIGINT', () => { stopping = true; });
 
 // 等待：被触发（poke）或兜底定时器到期
 function armIdle() {
@@ -982,7 +988,7 @@ async function main() {
     + (features.length ? '，反向同步：' + features.join('/') : '（未配置 JMAP，仅下行）')
     + (CFG.withAttachments ? '，附件开启' : ''));
   startTrigger();
-  while (true) {
+  while (!stopping) {
     try {
       await cloud.login();
       await syncOnce();
@@ -990,6 +996,7 @@ async function main() {
       console.error('[' + new Date().toISOString() + '] 同步异常：', e.message);
     }
     lastSyncAt = Date.now();
+    if (stopping) { console.log('[' + new Date().toISOString() + '] 已停止（state 已保存）'); break; }
     await armIdle();
   }
 }
