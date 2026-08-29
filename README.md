@@ -99,6 +99,14 @@
   - **附件可选镜像**：`ATTACHMENTS=1` 时同步附件到本地 Stalwart（雷鸟直接查看 / 下载，无需 web 端）
   - **健壮性**：状态文件幂等（防重复投递）、失败熔断与退避重试、原子写；触发服务仅回环 + token 校验；MIME boundary 使用密码学随机
   - 详见 [`stalwart-sync/README.md`](stalwart-sync/README.md)（含完整环境变量说明）；部署与凭据说明见本地部署文档（**不含在仓库中**）
+- **🔒 安全审计（2026-08-29）**：CloudMail ↔ Stalwart 镜像链路全流程安全复核通过
+  - **CloudMail 用户数据**：邮件详情 / 删除 / 恢复 / 已读均按 `userId` 归属校验（越权 403）；SQL 全参数化；邮件 XSS 入库清洗 + 前端渲染兜底；登录防爆破
+  - **COS 附件安全**：COS 私有桶 + HMAC 短期签名（15min）+ 代理 Worker 路径白名单 + per-IP 限流 + `Cache-Control: private`（防边缘缓存绕过验签）——无权访问 / 越权访问 / 盗刷流量均受防护
+  - **sync.js**：凭据仅存环境变量（权限 600）、JMAP/SMTP 强制回环、SMTP/邮件头注入防护、MIME boundary 密码学随机（防邮件头走私）、触发服务仅回环 + token 校验、状态文件原子写
+  - **源码密钥检查**：git 历史 / 工作区无真实密钥（JWT / 签名密钥 / 密码 / token 均为占位符或环境变量）；含部署凭据说明的文档已从 git 移出跟踪
+  - **语法检查**：`sync.js` / `smtp-void.js` / 雷鸟插件脚本 `node --check` 全部通过
+  - **性能**：按需触发（雷鸟打开时同步）+ 低频兜底 + 指数退避重试 + 失败熔断——Worker 调用量大幅下降
+  - 完整报告见 `stalwart-sync/安全审计报告-2026-08-29.md`
 
 
 ## 技术栈

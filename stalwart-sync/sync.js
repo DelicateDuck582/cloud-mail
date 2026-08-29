@@ -148,19 +148,19 @@ const cloud = {
     // allReceive=0 强制按 accountId 过滤：若账户设了「接收所有邮件」，
     // 不显式传 0 会导致拉取到全部账户邮件 → 多号模式下重复投递
     const qs = new URLSearchParams({ accountId: accountId || 0, emailId: cursor || 0, size: CFG.page, type: 0, full: 0, timeSort: 0, allReceive: 0 });
-    // CloudMail 初次全量高频调用偶发 500：带退避重试 3 次
-    for (let t = 0; t < 3; t++) {
+    // VPS→CF 网络间歇波动：指数退避重试（600ms→12s），覆盖 1-2 次瞬时失败
+    for (let t = 0; t < 6; t++) {
       const j = await this.api('/api/email/list?' + qs.toString());
       if (j.code === 200) return j.data.list || [];
-      if (t < 2) await sleep(800 * (t + 1));
+      await sleep([600, 1500, 3000, 6000, 12000][t] || 12000);
     }
     throw new Error('拉取列表失败：CloudMail 返回异常');
   },
   async detail(emailId) {
-    for (let t = 0; t < 3; t++) {
+    for (let t = 0; t < 6; t++) {
       const j = await this.api('/api/email/detail?emailId=' + encodeURIComponent(emailId));
       if (j.code === 200) return j.data;
-      if (t < 2) await sleep(800 * (t + 1));
+      await sleep([600, 1500, 3000, 6000, 12000][t] || 12000);
     }
     throw new Error('拉取详情失败：CloudMail 返回异常');
   },
@@ -268,6 +268,11 @@ function cleanHeaderField(v) {
 function b64(s) { return Buffer.from(String(s), 'utf8').toString('base64'); }
 function b64buf(b) { return Buffer.from(b).toString('base64'); }
 function rndBoundary() { return '----=_cloudmail_' + crypto.randomBytes(16).toString('hex') + Date.now().toString(36); }
+function guessImageMime(url) {
+  const ext = ((String(url).split('?')[0].match(/\.([a-zA-Z0-9]+)$/) || [])[1] || '').toLowerCase();
+  const map = { png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif', webp: 'image/webp', svg: 'image/svg+xml', bmp: 'image/bmp', ico: 'image/x-icon', avif: 'image/avif' };
+  return map[ext] || null;
+}
 
 // Message-ID 固定为 cloudmail-<emailId>@duckgame-play.top，便于已读回写按 Message-ID 匹配
 async function buildMime(detail, emailId, rcptTo) {
@@ -277,8 +282,22 @@ async function buildMime(detail, emailId, rcptTo) {
   const date = cleanHeaderField(detail.createTime);
   const msgId = 'cloudmail-' + emailId + '@duckgame-play.top';
   const plain = detail.text || '';
-  const html = detail.content || '';
+  let html = detail.content || '';
   const atts = (detail.attList || []).filter(a => a && a.url);
+
+  // 内嵌图：提取正文 HTML 中的 COS 图片 URL（detail 返回时已现场签名，15min 有效），
+  // 立即下载并替换为 cid 引用 → 镜像邮件自包含（手机/雷鸟无需联网签名即可显示）
+  const inlineImgs = [];
+  const inlineUrlSet = new Set();
+  if (CFG.withAttachments && html) {
+    html = html.replace(/(<img[^>]*\bsrc=["'])([^"']+)(["'][^>]*>)/gi, (all, pre, src, post) => {
+      if (src.startsWith('cid:') || src.startsWith('data:') || !src.includes('/attachments/')) return all;
+      const n = inlineImgs.length;
+      inlineImgs.push({ url: src, n });
+      inlineUrlSet.add(src);
+      return pre + 'cid:img' + n + post;
+    });
+  }
 
   const headers =
     'From: ' + (fromName ? fromName + ' <' + fromAddr + '>' : fromAddr) + '\r\n' +
@@ -301,6 +320,65 @@ async function buildMime(detail, emailId, rcptTo) {
 
   let bodyPart = altPart;
   let contentType = 'multipart/alternative; boundary="' + boundaryAlt + '"';
+
+  // 有内嵌图 → multipart/related（alternative 作为第一子部分 + 各图片 part，cid 自包含）
+  // 若同时有普通附件 → 外层再套 multipart/mixed（related + 附件），不丢失附件
+  if (inlineImgs.length) {
+    const boundaryRel = rndBoundary();
+    let rel = '--' + boundaryRel + '\r\n' + altPart + '\r\n';
+    const MAX_INLINE = ATTACH_MAX_MB * 1024 * 1024;
+    for (const img of inlineImgs) {
+      let bytes;
+      try {
+        const res = await fetchT(img.url); // 现场签名 URL（同步时 15min 内有效）
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        bytes = Buffer.from(await res.arrayBuffer());
+      } catch (e) {
+        console.warn('  内嵌图拉取失败 ' + String(img.url).slice(0, 70) + '：' + e.message);
+        continue; // 失败则 HTML 仍引用 cid（无 part）→ 客户端忽略显示，不影响邮件
+      }
+      if (bytes.length > MAX_INLINE) { console.warn('  内嵌图超上限跳过（' + bytes.length + ' B）'); continue; }
+      rel += '--' + boundaryRel + '\r\n' +
+        'Content-Type: ' + (guessImageMime(img.url) || 'application/octet-stream') + '\r\n' +
+        'Content-Transfer-Encoding: base64\r\n' +
+        'Content-ID: <img' + img.n + '>\r\n' +
+        'Content-Disposition: inline\r\n\r\n' + b64buf(bytes) + '\r\n';
+    }
+    rel += '--' + boundaryRel + '--\r\n';
+    const relatedBody = 'Content-Type: multipart/related; boundary="' + boundaryRel + '"\r\n\r\n' + rel;
+
+    const restAtts = CFG.withAttachments ? atts.filter(a => !inlineUrlSet.has(a.url)) : [];
+    if (restAtts.length) {
+      const boundaryMix = rndBoundary();
+      let mix = '--' + boundaryMix + '\r\n' + relatedBody + '\r\n';
+      let totalBytes = 0;
+      const MAX_SINGLE = ATTACH_MAX_MB * 1024 * 1024;
+      const MAX_TOTAL = ATTACH_TOTAL_MAX_MB * 1024 * 1024;
+      for (const a of restAtts) {
+        if (a.size && a.size > MAX_SINGLE) { console.warn('  附件超单文件上限跳过：' + (a.filename || a.key)); continue; }
+        if (totalBytes >= MAX_TOTAL) { console.warn('  附件总量超限，剩余跳过'); break; }
+        let bytes;
+        try {
+          const res = await fetchT(a.url); // 签名 URL（COS 私有桶）
+          if (!res.ok) throw new Error('HTTP ' + res.status);
+          bytes = Buffer.from(await res.arrayBuffer());
+        } catch (e) {
+          console.warn('  附件拉取失败 ' + (a.filename || a.key) + '：' + e.message);
+          continue;
+        }
+        totalBytes += bytes.length;
+        if (totalBytes > MAX_TOTAL) { console.warn('  附件总量超限，剩余跳过'); break; }
+        mix += '--' + boundaryMix + '\r\n' +
+          'Content-Type: ' + (a.mimeType || 'application/octet-stream') + '\r\n' +
+          'Content-Disposition: attachment; filename="' + cleanHeaderField(a.filename || 'attachment').replace(/"/g, '\\"') + '"\r\n' +
+          'Content-Transfer-Encoding: base64\r\n\r\n' + b64buf(bytes) + '\r\n';
+      }
+      mix += '--' + boundaryMix + '--\r\n';
+      return headers + 'Content-Type: multipart/mixed; boundary="' + boundaryMix + '"\r\n\r\n' + mix;
+    }
+    return headers + 'Content-Type: multipart/related; boundary="' + boundaryRel + '"\r\n\r\n' + rel;
+  }
+
   if (CFG.withAttachments && atts.length) {
     const boundaryMix = rndBoundary();
     let mix = '--' + boundaryMix + '\r\n' + altPart + '\r\n';
@@ -308,6 +386,7 @@ async function buildMime(detail, emailId, rcptTo) {
     const MAX_SINGLE = ATTACH_MAX_MB * 1024 * 1024;
     const MAX_TOTAL = ATTACH_TOTAL_MAX_MB * 1024 * 1024;
     for (const a of atts) {
+      if (inlineUrlSet.has(a.url)) continue; // 内嵌图已进 related，避免重复
       if (a.size && a.size > MAX_SINGLE) { console.warn('  附件超单文件上限跳过：' + (a.filename || a.key)); continue; }
       if (totalBytes >= MAX_TOTAL) { console.warn('  附件总量超限，剩余跳过'); break; }
       let bytes;
