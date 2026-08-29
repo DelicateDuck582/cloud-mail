@@ -103,13 +103,18 @@ const signUtils = {
 
 		const signMap = await this.signKeys(c, keys);
 		const base = await this.getBase(c, r2Domain);
+		// KV 模式 getBase 返回 `${origin}/attachments`，key 本身带 `attachments/` 前缀 →
+		// 若直接拼接会产生 `/attachments/attachments/` 双前缀（验签用 pathname 全路径，签名算 key，
+		// 双前缀会导致 403）。此处按 base 是否已含 `/attachments` 决定去掉 key 前缀。
+		const baseEndsAttachments = base.endsWith('/attachments');
 
 		return str.replace(pattern, (match, key) => {
 			const sp = signMap.get(key);
 			if (!sp) {
 				return match;
 			}
-			return `${base}/${key}?expires=${sp.expires}&sign=${sp.sign}`;
+			const pathKey = baseEndsAttachments ? key.replace(/^attachments\//, '') : key;
+			return `${base}/${pathKey}?expires=${sp.expires}&sign=${sp.sign}`;
 		});
 	},
 
@@ -122,13 +127,16 @@ const signUtils = {
 		const keys = attList.filter(a => a && a.key).map(a => a.key);
 		const signMap = await this.signKeys(c, keys);
 		const base = await this.getBase(c, r2Domain);
+		// 同 signContent：KV 模式 base 含 `/attachments`，key 去前缀防双前缀（验签 key 取 pathname 除前缀后）
+		const baseEndsAttachments = base.endsWith('/attachments');
 
 		for (const att of attList) {
 			if (!att || !att.key || !signMap.has(att.key)) {
 				continue;
 			}
 			const sp = signMap.get(att.key);
-			att.url = `${base}/${att.key}?expires=${sp.expires}&sign=${sp.sign}`;
+			const pathKey = baseEndsAttachments ? att.key.replace(/^attachments\//, '') : att.key;
+			att.url = `${base}/${pathKey}?expires=${sp.expires}&sign=${sp.sign}`;
 		}
 	}
 };
