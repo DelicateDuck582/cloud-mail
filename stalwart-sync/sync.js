@@ -440,7 +440,8 @@ async function buildMime(detail, emailId, rcptTo) {
           const res = await fetchT(a.url); // 签名 URL（COS 私有桶）
           if (!res.ok) throw new Error('HTTP ' + res.status);
           bytes = Buffer.from(await res.arrayBuffer());
-          if (!attType) attType = resolveMime(bytes, res.headers.get('content-type') || '', a.url);
+          // 图片魔数绝对优先（覆盖 COS/attList 错误的 octet-stream），非图片保持原类型
+          attType = sniffImageType(bytes) || attType || resolveMime(bytes, res.headers.get('content-type') || '', a.url);
         } catch (e) {
           console.warn('  附件拉取失败 ' + (a.filename || a.key) + '：' + e.message);
           continue;
@@ -473,7 +474,8 @@ async function buildMime(detail, emailId, rcptTo) {
         const res = await fetchT(a.url); // 签名 URL（COS 私有桶）
         if (!res.ok) throw new Error('HTTP ' + res.status);
         bytes = Buffer.from(await res.arrayBuffer());
-        if (!attType) attType = resolveMime(bytes, res.headers.get('content-type') || '', a.url);
+        // 图片魔数绝对优先（覆盖 COS/attList 错误的 octet-stream），非图片保持原类型
+        attType = sniffImageType(bytes) || attType || resolveMime(bytes, res.headers.get('content-type') || '', a.url);
       } catch (e) {
         console.warn('  附件拉取失败 ' + (a.filename || a.key) + '：' + e.message);
         continue;
