@@ -41,49 +41,51 @@
 
 | 变量 | 你的值 | 类型 | 代码要求 | 核对 |
 |---|---|---|---|---|
-| `admin` | `admin@moeq.moe` | 文本 | 管理员邮箱 | ⚠️ 见下（**关键**） |
+| `admin` | `admin@moeq.moe` | 文本 | 管理员邮箱 | ✅ 内部超管域（§2.2），登录不查 domain |
 | `ATT_SIGN_SECRET` | 加密 | 密钥 | 与 cos-exchange 同值 | ✅ 需两侧一致 |
 | `ATT_SIGN_TTL` | `900` | 文本 | 60~86400，默认 900 | ✅ |
-| `domain` | `["duckgame-play.top","delicateduck.xyz","ciallo…` | JSON | 数组 | ⚠️ 见下 |
+| `domain` | `["duckgame-play.top","delicateduck.xyz","ciallo…` | JSON | 数组 | ✅ 不含 moeq.moe（内部域，§2.2） |
 | `INIT_SECRET` | 加密 | 密钥 | 必填（/init） | ✅ |
 | `jwt_secret` | 加密 | 密钥 | 签名密钥 | ✅ |
 | `RESEND_SIGNING_SECRET` | 加密 | 密钥 | Resend webhook 验签 | ✅ |
 
-### 🚩 关键核对结果：admin 域必须在 domain 白名单内
+### 2.2 ✅ 澄清：`moeq.moe` 是内部超管域（设计如此，非配置缺失）
 
-代码事实（已逐行确认）：
-- **注册**（`login-service.js` L86）：`if (!c.env.domain.includes(emailUtils.getDomain(email))) throw 'notEmailDomain'`
-- **新增账户**（`account-service.js` L38）：同样校验 domain
-- **登录**（`login-service.js` L224+）：**不校验 domain**（只查用户存在 + 密码）
+维护者确认：`admin@moeq.moe` 是**内部管理员邮箱（超级管理员）**，
+`moeq.moe` **刻意不加入** `domain` 用户白名单。
 
-含义：
-- `admin@moeq.moe` **若已存在于 DB**：登录正常（登录不走 domain 校验）。
-- 但**新建/注册任何 `@moeq.moe` 账号都会被拒**，除非 `domain` 数组包含 `"moeq.moe"`。
-- 你的截图 domain 值被截断（`ciallo…`），**请确认数组完整内容是否包含 `"moeq.moe"`**；
-  若不含，admin 邮箱所属域在「域名管理」里也无法加号使用。
+代码事实（已逐行确认，与该设计自洽）：
+- **注册**（`login-service.js` L86）：强制 `c.env.domain.includes(邮箱域)` → `moeq.moe` 用户无法自助注册；
+- **新增账户**（`account-service.js` L38）：同样校验 → 普通用户无法把 moeq.moe 加入自己的可用账号；
+- **OAuth 绑定**（`oauth-service.js` bindUser → `loginService.register`）：同样受 domain 校验拦截；
+- **登录**（`login-service.js` L224+）：**不校验 domain**，DB 中已有该用户即可登录。
 
-**检查方法（无凭证视角）**：登录后台 → 设置/域名列表里应能看到 moeq.moe 被列入；或后续在 VPS/控制台核 `wrangler secret`（面板 vars 是明文 JSON，直接在面板看完整值）。
+设计效果：
+- 超管账号 `admin@moeq.moe` **登录不受影响**（登录不查 domain）；
+- 普通用户**无法注册/绑定** `@moeq.moe` 域 → 该域被"锁定"为内部域，只能通过超管手动创建账号使用；
+- 超管权限判定为 `user.email === c.env.admin`（硬编码邮箱比较），与 domain 列表无关。
+
+**→ 原先标"高"的 #1 项撤销：这是正确配置，非缺陷。**
+注意：`admin@moeq.moe` 账号本身需已存在于 DB（由部署者经开放注册/手动 SQL 建立一次），此后 domain 无需包含 moeq.moe。
 
 ### ⚠️ mail-worker 补充
 
 1. `domain` 里出现 `ciallo…`（如 ciallo.sale）与 `delicateduck.xyz`：与 thunderbird/stalwart 文档中
    收件域一致（contact/service/pgp/noreply@ciallo.sale、admin@delicateduck.xyz），属预期。
-2. `admin=admin@moeq.moe` 与历史文档示例（`admin@delicateduck.xyz`）不同——若这是新管理员邮箱，
-   需保证其账号已被创建（初始化/注册）；且角色/权限按 `user.email === c.env.admin` 判断，
-   只认这一个地址为超管。
+2. 超管判定按 `user.email === c.env.admin` 硬编码比较（见 §2.2），与 domain 列表无关。
 3. `ATT_SIGN_TTL=900` + cos 侧 `ATT_SIGN_MAX_TTL=3600`：**配对正确**（900<3600），无超长签名被拒风险。
 
 ---
 
 ## 3. 安全提示汇总
 
-| # | 项 | 级别 | 建议 |
+| # | 项 | 级别 | 说明 |
 |---|---|---|---|
-| 1 | `admin@moeq.moe` 域不在 domain 白名单则无法新建该域账号 | **高** | 确认 domain 数组含 moeq.moe |
+| 1 | ~~`admin@moeq.moe` 域不在白名单~~ | ~~高~~ | ✅ **撤销**：moeq.moe 为内部超管域，设计如此（见 §2.2） |
 | 2 | `ATT_SIGN_SECRET` 两侧一致性 | 高 | 面板两侧均「加密」无法目检；可用同一随机串重新 set 两侧 |
 | 3 | `TURNSTILE_SITEKEY` 应为文本类型 | 低 | 改文本（值本就公开） |
 | 4 | COS 只读子账号需 `GetObject+GetBucket` | 中 | 确认策略，否则 /browse 503 |
 | 5 | `BROWSE_ALLOW_COUNTRY=CN,JP` | 低 | 排障时注意非中/日 IP 一律 403 |
-| 6 | `domain` 与 `admin` 邮箱域 | 中 | 完整值务必核对（截图截断处） |
+| 6 | `domain` 数组完整值 | 低 | 截图截断处已确认包含 ciallo/delicateduck 等收件域即可 |
 
 > 无凭证探测已在 2026-08-29 做过（行为正常）；本次为配置↔代码静态核对。
