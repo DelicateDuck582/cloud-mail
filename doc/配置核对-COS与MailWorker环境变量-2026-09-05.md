@@ -88,4 +88,47 @@
 | 5 | `BROWSE_ALLOW_COUNTRY=CN,JP` | 低 | 排障时注意非中/日 IP 一律 403 |
 | 6 | `domain` 数组完整值 | 低 | 截图截断处已确认包含 ciallo/delicateduck 等收件域即可 |
 
+---
+
+## 4. COS 子账号权限审计（2026-09-05 补充）
+
+### 4.1 现状
+
+你提供了「全权账号」策略（mail-worker 上传用，存系统设置表 s3AccessKey/s3SecretKey）：
+
+```json
+{
+  "action": ["name/cos:GetObject","name/cos:PutObject","name/cos:DeleteObject","name/cos:GetBucket"],
+  "effect": "allow",
+  "resource": ["qcs::cos:ap-osaka:uid/<APPID>:cloudmail-<APPID>/*"]
+}
+```
+
+代码核验（attachment-manager）：
+- mail-worker 附件写/删/读全部走 `s3-service`（PutObject/DeleteObject/GetObject），
+  key 一律 `attachments/` 前缀（`constant.ATTACHMENT_PREFIX='attachments/'`，r2-service 逐行确认）；
+- `getBucketUsage`（att-service L603 用量统计）ListObjectsV2 **不带 prefix**，遍历整桶；
+- 桶内另有 /browse 网盘文件（browse-alist 只读账号浏览同一桶）。
+
+### 4.2 结论
+
+- **用途正确**：这是 mail-worker 上传/删除附件的全权账号，PutObject/DeleteObject 是必要权限 ✅
+- **范围可收窄（评估过）**：`cloudmail-<APPID>/*` → `cloudmail-<APPID>/attachments/*`
+  - 收益：该账号即使泄露也只能破坏邮件附件，无法删/改 /browse 网盘文件（最小权限）；
+  - 代价：`getBucketUsage` 现不带 prefix，收窄后需改为 `prefix: 'attachments/'` 才能正确统计
+    （COS ListObjectsV2 对越权 prefix 的 key 不可见/报错）。
+
+### 4.3 决策（维护者 2026-09-05）
+
+**✅ 采用方案 B：维持全桶 `*`（当前现状），不做收窄、不改代码。**
+
+理由（维护者）：当前桶内 /browse 网盘为个人使用场景，附件与网盘文件共享全权账号的
+权限边界风险可接受；且方案 A 需在 mail-worker 侧改 `getBucketUsage` 并配套验证，
+暂不引入该改动。若日后网盘开放多用户/外部使用，再评估收窄。
+
+- ~~[ ] 方案 A：策略收窄到 `attachments/*` + `getBucketUsage` 加 `prefix:'attachments/'`~~
+- [x] 方案 B：维持全桶 `*`（已采纳）
+
+---
+
 > 无凭证探测已在 2026-08-29 做过（行为正常）；本次为配置↔代码静态核对。
