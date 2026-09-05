@@ -43,6 +43,7 @@ const dbInit = {
 		await this.v3_9DB(c);
 		await this.v4_0DB(c);
 		await this.v4_1DB(c);
+		await this.v4_2DB(c);
 		await settingService.refresh(c);
 		return c.text('success');
 	},
@@ -190,6 +191,31 @@ const dbInit = {
 			]);
 		} catch (e) {
 			console.warn(`跳过索引：${e.message}`);
+		}
+	},
+
+	// 上游 v3.3.0：auto_clean（自动清理过期邮件）+ webhook 列（幂等）
+	// 本地编号 v3_3 已被 fork 用于 attachments trash，故上游 v3.3 迁移并入 v4_2
+	async v4_2DB(c) {
+		try {
+			await c.env.db.batch([
+				c.env.db.prepare(`ALTER TABLE setting ADD COLUMN auto_clean_days INTEGER NOT NULL DEFAULT 0;`),
+				c.env.db.prepare(`ALTER TABLE setting ADD COLUMN auto_clean_exclude TEXT NOT NULL DEFAULT '';`),
+				c.env.db.prepare(`CREATE INDEX IF NOT EXISTS idx_email_create_time ON email(create_time)`)
+			]);
+		} catch (e) {
+			console.warn(`跳过字段：${e.message}`);
+		}
+
+		try {
+			await c.env.db.batch([
+				c.env.db.prepare(`ALTER TABLE setting ADD COLUMN webhook_url TEXT NOT NULL DEFAULT '';`),
+				c.env.db.prepare(`ALTER TABLE setting ADD COLUMN webhook_status INTEGER NOT NULL DEFAULT 1;`),
+				c.env.db.prepare(`ALTER TABLE setting ADD COLUMN webhook_retry INTEGER NOT NULL DEFAULT 0;`),
+				c.env.db.prepare(`ALTER TABLE setting ADD COLUMN webhook_secret TEXT NOT NULL DEFAULT '';`)
+			]);
+		} catch (e) {
+			console.warn(`跳过字段：${e.message}`);
 		}
 	},
 

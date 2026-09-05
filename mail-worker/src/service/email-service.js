@@ -2,7 +2,7 @@ import orm from '../entity/orm';
 import email from '../entity/email';
 import { emailListColumns, emailBriefColumns, EMAIL_LIST_TEXT_LEN } from '../lib/email-list-columns';
 import { attConst, emailConst, isDel, settingConst } from '../const/entity-const';
-import { and, desc, eq, gt, inArray, lt, count, asc, sql, ne, or, like, lte, gte } from 'drizzle-orm';
+import { and, desc, eq, gt, inArray, notInArray, lt, count, asc, sql, ne, or, like, lte, gte } from 'drizzle-orm';
 import { star } from '../entity/star';
 import settingService from './setting-service';
 import accountService from './account-service';
@@ -33,11 +33,30 @@ const emailService = {
 		let { emailId, type, accountId, size, timeSort, allReceive, full } = params;
 
 		size = Number(size);
+		type = Number(type);
 		emailId = Number(emailId) || 0;
 		timeSort = Number(timeSort);
 		accountId = Number(accountId);
 		allReceive = Number(allReceive);
-		full = Number(full) === 1;
+		full = Number(full);
+
+		if (isNaN(type)) {
+			type = 0;
+		}
+
+		if (isNaN(accountId)) {
+			throw new BizError(t('emptyAccountId'));
+		}
+
+		if (isNaN(size)) {
+			size = 10;
+		}
+
+		if (isNaN(full)) {
+			full = 1;
+		}
+
+		full = full === 1;
 
 		if (size > 50) {
 			size = 50;
@@ -134,7 +153,8 @@ const emailService = {
 
 	applyListText(list) {
 		for (const item of list) {
-			item.text = this.toListText(item);
+			item.listText = this.toListText(item);
+			delete item.text;
 			delete item.content;
 		}
 		return list;
@@ -861,7 +881,7 @@ const emailService = {
 			allReceive = accountRow.allReceive;
 		}
 
-		let list = await orm(c).select({ ...emailBriefColumns }).from(email)
+		const list = await orm(c).select({ ...emailListColumns }).from(email)
 			.innerJoin(
 				account,
 				eq(account.accountId, email.accountId)
@@ -929,14 +949,27 @@ const emailService = {
 		let { emailId, size, name, subject, accountEmail, userEmail, type, timeSort, full } = params;
 
 		size = Number(size);
-
 		emailId = Number(emailId) || 0;
 		timeSort = Number(timeSort);
-		full = Number(full) === 1;
+		full = Number(full);
+
+		if (type === undefined) {
+			type = 'receive';
+		}
+
+		if (isNaN(size)) {
+			size = 10;
+		}
 
 		if (size > 50) {
 			size = 50;
 		}
+
+		if (isNaN(full)) {
+			full = 1;
+		}
+
+		full = full === 1;
 
 		const filters = this.allEmailListFilters({ emailId, name, subject, accountEmail, userEmail, type, timeSort });
 		const countFilters = this.allEmailListFilters({ emailId, name, subject, accountEmail, userEmail, type, timeSort, withCursor: false });
@@ -998,7 +1031,7 @@ const emailService = {
 
 		const { emailId } = params;
 
-		let list = await orm(c).select({ ...emailBriefColumns, userEmail: user.email }).from(email)
+		let list = await orm(c).select({ ...emailListColumns, userEmail: user.email }).from(email)
 			.leftJoin(user, eq(email.userId, user.userId))
 			.where(
 				and(
@@ -1064,8 +1097,70 @@ const emailService = {
 	},
 
 	async completeReceiveAll(c) {
-		await c.env.db.prepare(`UPDATE email as e SET status = ${emailConst.status.RECEIVE} WHERE status = ${emailConst.status.SAVING} AND EXISTS (SELECT 1 FROM account WHERE account_id = e.account_id)`).run();
-		await c.env.db.prepare(`UPDATE email as e SET status = ${emailConst.status.NOONE} WHERE status = ${emailConst.status.SAVING} AND NOT EXISTS (SELECT 1 FROM account WHERE account_id = e.account_id)`).run();
+		// 用 EXISTS 走 status=6 部分索引 + account 主键；避免 IN (SELECT account_id FROM account) 触发全盘扫描
+		await c.env.db.prepare(
+			`UPDATE email
+			 SET status = ${emailConst.status.RECEIVE}
+			 WHERE status = ${emailConst.status.SAVING}
+			   AND EXISTS (SELECT 1 FROM account WHERE account.account_id = email.account_id)`
+		).run();
+		await c.env.db.prepare(
+			`UPDATE email
+			 SET status = ${emailConst.status.NOONE}
+			 WHERE status = ${emailConst.status.SAVING}`
+		).run();
+	},
+
+	async autoClean(c) {
+		const { autoCleanDays, autoCleanExclude } = await settingService.query(c);
+		const days = Number(autoCleanDays);
+
+		if (!days || days <= 0) {
+			return;
+		}
+
+		const cutoff = dayjs().subtract(days, 'day').format('YYYY-MM-DD HH:mm:ss');
+		const excludeEmails = String(autoCleanExclude || '')
+			.split(/[,，]/)
+			.map(item => item.trim())
+			.filter(Boolean);
+
+		let excludeUserIds = [];
+		if (excludeEmails.length) {
+			const rows = await orm(c)
+				.select({ userId: user.userId })
+				.from(user)
+				.where(sql`lower(${user.email}) IN (${sql.join(excludeEmails.map(email => sql`${email.toLowerCase()}`), sql`, `)})`)
+				.all();
+			excludeUserIds = rows.map(row => row.userId);
+		}
+
+		const batchSize = 95;
+
+		while (true) {
+			const conditions = [lt(email.createTime, cutoff)];
+			if (excludeUserIds.length) {
+				conditions.push(notInArray(email.userId, excludeUserIds));
+			}
+
+			const rows = await orm(c)
+				.select({ emailId: email.emailId })
+				.from(email)
+				.where(and(...conditions))
+				.limit(batchSize)
+				.all();
+
+			if (!rows.length) {
+				break;
+			}
+
+			const emailIds = rows.map(row => row.emailId);
+			await this.physicsDelete(c, { emailIds: emailIds.join(',') });
+
+			if (rows.length < batchSize) {
+				break;
+			}
+		}
 	},
 
 	async batchDelete(c, params) {

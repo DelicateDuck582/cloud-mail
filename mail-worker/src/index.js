@@ -5,7 +5,7 @@ import verifyRecordService from './service/verify-record-service';
 import emailService from './service/email-service';
 import kvObjService from './service/kv-obj-service';
 import r2Service from './service/r2-service';
-import oauthService from "./service/oauth-service";
+import oauthService from './service/oauth-service';
 import analysisService from './service/analysis-service';
 import attService from './service/att-service';
 import signUtils from './utils/sign-utils';
@@ -78,6 +78,7 @@ export default {
 		await verifyRecordService.clearRecord({ env })
 		await userService.resetDaySendCount({ env })
 		await emailService.completeReceiveAll({ env })
+		await emailService.autoClean({ env })
 		await oauthService.clearNoBindOathUser({ env })
 		await attService.clearTrash({ env })
 		await analysisService.refreshEchartsCache({ env })

@@ -113,6 +113,10 @@ export const settingConst = {
 		OPEN: 0,
 		CLOSE: 1,
 	},
+	webhookStatus: {
+		OPEN: 0,
+		CLOSE: 1,
+	},
 	ruleType: {
 		ALL: 0,
 		RULE: 1
