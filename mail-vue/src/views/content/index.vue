@@ -34,9 +34,33 @@
             <el-alert v-if="email.status === 4" :closable="false" :title="$t('complained')" class="email-msg" type="warning" show-icon />
             <el-alert v-if="email.status === 5" :closable="false" :title="$t('delayed')" class="email-msg" type="warning" show-icon />
           </div>
+          <div v-if="pgpBarVisible" class="pgp-bar">
+            <Icon class="pgp-bar-ic" icon="mdi:shield-lock-outline" width="17" height="17"/>
+            <div class="pgp-bar-txt">
+              <b>{{ t('pgpMailTag') }}</b>
+              <span>{{ pgpBarText }}</span>
+            </div>
+            <div class="pgp-bar-ops">
+              <el-button v-if="!pgpView" type="primary" plain size="small" :loading="attArmorLoading" @click="pgpOpen">
+                {{ t('pgpDecryptBtn') }}
+              </el-button>
+              <el-button v-if="pgpView && pgpArmorInline" size="small" @click="pgpView = false">{{ t('pgpBackRaw') }}</el-button>
+            </div>
+          </div>
           <el-scrollbar class="htm-scrollbar" :class="!email.attList?.length ? 'bottom-distance' : ''">
-            <ShadowHtml class="shadow-html" :html="formatImage(email.content)" v-if="email.content" />
-            <pre v-else class="email-text" >{{email.text}}</pre>
+            <template v-if="pgpView && pgpActiveArmor">
+              <pgp-read
+                  :key="`${email.emailId || 0}-${pgpView}`"
+                  :armored="pgpActiveArmor.armored"
+                  :kind="pgpActiveArmor.kind"
+                  :sender-address="email.sendEmail"
+                  :keyring-id="keyringId"
+              />
+            </template>
+            <template v-else>
+              <ShadowHtml class="shadow-html" :html="formatImage(email.content)" v-if="email.content" />
+              <pre v-else class="email-text" >{{email.text}}</pre>
+            </template>
           </el-scrollbar>
           <div class="att" v-if="email.attList?.length > 0">
             <div class="att-title">
@@ -90,13 +114,17 @@ import {getIconByName} from "@/utils/icon-utils.js";
 import {useSettingStore} from "@/store/setting.js";
 import {allEmailDelete} from "@/request/all-email.js";
 import {useUiStore} from "@/store/ui.js";
+import {useUserStore} from "@/store/user.js";
 import {useI18n} from "vue-i18n";
 import {EmailUnreadEnum} from "@/enums/email-enum.js";
+import PgpRead from '@/components/pgp-read/index.vue'
+import {extractArmor, isPgpAttachment} from '@/utils/pgp-utils.js'
 
 const uiStore = useUiStore();
 const settingStore = useSettingStore();
 const accountStore = useAccountStore();
 const emailStore = useEmailStore();
+const userStore = useUserStore();
 const router = useRouter()
 const email = computed(() => emailStore.contentData.email || {
   emailId: 0,
@@ -107,6 +135,84 @@ const email = computed(() => emailStore.contentData.email || {
 })
 const showPreview = ref(false)
 const srcList = reactive([])
+
+// ---------- PGP（Mailvelope 外接扩展）支持 ----------
+const pgpArmorInline = computed(() => {
+  const e = email.value
+  if (!e || !e.emailId) return null
+  return extractArmor(e.content) || extractArmor(e.text)
+})
+const pgpAttArmor = ref(null)        // 单个 .asc 附件内提取的 armor
+const pgpAtt = computed(() => {
+  const list = email.value.attList || []
+  // 只对唯一 PGP 载体附件自动提供解密入口，避免误判普通 .asc 文本
+  const pgpOnes = list.filter(isPgpAttachment)
+  return pgpOnes.length === 1 ? pgpOnes[0] : null
+})
+const pgpView = ref(false)           // 是否已切到 Mailvelope 解密视图
+const attArmorLoading = ref(false)
+const keyringId = computed(() => {
+  const acc = accountStore.currentAccount || {}
+  return (acc.email || userStore.user?.email || '').trim()
+})
+const pgpActiveArmor = computed(() => pgpAttArmor.value || pgpArmorInline.value)
+const pgpBarVisible = computed(() => {
+  const e = email.value
+  return !!e && !!e.emailId && (pgpArmorInline.value || pgpAtt.value || pgpView.value)
+})
+const pgpKindLabel = computed(() => {
+  const src = pgpAttArmor.value || pgpArmorInline.value
+  if (!src) return ''
+  if (src.kind === 'message') return t('pgpEncryptedMail')
+  if (src.kind === 'signed-message') return t('pgpSignedMail')
+  if (src.kind === 'pubkey') return t('pgpPubKeyFound')
+  return t('pgpDetected')
+})
+const pgpBarText = computed(() => {
+  const e = email.value
+  if (pgpView.value && pgpActiveArmor.value) return pgpKindLabel.value
+  if (pgpArmorInline.value) return pgpKindLabel.value
+  if (pgpAtt.value) {
+    return `${t('pgpAttMail')}：${pgpAtt.value.filename}`
+  }
+  return ''
+})
+
+// 切换邮件时重置 PGP 状态
+watch(() => [email.value.emailId, email.value.content, email.value.text], () => {
+  pgpView.value = false
+  pgpAttArmor.value = null
+})
+
+async function pgpOpen() {
+  if (pgpArmorInline.value || pgpAttArmor.value) {
+    pgpView.value = true
+    return
+  }
+  const att = pgpAtt.value
+  if (!att) return
+  // 从附件读取 armor（PGP/MIME 邮件常以 .asc 携带密文）
+  const url = att.url || cvtR2Url(att.key)
+  if (!url) return
+  attArmorLoading.value = true
+  try {
+    const resp = await fetch(url)
+    if (!resp.ok) throw new Error('HTTP ' + resp.status)
+    const text = await resp.text()
+    const armor = extractArmor(text)
+    if (!armor || armor.kind !== 'message') {
+      ElMessage({message: t('pgpErrParse'), type: 'warning', plain: true})
+      return
+    }
+    pgpAttArmor.value = armor
+    pgpView.value = true
+  } catch (e) {
+    console.error('pgp attachment fetch error', e)
+    ElMessage({message: t('pgpErrGeneric'), type: 'error', plain: true})
+  } finally {
+    attArmorLoading.value = false
+  }
+}
 
 const { t } = useI18n()
 watch(() => accountStore.currentAccountId, () => {
@@ -439,6 +545,38 @@ const handleDelete = () => {
 
 .bottom-distance {
   margin-bottom: 30px;
+}
+
+.pgp-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  padding: 8px 12px;
+  margin-bottom: 12px;
+  border: 1px solid var(--el-color-primary-light-7);
+  border-radius: 6px;
+  background: var(--el-color-primary-light-9);
+
+  .pgp-bar-ic {
+    color: var(--el-color-primary);
+    flex-shrink: 0;
+  }
+
+  .pgp-bar-txt {
+    flex: 1;
+    min-width: 200px;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    font-size: 13px;
+    color: var(--regular-text-color);
+
+    b {
+      font-size: 14px;
+      color: var(--el-color-primary);
+    }
+  }
 }
 
 

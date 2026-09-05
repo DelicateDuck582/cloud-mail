@@ -43,13 +43,40 @@
             </div>
           </template>
         </el-input-tag>
-        <el-input v-model="form.subject" :placeholder="t('subject')" />
-        <tinyEditor :def-value="defValue" ref="editor" @change="change" @focus="focusChange" />
+        <el-input v-model="form.subject" :placeholder="t('subject')">
+          <template #suffix>
+            <span class="pgp-lock" :class="{'pgp-on': pgpOn}" :title="pgpOn ? t('pgpExit') : t('pgpEnter')" @click.stop="togglePgp">
+              <Icon :icon="pgpOn ? 'material-symbols:enhanced-encryption' : 'mdi:shield-lock-outline'" width="18" height="18"/>
+            </span>
+          </template>
+        </el-input>
+        <div class="editor-area">
+          <div v-if="pgpReplyHintVisible" class="pgp-reply-hint">
+            <Icon icon="mdi:shield-key-outline" width="15" height="15"/>
+            <span>{{ t('pgpReplyHint') }}</span>
+          </div>
+          <div v-if="pgpOn" class="pgp-toolbar">
+            <span class="pgp-toolbar-hint">
+              <Icon icon="material-symbols:enhanced-encryption-rounded" width="16" height="16"/>
+              <span>{{ t('pgpEditingMode') }}</span>
+            </span>
+            <span v-if="form.attachments.length" class="pgp-toolbar-warn">
+              <Icon icon="mdi:attachment-off" width="15" height="15"/>
+              <span>{{ t('pgpNoAttachment') }}</span>
+            </span>
+            <span class="pgp-toolbar-link" @click="openPgpKeys">{{ t('pgpKeyManager') }}</span>
+            <span class="pgp-toolbar-link exit" @click="togglePgp">{{ t('pgpExit') }}</span>
+          </div>
+          <div class="editor-flex">
+            <tinyEditor v-show="!pgpOn" :def-value="defValue" ref="editor" @change="change" @focus="focusChange" />
+            <div v-show="pgpOn" ref="pgpBox" class="pgp-box"></div>
+          </div>
+        </div>
         <div class="button-item">
-          <div class="att-add" @click="chooseFile">
+          <div v-if="!pgpOn" class="att-add" @click="chooseFile">
             <Icon icon="iconamoon:attachment-fill" width="24" height="24"/>
           </div>
-          <div class="att-clear" @click="clearContent">
+          <div v-if="!pgpOn" class="att-clear" @click="clearContent">
             <Icon icon="icon-park-outline:clear-format" width="24" height="24 "/>
           </div>
           <div class="att-list">
@@ -115,6 +142,16 @@ import dayjs from "dayjs";
 import {useI18n} from "vue-i18n";
 import router from "@/router/index.js";
 import {ElMessageBox} from "element-plus";
+import {
+  MAILVELOPE_STORES,
+  waitMailvelope,
+  getOrCreateKeyring,
+  armorToHtml,
+  htmlToPlain,
+  extractArmor,
+  pgpErrorHint,
+  openMailvelopeAuthorize,
+} from "@/utils/pgp-utils.js";
 
 defineExpose({
   open,
@@ -161,6 +198,19 @@ const form = reactive({
   attachments: [],
   draftId: null,
 })
+
+// ---------- Mailvelope PGP 加密写信 ----------
+const pgpOn = ref(false)          // 是否处于 PGP 加密编辑模式
+const pgpBusy = ref(false)        // 进入/退出切换中
+const pgpReady = ref(false)       // Mailvelope 编辑器容器已挂载
+const pgpKeyring = ref(null)
+const pgpEditor = ref(null)       // createEditorContainer 返回的编辑器句柄
+const pgpSign = ref(true)         // 默认加密并签名
+const pgpReplyArmor = ref('')     // 回复 PGP 加密原邮件时：原密文（做引用）
+const pgpReplyHeader = ref('')    // 引用头
+const pgpBox = ref(null)
+
+const pgpReplyHintVisible = computed(() => !!pgpReplyArmor.value && !pgpOn.value)
 
 const selectRecipientList = ref([])
 
@@ -269,6 +319,10 @@ function delAtt(index) {
 }
 
 function chooseFile() {
+  if (pgpOn.value) {
+    ElMessage({message: t('pgpNoAttachment'), type: 'warning', plain: true})
+    return
+  }
   const doc = document.createElement("input")
   doc.setAttribute("type", "file")
   doc.multiple = true;
@@ -302,6 +356,10 @@ function chooseFile() {
 }
 
 async function sendEmail() {
+  if (pgpOn.value) {
+    pgpEncryptSend()
+    return
+  }
 
   // 兜底检查：防止草稿恢复等绕过选择时的校验（单个附件超 28MB 直接拦截）
   const overSizedAtt = form.attachments.find(att => att.size > MAX_ATT_SIZE)
@@ -363,6 +421,10 @@ async function sendEmail() {
     return
   }
 
+  fireEmailSend()
+}
+
+async function fireEmailSend() {
   percentMessage = ElMessage({
     message: () => h(sendPercent, {value: percent.value, desc: t('sending')}),
     dangerouslyUseHTMLString: true,
@@ -423,6 +485,187 @@ async function sendEmail() {
   })
 }
 
+// ---- Mailvelope PGP 支持 ----
+
+function showPgpInstallDialog() {
+  ElMessageBox({
+    title: t('pgpUnavailableTitle'),
+    message: h('div', {class: 'pgp-install-dialog'}, [
+      h('p', {class: 'pgp-install-desc'}, t('pgpUnavailableDesc')),
+      h('div', {class: 'pgp-install-links'}, [
+        h('a', {href: MAILVELOPE_STORES.chrome.url, target: '_blank', rel: 'noopener'}, t('pgpInstallChrome')),
+        h('span', {class: 'pgp-install-sep'}, ' · '),
+        h('a', {href: MAILVELOPE_STORES.firefox.url, target: '_blank', rel: 'noopener'}, t('pgpInstallFirefox')),
+      ]),
+      h('div', {class: 'pgp-install-auth', onClick: () => openMailvelopeAuthorize()}, t('pgpAuthorizeBtn')),
+    ]),
+    showCancelButton: false,
+    confirmButtonText: t('pgpGotIt'),
+  })
+}
+
+function pgpReport(e) {
+  const code = e && (e.code || e.name)
+  const base = code ? t(pgpErrorHint(code)) : t('pgpErrGeneric')
+  const detail = e && e.message ? String(e.message).slice(0, 200) : ''
+  ElMessage({
+    message: detail ? `${base}：${detail}` : base,
+    type: 'error',
+    plain: true,
+  })
+  if (code === 'NO_KEY_FOR_ADDRESS' || code === 'NO_KEY_FOUND') {
+    openPgpKeys().catch(() => {})
+  }
+}
+
+async function togglePgp() {
+  if (pgpOn.value) {
+    pgpExit()
+    return
+  }
+  await pgpEnter()
+}
+
+async function pgpEnter() {
+  if (pgpBusy.value || pgpOn.value) return
+  if (!form.sendEmail) {
+    ElMessage({message: t('pgpErrAccount'), type: 'warning', plain: true})
+    return
+  }
+  pgpBusy.value = true
+  try {
+    const mvel = await waitMailvelope(1200)
+    if (!mvel) {
+      showPgpInstallDialog()
+      return
+    }
+    const keyring = await getOrCreateKeyring(mvel, form.sendEmail)
+    pgpKeyring.value = keyring
+
+    const opts = {quota: 20 * 1024, signMsg: pgpSign.value}
+    // 把 TinyMCE 里已输入的内容带进 Mailvelope 编辑器（明文，HTML 转纯文本）
+    let plain = ''
+    try {
+      if (editor.value && typeof editor.value.getContent === 'function') {
+        plain = htmlToPlain(editor.value.getContent())
+      }
+    } catch (e) {
+      plain = ''
+    }
+    if (!plain && form.text && !/^-{5}BEGIN PGP/.test(form.text)) plain = form.text
+    if (!plain && defValue.value) plain = htmlToPlain(defValue.value)
+    if (plain) opts.predefinedText = plain
+    if (pgpReplyArmor.value) {
+      opts.quotedMail = pgpReplyArmor.value
+      if (pgpReplyHeader.value) opts.quotedMailHeader = pgpReplyHeader.value
+    }
+
+    pgpOn.value = true
+    await nextTick()
+    if (pgpBox.value) pgpBox.value.innerHTML = ''
+    const editorObj = await mvel.createEditorContainer(pgpBox.value, keyring, opts)
+    pgpEditor.value = editorObj
+    pgpReady.value = true
+    pgpReplyArmor.value = ''
+    pgpReplyHeader.value = ''
+  } catch (e) {
+    pgpOn.value = false
+    pgpReport(e)
+  } finally {
+    pgpBusy.value = false
+  }
+}
+
+function pgpExit() {
+  if (!pgpOn.value) return
+  ElMessageBox.confirm(t('pgpExitConfirm'), {
+    confirmButtonText: t('confirm'),
+    cancelButtonText: t('cancel'),
+    type: 'warning',
+  }).then(() => {
+    teardownPgp()
+  }).catch(() => {
+  })
+}
+
+function teardownPgp() {
+  pgpOn.value = false
+  pgpBusy.value = false
+  pgpReady.value = false
+  pgpEditor.value = null
+  pgpReplyArmor.value = ''
+  pgpReplyHeader.value = ''
+  if (pgpBox.value) pgpBox.value.innerHTML = ''
+}
+
+async function openPgpKeys() {
+  const mvel = await waitMailvelope(1200)
+  if (!mvel) {
+    showPgpInstallDialog()
+    return
+  }
+  try {
+    const id = form.sendEmail || userStore.user.email || ''
+    const keyring = await getOrCreateKeyring(mvel, id)
+    await keyring.openSettings()
+  } catch (e) {
+    pgpReport(e)
+  }
+}
+
+async function pgpEncryptSend() {
+  if (pgpBusy.value || sending) {
+    ElMessage({message: t('sendingErrorMsg'), type: 'error', plain: true})
+    return
+  }
+  if (form.receiveEmail.length === 0) {
+    ElMessage({message: t('emptyRecipientMsg'), type: 'error', plain: true})
+    return
+  }
+  if (!form.subject) {
+    ElMessage({message: t('emptySubjectMsg'), type: 'error', plain: true})
+    return
+  }
+  if (form.attachments.length > 0) {
+    ElMessage({message: t('pgpNoAttachment'), type: 'warning', plain: true})
+    return
+  }
+  if (!pgpReady.value || !pgpEditor.value) {
+    ElMessage({message: t('pgpLoading'), type: 'warning', plain: true})
+    return
+  }
+
+  pgpBusy.value = true
+  percentMessage = ElMessage({
+    message: () => h(sendPercent, {value: percent.value, desc: t('pgpEncrypting')}),
+    dangerouslyUseHTMLString: true,
+    plain: true,
+    duration: 0,
+    customClass: 'message-bottom'
+  })
+
+  try {
+    const recipients = form.receiveEmail.filter(item => isEmail(item))
+    if (recipients.length === 0) {
+      ElMessage({message: t('emptyRecipientMsg'), type: 'error', plain: true})
+      return
+    }
+    const armored = await pgpEditor.value.encrypt(recipients)
+    // 密文以内嵌 armor 文本块发送（content 与 text 双份，兼容无扩展收件方）
+    form.content = armorToHtml(armored, escapeHtml)
+    form.text = armored
+  } catch (e) {
+    pgpReport(e)
+    return
+  } finally {
+    pgpBusy.value = false
+    percentMessage.close()
+    percent.value = 0
+  }
+
+  await fireEmailSend()
+}
+
 function addRecipientRecord() {
   writerStore.sendRecipientRecord = writerStore.sendRecipientRecord.filter(
       email => !form.receiveEmail.includes(email)
@@ -446,6 +689,7 @@ function resetForm() {
   backReply.receiveEmail = []
   backReply.sendType = ''
   editor.value.clearEditor()
+  teardownPgp()
 }
 
 function change(content, text) {
@@ -499,6 +743,19 @@ function openReply(email) {
   form.emailId = email.emailId
 
   defValue.value = ''
+
+  // 原邮件是 PGP 加密邮件：切到 Mailvelope 加密回复，由扩展在本机解密原密文并作引用
+  const origArmor = extractArmor(email.content) || extractArmor(email.text)
+  if (origArmor && (origArmor.kind === 'message' || origArmor.kind === 'signed-message')) {
+    pgpReplyArmor.value = origArmor.armored
+    pgpReplyHeader.value = `${formatDetailDate(email.createTime)} ${email.name} &lt;${email.sendEmail}&gt; ${t('wrote')}:`
+    open()
+    waitMailvelope(800).then(m => {
+      if (m && !pgpOn.value) pgpEnter()
+    }).catch(() => {
+    })
+    return
+  }
 
   setTimeout(() => {
     defValue.value = `
@@ -588,6 +845,23 @@ onUnmounted(() => {
 });
 
 function close() {
+  // PGP 编辑模式先退出（Mailvelope 编辑器内容无法在退出后保留）
+  if (pgpOn.value) {
+    ElMessageBox.confirm(t('pgpExitConfirm'), {
+      confirmButtonText: t('confirm'),
+      cancelButtonText: t('cancel'),
+      type: 'warning',
+    }).then(() => {
+      teardownPgp()
+      closeInner()
+    }).catch(() => {
+    })
+    return
+  }
+  closeInner()
+}
+
+function closeInner() {
 
   if (selectStatus) openSelect();
 
@@ -659,6 +933,53 @@ function close() {
 
 .write-select .el-select-dropdown {
   min-width: 0 !important;
+}
+
+.pgp-install-dialog {
+  text-align: center;
+  padding: 4px 2px;
+
+  .pgp-install-desc {
+    font-size: 13px;
+    line-height: 1.8;
+    color: var(--el-text-color-regular);
+    margin: 0 0 14px;
+  }
+
+  .pgp-install-links {
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    gap: 12px;
+
+    a {
+      color: var(--el-color-primary);
+      font-weight: 600;
+      text-decoration: none;
+
+      &:hover {
+        text-decoration: underline;
+      }
+    }
+
+    .pgp-install-sep {
+      color: var(--el-text-color-placeholder);
+    }
+  }
+
+  .pgp-install-auth {
+    margin-top: 16px;
+    padding: 9px 10px;
+    border: 1px dashed var(--el-color-primary-light-5);
+    border-radius: 8px;
+    color: var(--el-color-primary);
+    font-size: 13px;
+    cursor: pointer;
+
+    &:hover {
+      background: var(--el-color-primary-light-9);
+    }
+  }
 }
 </style>
 <style scoped lang="scss">
@@ -829,5 +1150,107 @@ function close() {
 
 .icon {
   cursor: pointer;
+}
+
+.pgp-lock {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  border-radius: 5px;
+  cursor: pointer;
+  color: var(--regular-text-color);
+  transition: color .15s, background .15s;
+
+  &:hover {
+    background: var(--el-fill-color-light);
+  }
+
+  &.pgp-on {
+    color: var(--el-color-primary);
+    background: var(--el-color-primary-light-9);
+  }
+}
+
+.editor-area {
+  height: 100%;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+
+  .pgp-reply-hint {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 12px;
+    color: var(--el-color-warning);
+    background: var(--el-color-warning-light-9);
+    border: 1px dashed var(--el-color-warning-light-5);
+    border-radius: 6px;
+    padding: 5px 10px;
+  }
+
+  .pgp-toolbar {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    flex-wrap: wrap;
+    padding: 4px 10px;
+    border: 1px solid var(--el-color-primary-light-7);
+    border-radius: 6px;
+    background: var(--el-color-primary-light-9);
+    font-size: 13px;
+    color: var(--el-color-primary);
+
+    .pgp-toolbar-hint {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      font-weight: 600;
+    }
+
+    .pgp-toolbar-warn {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      color: var(--el-color-warning);
+      font-size: 12px;
+    }
+
+    .pgp-toolbar-link {
+      cursor: pointer;
+      color: var(--el-color-primary);
+      margin-left: auto;
+
+      &.exit {
+        color: var(--el-color-danger);
+      }
+
+      &:hover {
+        text-decoration: underline;
+      }
+    }
+  }
+
+  .editor-flex {
+    flex: 1;
+    min-height: 0;
+    position: relative;
+  }
+
+  :deep(.editor-box) {
+    height: 100%;
+  }
+
+  .pgp-box {
+    width: 100%;
+    height: 100%;
+    overflow: hidden;
+    background: var(--el-bg-color);
+    border: 1px solid var(--el-border-color-light);
+    border-radius: 4px;
+  }
 }
 </style>
