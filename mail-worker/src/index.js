@@ -40,7 +40,7 @@ export default {
 				}
 
 				const expected = await signUtils.hmacHex(secret, `/${key}:${expires}`);
-				if (expected !== sign) {
+				if (!signUtils.timingSafeEqual(expected, sign)) {
 					return new Response(JSON.stringify({ code: 403, message: 'unauthorized' }), { status: 403 });
 				}
 			}

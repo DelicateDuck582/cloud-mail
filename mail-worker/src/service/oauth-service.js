@@ -55,7 +55,7 @@ const oauthService = {
 
 		userRow = await userService.selectByEmail(c, email);
 
-		orm(c).update(oauth).set({ userId: userRow.userId }).where(eq(oauth.oauthUserId, oauthUserId)).run();
+		await orm(c).update(oauth).set({ userId: userRow.userId }).where(eq(oauth.oauthUserId, oauthUserId)).run();
 
 		// 一次性令牌：绑定成功即作废
 		await c.env.kv.delete(kvConst.OAUTH_BIND + oauthUserId);

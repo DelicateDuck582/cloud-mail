@@ -130,6 +130,18 @@ const signUtils = {
 			const sp = signMap.get(att.key);
 			att.url = `${base}/${att.key}?expires=${sp.expires}&sign=${sp.sign}`;
 		}
+	},
+
+	// 恒定时间比较，防时序侧信道（与 cos-exchange / oauth-service 保持一致）
+	timingSafeEqual(a, b) {
+		if (typeof a !== 'string' || typeof b !== 'string' || a.length !== b.length) {
+			return false;
+		}
+		let diff = 0;
+		for (let i = 0; i < a.length; i++) {
+			diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+		}
+		return diff === 0;
 	}
 };
 

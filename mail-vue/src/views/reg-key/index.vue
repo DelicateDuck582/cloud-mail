@@ -282,11 +282,14 @@ function genCode() {
 
 function generateRandomCode(length = 8) {
   const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+  // 密码学安全随机（替代 Math.random，防止邀请码可预测/碰撞）
+  const arr = new Uint8Array(length);
+  crypto.getRandomValues(arr);
   let result = '';
   for (let i = 0; i < length; i++) {
-    result += chars.charAt(Math.floor(Math.random() * chars.length));
+    result += chars.charAt(arr[i] % chars.length);
   }
-  return result;
+  return result
 }
 
 function clearNotUse() {
