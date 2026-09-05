@@ -1,3 +1,8 @@
+> ⚠️ **项目搁置（ARCHIVED）**
+>
+> 暂无时间继续维护，且当时没有可行的"无服务器"落地方案；
+> 即便日后拥有服务器，也不会再采用这套方案。本目录仅作代码存档，不再更新。
+
 # CloudMail → Stalwart 同步（替换最小 IMAP 桥）
 
 把 CloudMail 收件箱镜像到 **Stalwart Mail Server**（标准 IMAP/POP/JMAP 服务器），

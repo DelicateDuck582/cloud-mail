@@ -1,3 +1,8 @@
+> ⚠️ **项目搁置（ARCHIVED）**
+>
+> 暂无时间继续维护，且当时没有可行的"无服务器"落地方案；
+> 即便日后拥有服务器，也不会再采用这套方案。本目录仅作代码存档，不再更新。
+
 # CloudMail Reader（Thunderbird 插件 · 只读）
 
 在 Thunderbird 中手动刷新查看 CloudMail（`mail.duckgame-play.top`）的收件箱。**只读**（当前版本仅拉取邮件），无实时推送，无发信。
