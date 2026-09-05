@@ -169,15 +169,36 @@ export default {
       delete headersForFetch['Host'];
 
       // 发起带私有凭证的回源请求
-      const response = await fetch(targetUrl.toString(), {
+      // 超时 10s + 429/5xx 重试一次（600ms 退避），与 /browse 下载路径行为一致，
+      // 抵抗 COS 偶发限流/抖动（附件路径此前无重试，COS 抖动会直接 5xx）
+      const fetchOrigin = async () => fetch(targetUrl.toString(), {
         method: request.method,
         headers: headersForFetch,
+        signal: AbortSignal.timeout(10000),
       });
+      let response;
+      try {
+        response = await fetchOrigin();
+        if (response.status === 429 || response.status >= 500) {
+          await new Promise(r => setTimeout(r, 600));
+          response = await fetchOrigin();
+        }
+      } catch (err) {
+        // 首次请求超时（AbortError）也重试一次
+        try {
+          await new Promise(r => setTimeout(r, 600));
+          response = await fetchOrigin();
+        } catch (err2) {
+          throw err2;
+        }
+      }
 
       // 设置跨域 Header（只放行邮件域）并去除敏感头
       const newHeaders = new Headers(response.headers);
       newHeaders.set('Access-Control-Allow-Origin', 'https://mail.duckgame-play.top');
       newHeaders.delete('x-cos-request-id');
+      newHeaders.delete('x-cos-hash-crc64ecma');
+      newHeaders.set('X-Content-Type-Options', 'nosniff');
 
       // =====================================================
       // 7. 回源成功后写入 Cache API（按 path；内容哈希不变则无需重复回源）
@@ -198,11 +219,23 @@ export default {
         return cacheResp;
       }
 
-      // 非 200（如回源 404）：不缓存
-      return new Response(response.body, {
-        status: response.status,
-        statusText: response.statusText,
-        headers: newHeaders,
+      // 非 200：不缓存
+      // - 206/3xx：透传（206 供未来 Range/内嵌媒体场景；3xx 如 COS 临时重定向）
+      // - 4xx/5xx：不向客户端透传 COS 原始 XML（其含真实桶名/错误细节），统一脱敏
+      const upstream = response.status;
+      if (upstream === 206 || (upstream >= 300 && upstream < 400)) {
+        return new Response(response.body, {
+          status: upstream,
+          statusText: response.statusText,
+          headers: newHeaders,
+        });
+      }
+      if (upstream === 429) {
+        return new Response('Too Many Requests', { status: 429, headers: { 'Retry-After': '60', 'X-Content-Type-Options': 'nosniff' } });
+      }
+      return new Response(upstream >= 500 ? 'Upstream Error' : 'Not Found', {
+        status: upstream >= 500 ? 502 : 404,
+        headers: { 'Content-Type': 'text/plain; charset=utf-8', 'X-Content-Type-Options': 'nosniff' },
       });
     } catch (err) {
       console.error('cos-exchange proxy error:', err);
