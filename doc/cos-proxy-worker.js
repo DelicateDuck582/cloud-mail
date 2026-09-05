@@ -517,8 +517,12 @@ async function handleBrowse(request, env, ctx) {
       if (!Number.isFinite(perPage) || perPage < 1) perPage = 100;
       if (perPage > 200) perPage = 200;
       const data = await browseList(env, prefix, token, perPage);
+      // 魔数嗅探：对"扩展名无法识别"的文件读 COS 头部(0-15B)识别真实类型，
+      // 解决无扩展名/伪扩展名内嵌图（如 063A2F5D_247B9635.D22C7B6A00000000 实为 JPEG）
+      // 在查看器里无法显示的问题。只嗅探 oth 项，且带结果缓存避免重复请求 COS。
+      await sniffUnknownTypes(env, data.files);
       return new Response(JSON.stringify(data), {
-        headers: { 'Content-Type': 'application/json; charset=utf-8', 'X-Content-Type-Options': 'nosniff' },
+        headers: { 'Content-Type': 'application/json; charset=utf-8', 'X-Content-Type-Options': 'nosniff', 'Cache-Control': 'no-store' },
       });
     } catch (e) {
       // 只把 error 字段回给前端：browseList 的 throw 里带 ourSTS/cosSTS/sentUrl 等排错字段，
@@ -831,6 +835,125 @@ function parseListXml(xml) {
   const truncated = /<IsTruncated>true<\/IsTruncated>/.test(xml);
   const tm = xml.match(/<NextContinuationToken>([^<]*)<\/NextContinuationToken>/);
   return { folders, files, truncated, token: tm ? tm[1] : '' };
+}
+
+// =====================================================================
+// 魔数嗅探：识别无扩展名/伪扩展名的图片等（读 COS 对象头 0-15 字节）
+// 例：邮件内嵌图 key 形如 063A2F5D_247B9635.D22C7B6A00000000（无 .jpg 后缀）
+//     —— mail web 靠 DB mimeType 可看，本查看器此前靠扩展名判定看不了。
+// 仅对"扩展名无法归类"(type 会判为 oth)的文件嗅探；命中缓存避免重复请求。
+// =====================================================================
+const sniffCache = new Map();           // key -> { t: expireTs, type: 'img'|'vid'|'aud'|null }
+const SNIFF_CACHE_TTL = 7 * 24 * 3600 * 1000; // 与文件缓存一致；COS key=内容哈希，类型恒定
+const SNIFF_CACHE_MAX = 5000;           // 内存保护：超限时清空最旧一半，防长期运行无限增长
+function sniffCacheSet(key, val) {
+  sniffCache.set(key, val);
+  if (sniffCache.size > SNIFF_CACHE_MAX) {
+    const cutoff = Math.floor(SNIFF_CACHE_MAX / 2);
+    let i = 0;
+    for (const k of sniffCache.keys()) {
+      if (i++ >= cutoff) break;
+      sniffCache.delete(k);
+    }
+  }
+}
+
+// 由扩展名得到的"可信类型"：命中则无需嗅探（返回 null 表示不用管）
+function extGuessType(name) {
+  const e = String(name || '').split('.').pop().toLowerCase();
+  const IMG = ['png','jpg','jpeg','gif','webp','bmp','svg','ico','heic','avif','jfif'];
+  const VID = ['mp4','mkv','mov','avi','webm','m4v','wmv','flv','ts','3gp','rmvb'];
+  const AUD = ['mp3','wav','flac','ogg','m4a','aac','opus','ape','amr'];
+  if (IMG.includes(e)) return 'img';
+  if (VID.includes(e)) return 'vid';
+  if (AUD.includes(e)) return 'aud';
+  return null; // 无法归类 -> 需要嗅探
+}
+
+// 前若干字节 -> 类型（魔数，与 mail-worker 魔数嗅探思路一致）
+function sniffTypeFromBytes(buf) {
+  if (!buf || buf.length < 12) return null;
+  const b = new Uint8Array(buf);
+  // JPEG: FF D8 FF
+  if (b[0] === 0xFF && b[1] === 0xD8 && b[2] === 0xFF) return 'img';
+  // PNG: 89 50 4E 47
+  if (b[0] === 0x89 && b[1] === 0x50 && b[2] === 0x4E && b[3] === 0x47) return 'img';
+  // GIF: 47 49 46 38
+  if (b[0] === 0x47 && b[1] === 0x49 && b[2] === 0x46 && b[3] === 0x38) return 'img';
+  // WEBP: RIFF....WEBP
+  if (b[0] === 0x52 && b[1] === 0x49 && b[2] === 0x46 && b[3] === 0x46 &&
+      b[8] === 0x57 && b[9] === 0x45 && b[10] === 0x42 && b[11] === 0x50) return 'img';
+  // BMP: 42 4D
+  if (b[0] === 0x42 && b[1] === 0x4D) return 'img';
+  // AVIF/HEIC: ....ftyp(avif|heic|heix|hevc|mif1)
+  if (b[4] === 0x66 && b[5] === 0x74 && b[6] === 0x79 && b[7] === 0x70) {
+    const brand = String.fromCharCode(b[8], b[9], b[10], b[11]).toLowerCase();
+    if (['avif','heic','heix','hevc','mif1','msf1'].includes(brand)) return 'img';
+  }
+  // MP4/M4V 视频: ....ftyp(....)
+  if (b[4] === 0x66 && b[5] === 0x74 && b[6] === 0x79 && b[7] === 0x70) {
+    const brand = String.fromCharCode(b[8], b[9], b[10], b[11]).toLowerCase();
+    if (['mp42','mp41','isom','iso2','avc1','m4v ','dash'].includes(brand)) return 'vid';
+  }
+  // MP3: ID3 或 FF FB / FF F3 / FF F2
+  if (b[0] === 0x49 && b[1] === 0x44 && b[2] === 0x33) return 'aud';
+  if (b[0] === 0xFF && (b[1] === 0xFB || b[1] === 0xF3 || b[1] === 0xF2)) return 'aud';
+  // FLAC: 66 4C 61 43
+  if (b[0] === 0x66 && b[1] === 0x4C && b[2] === 0x61 && b[3] === 0x43) return 'aud';
+  // OGG: 4F 67 67 53
+  if (b[0] === 0x4F && b[1] === 0x67 && b[2] === 0x67 && b[3] === 0x53) return 'aud';
+  return null;
+}
+
+// 对单个 COS 对象做 Range GET(0-15B) 读魔数
+async function sniffOne(env, key) {
+  const cached = sniffCache.get(key);
+  if (cached && cached.t > Date.now()) return cached.type;
+  if (cached && cached.type === null && cached.attempts > 3) return null; // 之前嗅探失败过，不再重复打 COS
+
+  const rawEndpoint = (env.S3_ENDPOINT || '').trim().replace(/\/+$/, '');
+  const region = (env.REGION || '').trim();
+  const ak = (env.AWS_ACCESS_KEY_ID || '').trim();
+  const sk = (env.AWS_SECRET_ACCESS_KEY || '').trim();
+  const encodedPath = '/' + key.split('/').map(enc).join('/');
+  const targetUrl = new URL(encodedPath, rawEndpoint);
+  try {
+    const signedHeaders = await getS3v4Headers({ method: 'GET', url: targetUrl, region, accessKeyId: ak, secretAccessKey: sk });
+    const headersForFetch = { ...signedHeaders };
+    delete headersForFetch['host'];
+    delete headersForFetch['Host'];
+    headersForFetch['Range'] = 'bytes=0-15';
+    const res = await fetch(targetUrl.toString(), { method: 'GET', headers: headersForFetch, signal: AbortSignal.timeout(5000) });
+    if (!res.ok || (res.status !== 200 && res.status !== 206)) {
+      sniffCacheSet(key, { t: Date.now() + 3600000, type: null, attempts: (cached?.attempts || 0) + 1 });
+      return null;
+    }
+    const ab = await res.arrayBuffer();
+    const type = sniffTypeFromBytes(ab);
+    sniffCacheSet(key, { t: Date.now() + SNIFF_CACHE_TTL, type, attempts: 0 });
+    return type;
+  } catch (e) {
+    sniffCacheSet(key, { t: Date.now() + 3600000, type: null, attempts: (cached?.attempts || 0) + 1 });
+    return null;
+  }
+}
+
+// 只嗅探无法靠扩展名归类的文件；受限并发（同时 ≤4）+ 单次上限，避免瞬时打满 COS/超时
+async function sniffUnknownTypes(env, files) {
+  if (!files || files.length === 0) return;
+  const unknown = files.filter(f => f && f.key && !extGuessType(f.key.split('/').pop()));
+  if (unknown.length === 0) return;
+  const MAX_SNIFF = 24;   // 单次 list 最多嗅探 24 个（列表页已 ≥分页，防止极端目录拖慢响应）
+  const pool = unknown.slice(0, MAX_SNIFF);
+  let idx = 0;
+  const worker = async () => {
+    while (idx < pool.length) {
+      const cur = idx++;
+      const type = await sniffOne(env, pool[cur].key);
+      if (type) pool[cur].type = type;
+    }
+  };
+  await Promise.all([worker(), worker(), worker(), worker()]);
 }
 
 // 下载：经本 Worker 回源 COS（S3 签名 GET），不直连 COS 默认域名
@@ -1494,7 +1617,7 @@ var fmtT=function(t){
   return d.getFullYear()+'-'+p(d.getMonth()+1)+'-'+p(d.getDate())+' '+p(d.getHours())+':'+p(d.getMinutes())+':'+p(d.getSeconds());
 };
 var urlOf=function(k){return '/browse/api/file?key='+encodeURIComponent(k);};
-var typeOf=function(n){var e=ext(n);if(IMG.indexOf(e)>=0){return 'img';}if(VID.indexOf(e)>=0){return 'vid';}if(AUD.indexOf(e)>=0){return 'aud';}if(DOC.indexOf(e)>=0){return 'doc';}if(ARC.indexOf(e)>=0){return 'arc';}return 'oth';};
+var typeOf=function(n,serverType){if(serverType){return serverType;}var e=ext(n);if(IMG.indexOf(e)>=0){return 'img';}if(VID.indexOf(e)>=0){return 'vid';}if(AUD.indexOf(e)>=0){return 'aud';}if(DOC.indexOf(e)>=0){return 'doc';}if(ARC.indexOf(e)>=0){return 'arc';}return 'oth';};
 var typeLabel={'img':'\\u56FE\\u7247','vid':'\\u89C6\\u9891','aud':'\\u97F3\\u9891','doc':'\\u6587\\u6863','arc':'\\u538B\\u7F29','oth':'\\u5176\\u4ED6'};
 var prefix='';
 // \\u5206\\u9875\\uFF08\\u6587\\u4EF6\\u5217\\u8868\\uFF09\\uFF1ACOS continuation-token \\u987A\\u5E8F\\u7FFB\\u9875\\uFF0CpageTokens[i] \\u7F13\\u5B58\\u8FDB\\u5165\\u7B2C i \\u9875\\u6240\\u9700\\u7684 token
@@ -1535,7 +1658,7 @@ function sortList(list){
 }
 function norm(f){
   var n=f.key.split('/').pop();
-  return {key:f.key,name:n,size:f.size||0,mtime:f.mtime||'',type:typeOf(n)};
+  return {key:f.key,name:n,size:f.size||0,mtime:f.mtime||'',type:typeOf(n,f.type)};
 }
 function findItem(key){
   for(var i=0;i<activeItems.length;i++){if(activeItems[i].key===key){return activeItems[i];}}
