@@ -21,6 +21,13 @@ export default {
       // 1. 根路径拦截：访问根域名时自动跳转到邮件登录页
       const REDIRECT_TARGET = 'https://mail.duckgame-play.top';
       if (url.pathname === '/' || url.pathname === '') {
+        // 防自杀式重定向：若本代码被误部署到跳转目标域名（如 mail.duckgame-play.top），
+        // 302 到自身会无限循环（ERR_TOO_MANY_REDIRECTS）。命中即 200 兜底，不跳转。
+        try {
+          if (url.hostname === new URL(REDIRECT_TARGET).hostname) {
+            return new Response('OK', { status: 200 });
+          }
+        } catch (e) {}
         return Response.redirect(REDIRECT_TARGET, 302);
       }
 
@@ -30,7 +37,15 @@ export default {
       }
 
       // =====================================================
-      // 1.2 【文件浏览器】/browse —— 个人只读网盘
+      // 1.2 【临时网盘】/temp —— 独立密码（TEMP_PASS）+ 独立 KV
+      //     普通密码登录（无 2FA），与只读网盘互不影响
+      // =====================================================
+      if (url.pathname === '/temp' || url.pathname.startsWith('/temp/')) {
+        return await handleTemp(request, env, ctx);
+      }
+
+      // =====================================================
+      // 1.3 【文件浏览器】/browse —— 个人只读网盘
       //     所有请求都经本 Worker（cos-exchange），手机不直连 COS
       //     独立密码门控（BROWSE_PASS），与附件签名体系互不影响
       // =====================================================
@@ -51,6 +66,12 @@ export default {
       // =====================================================
       if (!url.pathname.startsWith('/attachments/') && !url.pathname.startsWith('/static/')) {
         return new Response('Forbidden', { status: 403 });
+      }
+
+      // /static/ 无签名（仅 Referer/Sec-Fetch，可被脚本伪造）：加 per-IP 限流，
+      // 防攻击者用随机 static/* 路径刷 COS 回源（每个唯一路径都会打一次 COS）
+      if (url.pathname.startsWith('/static/') && rateLimited('static:' + clientIP(request), 120, 60000)) {
+        return new Response('Too Many Requests', { status: 429, headers: { 'Retry-After': '60' } });
       }
 
       // =====================================================
@@ -162,15 +183,36 @@ export default {
       delete headersForFetch['Host'];
 
       // 发起带私有凭证的回源请求
-      const response = await fetch(targetUrl.toString(), {
+      // 超时 10s + 429/5xx 重试一次（600ms 退避），与 /browse 下载路径行为一致，
+      // 抵抗 COS 偶发限流/抖动（附件路径此前无重试，COS 抖动会直接 5xx）
+      const fetchOrigin = async () => fetch(targetUrl.toString(), {
         method: request.method,
         headers: headersForFetch,
+        signal: AbortSignal.timeout(10000),
       });
+      let response;
+      try {
+        response = await fetchOrigin();
+        if (response.status === 429 || response.status >= 500) {
+          await new Promise(r => setTimeout(r, 600));
+          response = await fetchOrigin();
+        }
+      } catch (err) {
+        // 首次请求超时（AbortError）也重试一次
+        try {
+          await new Promise(r => setTimeout(r, 600));
+          response = await fetchOrigin();
+        } catch (err2) {
+          throw err2;
+        }
+      }
 
       // 设置跨域 Header（只放行邮件域）并去除敏感头
       const newHeaders = new Headers(response.headers);
       newHeaders.set('Access-Control-Allow-Origin', 'https://mail.duckgame-play.top');
       newHeaders.delete('x-cos-request-id');
+      newHeaders.delete('x-cos-hash-crc64ecma');
+      newHeaders.set('X-Content-Type-Options', 'nosniff');
 
       // =====================================================
       // 7. 回源成功后写入 Cache API（按 path；内容哈希不变则无需重复回源）
@@ -191,11 +233,23 @@ export default {
         return cacheResp;
       }
 
-      // 非 200（如回源 404）：不缓存
-      return new Response(response.body, {
-        status: response.status,
-        statusText: response.statusText,
-        headers: newHeaders,
+      // 非 200：不缓存
+      // - 206/3xx：透传（206 供未来 Range/内嵌媒体场景；3xx 如 COS 临时重定向）
+      // - 4xx/5xx：不向客户端透传 COS 原始 XML（其含真实桶名/错误细节），统一脱敏
+      const upstream = response.status;
+      if (upstream === 206 || (upstream >= 300 && upstream < 400)) {
+        return new Response(response.body, {
+          status: upstream,
+          statusText: response.statusText,
+          headers: newHeaders,
+        });
+      }
+      if (upstream === 429) {
+        return new Response('Too Many Requests', { status: 429, headers: { 'Retry-After': '60', 'X-Content-Type-Options': 'nosniff' } });
+      }
+      return new Response(upstream >= 500 ? 'Upstream Error' : 'Not Found', {
+        status: upstream >= 500 ? 502 : 404,
+        headers: { 'Content-Type': 'text/plain; charset=utf-8', 'X-Content-Type-Options': 'nosniff' },
       });
     } catch (err) {
       console.error('cos-exchange proxy error:', err);
@@ -228,7 +282,11 @@ async function verifySignature(url, env) {
   }
 
   // 防"长期有效签名"：后端误配了超长 TTL 或签名被长期复用也拒绝
-  const maxTtl = Math.max(60, Math.min(Number(env.ATT_SIGN_MAX_TTL || 3600), 86400));
+  // 注意：ATT_SIGN_MAX_TTL 若被配成非数字（如粘贴错值），Number() 得 NaN，
+  // NaN 参与比较恒为 false → TTL 限制会整体失效（超长签名被放行）。必须兜底回默认值。
+  let maxTtl = Number(env.ATT_SIGN_MAX_TTL || 3600);
+  if (!Number.isFinite(maxTtl) || maxTtl <= 0) maxTtl = 3600;
+  maxTtl = Math.max(60, Math.min(maxTtl, 86400));
   if (expires - now > maxTtl) {
     return { ok: false, reason: 'Forbidden', remaining: 0 };
   }
@@ -338,7 +396,588 @@ async function getS3v4Headers({ method, url, region, accessKeyId, secretAccessKe
 }
 
 // 导出供测试使用（Cloudflare 只用 default export，不受影响）
-export { verifySignature, hmacSha256Hex, timingSafeEqual };
+export {
+  verifySignature, hmacSha256Hex, timingSafeEqual,
+  base32Encode, base32Decode, totpAt, verifyTotp,
+  tempConfig, tempList, tempPut, tempGet, tempDelete,
+  authStore, tempStore,
+};
+
+// =====================================================================
+// 【两步验证 2FA（TOTP）】+【KV 会话】+【临时网盘存储（KV 默认 / COS 预留）】
+// ---------------------------------------------------------------------
+// KV 绑定（两个命名空间各自独立，均可选；只绑一个时两个功能都能用）：
+//   BROWSE_KV   只读网盘 /browse 的 2FA 密钥 + 登录会话（优先）
+//   TEMP_KV     临时网盘 /temp 的文件存储（优先）
+//   回退规则：authStore = BROWSE_KV || TEMP_KV；tempStore = TEMP_KV || BROWSE_KV
+//   —— 两个都绑定：数据按命名空间分开；只绑一个：共用该命名空间（前缀隔离）
+//
+// 其他环境变量：
+//   TEMP_PASS        临时网盘 /temp 独立访问密码（必填，普通密码登录，无 2FA）
+//   TEMP_STORAGE     kv（默认）| cos（预留位，暂未启用）
+//   TEMP_MAX_MB      单文件上限（默认 20，最大 24；KV 单值硬上限 25MiB）
+//   TEMP_TTL         临时文件保存秒数（默认 604800=7 天，60~2592000）
+//   TEMP_MAX_FILES   临时文件数量上限（默认 100，最大 1000）
+//   TOTP_ISSUER      验证器显示的发行方（默认 COS-Exchange）
+//   TOTP_ACCOUNT     验证器显示的账户名（默认 cos-exchange）
+//   SESSION_TTL      会话有效期秒数（默认 604800=7 天，3600~2592000）
+//
+// KV 键设计（命名空间内按前缀隔离）：
+//   auth:totp   → {secret, at}   TOTP 密钥（Base32，仅服务端持有）
+//   sess:<id>   → {at, ip}       只读网盘登录会话（expirationTtl 自动过期）
+//   tmp/<id>    → 临时文件内容（metadata: {name,type,size,at}，到期自动删除）
+// =====================================================================
+function authStore(env) {
+  if (!env) return null;
+  return env.BROWSE_KV || env.TEMP_KV || null;
+}
+
+function tempStore(env) {
+  if (!env) return null;
+  return env.TEMP_KV || env.BROWSE_KV || null;
+}
+
+function jsonResp(obj, status) {
+  return new Response(JSON.stringify(obj), {
+    status: status || 200,
+    headers: {
+      'Content-Type': 'application/json; charset=utf-8',
+      'X-Content-Type-Options': 'nosniff',
+      'Cache-Control': 'no-store',
+    },
+  });
+}
+
+// ---------- TOTP（RFC 6238：HMAC-SHA1 / 6 位 / 30 秒）----------
+const B32_ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
+
+function base32Encode(bytes) {
+  let bits = 0;
+  let value = 0;
+  let out = '';
+  for (const b of bytes) {
+    value = (value << 8) | b;
+    bits += 8;
+    while (bits >= 5) {
+      out += B32_ALPHABET[(value >>> (bits - 5)) & 31];
+      bits -= 5;
+    }
+  }
+  if (bits > 0) out += B32_ALPHABET[(value << (5 - bits)) & 31];
+  return out;
+}
+
+function base32Decode(input) {
+  const s = String(input || '').toUpperCase().replace(/[^A-Z2-7]/g, '');
+  let bits = 0;
+  let value = 0;
+  const out = [];
+  for (const ch of s) {
+    const idx = B32_ALPHABET.indexOf(ch);
+    if (idx < 0) throw new Error('bad base32');
+    value = (value << 5) | idx;
+    bits += 5;
+    if (bits >= 8) {
+      out.push((value >>> (bits - 8)) & 0xff);
+      bits -= 8;
+    }
+  }
+  return new Uint8Array(out);
+}
+
+function randomBase32(byteLen) {
+  const b = crypto.getRandomValues(new Uint8Array(byteLen || 20));
+  return base32Encode(b);
+}
+
+async function totpAt(secret, counter) {
+  const key = await crypto.subtle.importKey(
+    'raw',
+    base32Decode(secret),
+    { name: 'HMAC', hash: 'SHA-1' },
+    false,
+    ['sign']
+  );
+  const msg = new ArrayBuffer(8);
+  const dv = new DataView(msg);
+  dv.setUint32(0, Math.floor(counter / 0x100000000) >>> 0);
+  dv.setUint32(4, counter >>> 0);
+  const sig = new Uint8Array(await crypto.subtle.sign('HMAC', key, msg));
+  const off = sig[19] & 0x0f;
+  const num = ((sig[off] & 0x7f) << 24) | (sig[off + 1] << 16) | (sig[off + 2] << 8) | sig[off + 3];
+  return String(num % 1000000).padStart(6, '0');
+}
+
+// 校验 TOTP：允许前后各 1 个时间窗（时钟漂移 ±30 秒）
+async function verifyTotp(secret, code, nowSec) {
+  const c = String(code || '').replace(/\s/g, '');
+  if (!/^[0-9]{6}$/.test(c)) return false;
+  const now = Number.isFinite(nowSec) ? nowSec : Math.floor(Date.now() / 1000);
+  const counter = Math.floor(now / 30);
+  for (const d of [-1, 0, 1]) {
+    if (timingSafeEqual(await totpAt(secret, counter + d), c)) return true;
+  }
+  return false;
+}
+
+function otpauthUri(env, secret) {
+  const issuer = (env.TOTP_ISSUER || 'COS-Exchange').trim() || 'COS-Exchange';
+  const account = (env.TOTP_ACCOUNT || 'cos-exchange').trim() || 'cos-exchange';
+  return 'otpauth://totp/' + encodeURIComponent(issuer + ':' + account) +
+    '?secret=' + secret + '&issuer=' + encodeURIComponent(issuer) +
+    '&algorithm=SHA1&digits=6&period=30';
+}
+
+async function getTotp(env, strict) {
+  const store = authStore(env);
+  if (!store) return null;
+  try {
+    const v = await store.get('auth:totp', { type: 'json' });
+    return v && v.secret ? v : null;
+  } catch (e) {
+    // strict=true（登录等安全关键路径）：KV 读取失败必须抛错，禁止「读不到就当作未绑定」
+    // 否则 KV 抖动期间会退化为仅密码登录（2FA 被静默绕过）
+    if (strict) throw e;
+    return null;
+  }
+}
+
+// 跨站 POST 防护（纵深防御，SameSite=Lax 之外再校验 Origin）：
+// 浏览器跨站表单/脚本 POST 会带 Origin；无 Origin（curl/旧客户端）放行由 SameSite 兜底。
+function sameSitePostOk(request) {
+  const origin = request.headers.get('Origin');
+  if (!origin) return true;
+  let oh = '';
+  try { oh = new URL(origin).hostname; } catch (e) { return false; }
+  let rh = '';
+  try { rh = new URL(request.url).hostname; } catch (e) {}
+  return oh === rh || oh === 'mail.duckgame-play.top';
+}
+
+// ---------- 会话（KV 随机 token；未绑定 KV 时回退旧版密码指纹 cookie）----------
+const SESSION_COOKIE = 'browse_sess';
+const sessionCache = new Map(); // sid -> 校验缓存到期时间（毫秒），减少 KV 读取
+const SESSION_CACHE_MS = 60 * 1000;
+
+function sessionTtl(env) {
+  let ttl = Number(env.SESSION_TTL || 604800);
+  if (!Number.isFinite(ttl) || ttl < 3600) ttl = 604800;
+  if (ttl > 2592000) ttl = 2592000;
+  return Math.floor(ttl);
+}
+
+function cookieValue(request, name) {
+  const cookies = (request.headers.get('Cookie') || '').split(';');
+  for (const c of cookies) {
+    const i = c.indexOf('=');
+    if (i < 0) continue;
+    if (c.slice(0, i).trim() === name) return c.slice(i + 1).trim();
+  }
+  return '';
+}
+
+async function createSession(env, request) {
+  const store = authStore(env);
+  if (!store) throw new Error('未绑定 KV');
+  const sid = crypto.randomUUID();
+  const ttl = sessionTtl(env);
+  await store.put(
+    'sess:' + sid,
+    JSON.stringify({ at: Date.now(), ip: clientIP(request) }),
+    { expirationTtl: ttl }
+  );
+  if (sessionCache.size > 500) sessionCache.clear();
+  sessionCache.set(sid, Date.now() + SESSION_CACHE_MS);
+  return { sid, ttl };
+}
+
+async function checkSession(env, sid) {
+  if (!sid || !/^[0-9a-f-]{36}$/.test(sid)) return false;
+  const store = authStore(env);
+  if (!store) return false;
+  const cached = sessionCache.get(sid);
+  if (cached && cached > Date.now()) return true;
+  try {
+    const v = await store.get('sess:' + sid);
+    if (!v) return false;
+  } catch (e) {
+    return false;
+  }
+  if (sessionCache.size > 500) sessionCache.clear();
+  sessionCache.set(sid, Date.now() + SESSION_CACHE_MS);
+  return true;
+}
+
+// ---------- 临时网盘存储（KV 默认；COS 预留位）----------
+function tempConfig(env) {
+  let storage = String(env.TEMP_STORAGE || 'kv').trim().toLowerCase();
+  if (storage !== 'cos') storage = 'kv';
+  let maxMb = Number(env.TEMP_MAX_MB || 20);
+  if (!Number.isFinite(maxMb) || maxMb < 1) maxMb = 20;
+  if (maxMb > 24) maxMb = 24;
+  let ttl = Number(env.TEMP_TTL || 604800);
+  if (!Number.isFinite(ttl) || ttl < 60) ttl = 604800;
+  if (ttl > 2592000) ttl = 2592000;
+  let maxFiles = Number(env.TEMP_MAX_FILES || 100);
+  if (!Number.isFinite(maxFiles) || maxFiles < 1) maxFiles = 100;
+  if (maxFiles > 1000) maxFiles = 1000;
+  return {
+    storage,
+    maxMb,
+    maxBytes: Math.floor(maxMb * 1024 * 1024),
+    ttl: Math.floor(ttl),
+    maxFiles: Math.floor(maxFiles),
+  };
+}
+
+const TEMP_KEY_RE = /^tmp\/[a-z0-9-]+$/i;
+
+function tempNewKey() {
+  const b = crypto.getRandomValues(new Uint8Array(8));
+  const id = Array.from(b).map(x => x.toString(16).padStart(2, '0')).join('');
+  return 'tmp/' + Date.now().toString(36) + '-' + id;
+}
+
+function tempSafeName(name) {
+  let n = String(name || 'file').replace(/[\u0000-\u001f\u007f]/g, '').replace(/[\\/]/g, '_').trim();
+  if (!n) n = 'file';
+  if (n.length > 120) n = n.slice(0, 120);
+  return n;
+}
+
+function tempAsciiName(name) {
+  const n = String(name || 'file').replace(/[^\x20-\x7e]/g, '_').replace(/["\\]/g, '_');
+  return n || 'file';
+}
+
+// 可安全 inline 展示的类型（HTML/SVG 强制下载，防存储型 XSS）
+function tempInlineOk(type) {
+  const t = String(type || '').toLowerCase().split(';')[0].trim();
+  if (t === 'image/svg+xml') return false;
+  if (t === 'application/pdf' || t === 'text/plain') return true;
+  return t.indexOf('image/') === 0 || t.indexOf('video/') === 0 || t.indexOf('audio/') === 0;
+}
+
+async function tempList(env) {
+  const cfg = tempConfig(env);
+  if (cfg.storage === 'cos') return tempCosList(env); // 预留
+  const store = tempStore(env);
+  if (!store) return [];
+  const out = [];
+  let cursor;
+  for (let i = 0; i < 10; i++) {
+    const page = await store.list({ prefix: 'tmp/', cursor, limit: 1000 });
+    for (const k of (page.keys || [])) {
+      const m = k.metadata || {};
+      out.push({
+        key: k.name,
+        name: m.name || k.name.split('/').pop(),
+        type: m.type || '',
+        size: Number(m.size) || 0,
+        at: Number(m.at) || 0,
+        expireAt: k.expiration ? k.expiration * 1000 : 0,
+      });
+    }
+    if (page.list_complete || !page.cursor) break;
+    cursor = page.cursor;
+  }
+  out.sort((a, b) => (b.at || 0) - (a.at || 0));
+  return out;
+}
+
+async function tempPut(env, name, type, buf) {
+  const cfg = tempConfig(env);
+  if (cfg.storage === 'cos') return tempCosPut(env, name, type, buf); // 预留
+  const store = tempStore(env);
+  if (!store) throw new Error('未绑定 KV（TEMP_KV / BROWSE_KV）');
+  const key = tempNewKey();
+  const at = Date.now();
+  await store.put(key, buf, {
+    expirationTtl: cfg.ttl,
+    metadata: { name, type, size: buf.byteLength, at },
+  });
+  return { key, name, type, size: buf.byteLength, at, expireAt: at + cfg.ttl * 1000 };
+}
+
+async function tempGet(env, key) {
+  const cfg = tempConfig(env);
+  if (cfg.storage === 'cos') return tempCosGet(env, key); // 预留
+  const store = tempStore(env);
+  if (!store || !TEMP_KEY_RE.test(key || '')) return null;
+  const obj = await store.getWithMetadata(key, { type: 'arrayBuffer' });
+  if (!obj || !obj.value) return null;
+  return { buf: obj.value, meta: obj.metadata || {} };
+}
+
+async function tempDelete(env, key) {
+  const cfg = tempConfig(env);
+  if (cfg.storage === 'cos') return tempCosDelete(env, key); // 预留
+  const store = tempStore(env);
+  if (!store) throw new Error('未绑定 KV（TEMP_KV / BROWSE_KV）');
+  if (!TEMP_KEY_RE.test(key || '')) throw new Error('bad key');
+  await store.delete(key);
+}
+
+// ---- 预留位：腾讯云 COS 临时存储（暂未启用）----
+// 启用时需要的环境变量（与 /browse 只读子账号隔离，需读写权限）：
+//   TEMP_COS_BUCKET / TEMP_COS_REGION / TEMP_COS_ENDPOINT / TEMP_COS_AK / TEMP_COS_SK
+// 实现要求：对象键用 tmp/<id>；上传/下载/删除全部经本 Worker 鉴权，禁止直链。
+function tempCosNotReady() {
+  return Object.assign(new Error('COS 临时存储暂未启用（TEMP_STORAGE=cos 为预留位）'), { status: 501 });
+}
+/** @returns {never} */
+function tempCosPut(env, name, type, buf) { throw tempCosNotReady(); }
+/** @returns {never} */
+function tempCosList(env) { throw tempCosNotReady(); }
+/** @returns {never} */
+function tempCosGet(env, key) { throw tempCosNotReady(); }
+/** @returns {never} */
+function tempCosDelete(env, key) { throw tempCosNotReady(); }
+
+
+// =====================================================================
+// 【临时网盘】/temp —— 独立于只读网盘 /browse 的临时文件存储
+// ---------------------------------------------------------------------
+//   - 独立密码 TEMP_PASS（普通密码登录，不使用 2FA）
+//   - 独立 KV：TEMP_KV（未绑定时回退 BROWSE_KV）
+//   - 独立 cookie（HMAC 指纹，密钥常量 cos-temp-cookie-fp-v1）
+//   - 文件到期由 KV expirationTtl 自动删除
+// =====================================================================
+const TEMP_SESSION_COOKIE = 'temp_pwd';
+let tempFpCachePass = '';
+let tempFpCacheVal = '';
+
+async function tempFingerprint(pass) {
+  if (tempFpCachePass === pass && tempFpCacheVal) return tempFpCacheVal;
+  const key = await crypto.subtle.importKey(
+    'raw',
+    new TextEncoder().encode('cos-temp-cookie-fp-v1'),
+    { name: 'HMAC', hash: 'SHA-256' },
+    false,
+    ['sign']
+  );
+  const sig = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(pass));
+  tempFpCachePass = pass;
+  tempFpCacheVal = Array.from(new Uint8Array(sig)).map(b => b.toString(16).padStart(2, '0')).join('');
+  return tempFpCacheVal;
+}
+
+async function tempAuthed(request, env) {
+  const pass = (env.TEMP_PASS || '').trim();
+  if (!pass) return false;
+  return timingSafeEqual(cookieValue(request, TEMP_SESSION_COOKIE), await tempFingerprint(pass));
+}
+
+async function tempLogin(request, env) {
+  if (!sameSitePostOk(request)) {
+    return new Response('Forbidden', { status: 403 });
+  }
+  const ip = 'temp:' + clientIP(request);
+  if (loginBlocked(ip)) {
+    return new Response('Too Many Login Attempts', { status: 429, headers: { 'Retry-After': '600' } });
+  }
+  const form = await request.formData();
+  const p = String(form.get('p') || '');
+  const pass = (env.TEMP_PASS || '').trim();
+  if (pass && timingSafeEqual(p, pass)) {
+    loginOk(ip);
+    const fp = await tempFingerprint(pass);
+    return new Response('', {
+      status: 302,
+      headers: {
+        Location: '/temp',
+        'Set-Cookie': TEMP_SESSION_COOKIE + '=' + fp + '; Path=/; Max-Age=604800; SameSite=Lax; HttpOnly; Secure',
+      },
+    });
+  }
+  // 登录失败：计数（同 IP 5 次/10 分钟锁定）+ 强制延迟 1 秒
+  loginFailRecord(ip);
+  await new Promise(r => setTimeout(r, 1000));
+  return new Response('密码错误', {
+    status: 401,
+    headers: { 'Content-Type': 'text/html; charset=utf-8' },
+  });
+}
+
+async function handleTemp(request, env, ctx) {
+  const url = new URL(request.url);
+
+  // 跨站 POST 防护（纵深防御；SameSite=Lax 之外再校验 Origin）
+  if (request.method === 'POST' && !sameSitePostOk(request)) {
+    return new Response('Forbidden', { status: 403 });
+  }
+
+  // 国家/地区白名单（可选）：与 /browse 共用 BROWSE_ALLOW_COUNTRY
+  const allowC = (env.BROWSE_ALLOW_COUNTRY || '').trim();
+  if (allowC) {
+    const c = (request.headers.get('CF-IPCountry') || '').toUpperCase();
+    if (!allowC.toUpperCase().split(',').map(s => s.trim()).includes(c)) {
+      return new Response('Forbidden', { status: 403 });
+    }
+  }
+
+  // 登录（POST）
+  if (request.method === 'POST' && url.pathname === '/temp/login') {
+    return await tempLogin(request, env);
+  }
+  // 退出登录
+  if (url.pathname === '/temp/logout') {
+    return new Response('', {
+      status: 302,
+      headers: {
+        Location: '/temp',
+        'Set-Cookie': TEMP_SESSION_COOKIE + '=; Path=/; Max-Age=0; SameSite=Lax; HttpOnly; Secure',
+      },
+    });
+  }
+
+  // POST 白名单：上传 / 删除（其余一律 405）
+  const isPostRoute = request.method === 'POST' && (
+    url.pathname === '/temp/api/upload' || url.pathname === '/temp/api/delete'
+  );
+  if (request.method !== 'GET' && request.method !== 'HEAD' && !isPostRoute) {
+    return new Response('Method Not Allowed', { status: 405 });
+  }
+
+  // 未配置 TEMP_PASS 或未绑定 KV：返回配置提示页（不暴露内部细节）
+  const store = tempStore(env);
+  const tempPass = (env.TEMP_PASS || '').trim();
+  if (!store || !tempPass) {
+    const reason = !tempPass
+      ? '未配置环境变量 TEMP_PASS（临时网盘访问密码）。'
+      : '未绑定 KV 命名空间（TEMP_KV 或 BROWSE_KV）。';
+    return new Response(tempDisabledHtml(reason), {
+      status: 200,
+      headers: { 'Content-Type': 'text/html; charset=utf-8', 'X-Content-Type-Options': 'nosniff', 'X-Frame-Options': 'DENY', 'Cache-Control': 'no-store' },
+    });
+  }
+
+  // 密码门控（独立 cookie，无 2FA）
+  if (!(await tempAuthed(request, env))) {
+    return new Response(tempLoginHtml(env), {
+      status: 200,
+      headers: { 'Content-Type': 'text/html; charset=utf-8', 'X-Content-Type-Options': 'nosniff', 'X-Frame-Options': 'DENY', 'Cache-Control': 'no-store' },
+    });
+  }
+
+  // 首页
+  if (url.pathname === '/temp' || url.pathname === '/temp/') {
+    const tcfg = tempConfig(env);
+    const cfg = {
+      tempStorage: tcfg.storage,
+      tempMaxMb: tcfg.maxMb,
+      tempTtlSec: tcfg.ttl,
+      tempMaxFiles: tcfg.maxFiles,
+      kvName: env.TEMP_KV ? 'TEMP_KV' : 'BROWSE_KV',
+    };
+    return new Response(tempIndexHtml(cfg), {
+      headers: { 'Content-Type': 'text/html; charset=utf-8', 'X-Content-Type-Options': 'nosniff', 'X-Frame-Options': 'DENY', 'Cache-Control': 'no-store' },
+    });
+  }
+
+  // 列表
+  if (url.pathname === '/temp/api/list') {
+    if (rateLimited('tlist:' + clientIP(request), 60, 60000)) {
+      return new Response('Too Many Requests', { status: 429, headers: { 'Retry-After': '60' } });
+    }
+    const tcfg = tempConfig(env);
+    try {
+      const files = await tempList(env);
+      return jsonResp({ files, storage: tcfg.storage, maxMb: tcfg.maxMb, ttl: tcfg.ttl, maxFiles: tcfg.maxFiles });
+    } catch (e) {
+      console.error('temp list error:', e);
+      return jsonResp({ error: (e && e.message) || '临时存储读取失败', files: [] }, e && e.status === 501 ? 501 : 500);
+    }
+  }
+
+  // 上传（multipart 字段 file）
+  if (url.pathname === '/temp/api/upload' && request.method === 'POST') {
+    if (rateLimited('tup:' + clientIP(request), 20, 60000)) {
+      return new Response('Too Many Requests', { status: 429, headers: { 'Retry-After': '60' } });
+    }
+    const tcfg = tempConfig(env);
+    if (tcfg.storage === 'cos') return jsonResp({ error: 'COS 临时存储暂未启用（预留位）' }, 501);
+    const clen = parseInt(request.headers.get('Content-Length') || '0', 10);
+    if (Number.isFinite(clen) && clen > tcfg.maxBytes + 1024 * 1024) {
+      return jsonResp({ error: '文件超过单文件上限 ' + tcfg.maxMb + ' MB' }, 413);
+    }
+    let form;
+    try {
+      form = await request.formData();
+    } catch (e) {
+      return jsonResp({ error: '上传内容解析失败' }, 400);
+    }
+    const f = form.get('file');
+    if (!f || typeof f === 'string' || typeof f.arrayBuffer !== 'function') {
+      return jsonResp({ error: '缺少 file 字段' }, 400);
+    }
+    if (f.size > tcfg.maxBytes) {
+      return jsonResp({ error: '文件超过单文件上限 ' + tcfg.maxMb + ' MB' }, 413);
+    }
+    try {
+      const existing = await tempList(env);
+      if (existing.length >= tcfg.maxFiles) {
+        return jsonResp({ error: '临时文件数量已达上限（' + tcfg.maxFiles + '），请先删除部分文件' }, 400);
+      }
+      const buf = await f.arrayBuffer();
+      if (buf.byteLength > tcfg.maxBytes) {
+        return jsonResp({ error: '文件超过单文件上限 ' + tcfg.maxMb + ' MB' }, 413);
+      }
+      const name = tempSafeName(f.name);
+      const type = f.type || 'application/octet-stream';
+      const item = await tempPut(env, name, type, buf);
+      return jsonResp({ ok: true, file: item });
+    } catch (e) {
+      console.error('temp upload error:', e);
+      return jsonResp({ error: (e && e.message) || '上传失败' }, e && e.status === 501 ? 501 : 500);
+    }
+  }
+
+  // 下载/预览（?key=&dl=1）
+  if (url.pathname === '/temp/api/file') {
+    if (rateLimited('tget:' + clientIP(request), 120, 60000)) {
+      return new Response('Too Many Requests', { status: 429, headers: { 'Retry-After': '60' } });
+    }
+    const key = url.searchParams.get('key') || '';
+    let obj;
+    try {
+      obj = await tempGet(env, key);
+    } catch (e) {
+      return jsonResp({ error: (e && e.message) || '临时存储读取失败' }, e && e.status === 501 ? 501 : 500);
+    }
+    if (!obj) return new Response('Not Found', { status: 404 });
+    const meta = obj.meta || {};
+    const type = meta.type || 'application/octet-stream';
+    const name = tempSafeName(meta.name);
+    const dl = url.searchParams.get('dl') === '1' || !tempInlineOk(type);
+    const headers = new Headers();
+    headers.set('Content-Type', type);
+    headers.set('Content-Length', String(obj.buf.byteLength));
+    headers.set('Content-Disposition', (dl ? 'attachment' : 'inline') + "; filename=\"" + tempAsciiName(name) + "\"; filename*=UTF-8''" + encodeURIComponent(name));
+    headers.set('X-Content-Type-Options', 'nosniff');
+    headers.set('Cache-Control', 'private, max-age=300');
+    return new Response(obj.buf, { status: 200, headers });
+  }
+
+  // 删除（字段 key）
+  if (url.pathname === '/temp/api/delete' && request.method === 'POST') {
+    if (rateLimited('tdel:' + clientIP(request), 60, 60000)) {
+      return new Response('Too Many Requests', { status: 429, headers: { 'Retry-After': '60' } });
+    }
+    const form = await request.formData();
+    const key = String(form.get('key') || '');
+    try {
+      await tempDelete(env, key);
+      return jsonResp({ ok: true });
+    } catch (e) {
+      console.error('temp delete error:', e);
+      return jsonResp({ error: (e && e.message) || '删除失败' }, e && e.status === 501 ? 501 : 400);
+    }
+  }
+
+  return new Response('Not Found', { status: 404 });
+}
+
 
 // =====================================================================
 // 【文件浏览器】/browse —— 个人只读网盘（请求全部经本 Worker，手机不直连 COS）
@@ -349,6 +988,57 @@ export { verifySignature, hmacSha256Hex, timingSafeEqual };
 //                                  复用上面的只读子账号（策略需含 GetObject + GetBucket）
 // 说明：/browse 是独立密码门控的个人浏览入口，不参与附件签名体系
 // =====================================================================
+// =====================================================================
+// COS 健康探测：COS 关闭/验证失败时，在登录界面/首页直接提示，
+// 避免用户输入密码后才在文件列表看到报错。
+// 带 30 秒缓存，避免每个页面请求都去打一次 COS。
+// =====================================================================
+let cosProbeCache = { at: 0, ok: true };
+const COS_PROBE_WINDOW = 30 * 1000;
+
+async function probeCosHealth(env) {
+  const now = Date.now();
+  if (now - cosProbeCache.at < COS_PROBE_WINDOW) return cosProbeCache.ok;
+  cosProbeCache.at = now;
+  try {
+    // 复用列表接口做一次最小探测（MaxKeys=1），签名逻辑与浏览列表完全一致
+    await browseList(env, '', '', 1);
+    cosProbeCache.ok = true;
+  } catch (e) {
+    // 仅记录状态，不泄露 COS 排错细节（bucket 域名/签名中间值只在 browseList 的 throw 里）
+    console.warn('cos-proxy: COS 探测失败，网盘暂时关闭服务');
+    cosProbeCache.ok = false;
+  }
+  return cosProbeCache.ok;
+}
+
+// COS 不可用提示页（纯 ASCII，中文用 HTML 实体）
+function cosDownHtml() {
+  return `<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>&#x670D;&#x52A1;&#x6682;&#x65F6;&#x4E0D;&#x53EF;&#x7528;</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body { min-height:100vh; display:flex; align-items:center; justify-content:center; background:#f7f8fa; font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,'PingFang SC','Microsoft YaHei',sans-serif; }
+  .box { text-align:center; padding:48px 32px; background:#fff; border-radius:12px; box-shadow:0 4px 20px rgba(0,0,0,.06); max-width:420px; }
+  .box .icon { font-size:48px; }
+  .box h1 { font-size:18px; color:#333; margin:16px 0 8px; font-weight:600; }
+  .box p { font-size:13px; color:#888; }
+</style>
+</head>
+<body>
+  <div class="box">
+    <div class="icon">&#x1F4E5;</div>
+    <h1>COS&#x5BF9;&#x8C61;&#x5B58;&#x50A8;&#x9519;&#x8BEF;&#xFF0C;&#x6682;&#x65F6;&#x5173;&#x95ED;&#x670D;&#x52A1;</h1>
+    <p>&#x8BF7;&#x7A0D;&#x540E;&#x518D;&#x8BD5;&#x6216;&#x8054;&#x7CFB;&#x7BA1;&#x7406;&#x5458;</p>
+  </div>
+</body>
+</html>`;
+}
+
 async function handleBrowse(request, env, ctx) {
   const url = new URL(request.url);
 
@@ -365,23 +1055,128 @@ async function handleBrowse(request, env, ctx) {
   if (request.method === 'POST' && url.pathname === '/browse/login') {
     return await browseLogin(request, env);
   }
-  if (request.method !== 'GET' && request.method !== 'HEAD') {
+  // 退出登录：会话/密码 cookie 都是 HttpOnly，前端 JS 的 document.cookie 无法删除，
+  // 必须由服务端 Set-Cookie 清除，并删除 KV 会话（立即失效）。放在密码门控之前，
+  // 保证已登录用户一定能退出；未登录访问也无害。
+  if (url.pathname === '/browse/logout') {
+    const sid = cookieValue(request, SESSION_COOKIE);
+    if (sid && authStore(env)) {
+      try { await authStore(env).delete('sess:' + sid); } catch (e) {}
+      sessionCache.delete(sid);
+    }
+    const h = new Headers();
+    h.set('Location', '/browse');
+    h.append('Set-Cookie', SESSION_COOKIE + '=; Path=/; Max-Age=0; SameSite=Lax; HttpOnly; Secure');
+    h.append('Set-Cookie', 'browse_pwd=; Path=/; Max-Age=0; SameSite=Lax; HttpOnly; Secure');
+    return new Response('', { status: 302, headers: h });
+  }
+  // POST 白名单：仅 2FA 绑定/关闭（临时文件上传/删除已迁移到独立的 /temp）
+  const isPostRoute = request.method === 'POST' && (
+    url.pathname === '/browse/api/2fa/bind' ||
+    url.pathname === '/browse/api/2fa/disable'
+  );
+  if (request.method !== 'GET' && request.method !== 'HEAD' && !isPostRoute) {
     return new Response('Method Not Allowed', { status: 405 });
   }
 
+  // COS 健康探测：COS 关闭/错误时，登录界面与首页直接提示（30 秒缓存）
+  // 仅对页面请求探测；/browse/api/* 由列表/下载接口自身报错兜底
+  if (url.pathname === '/browse' || url.pathname === '/browse/') {
+    const cosOk = await probeCosHealth(env);
+    if (!cosOk) {
+      return new Response(cosDownHtml(), {
+        status: 503,
+        headers: { 'Content-Type': 'text/html; charset=utf-8', 'X-Content-Type-Options': 'nosniff', 'X-Frame-Options': 'DENY', 'Cache-Control': 'no-store' },
+      });
+    }
+  }
+
   // 密码门控：未配置 BROWSE_PASS 时直接拒绝，防止误配导致整桶裸奔
-  if (!env.BROWSE_PASS || !browseAuthed(request, env.BROWSE_PASS)) {
-    return new Response(browseLoginHtml(env), {
+  if (!env.BROWSE_PASS || !(await browseAuthed(request, env))) {
+    return new Response(await browseLoginHtml(env), {
       status: 200,
-      headers: { 'Content-Type': 'text/html; charset=utf-8', 'X-Content-Type-Options': 'nosniff' },
+      headers: { 'Content-Type': 'text/html; charset=utf-8', 'X-Content-Type-Options': 'nosniff', 'X-Frame-Options': 'DENY', 'Cache-Control': 'no-store' },
     });
   }
 
-  // 首页
+  // 首页（注入页面配置：2FA 状态、临时网盘入口）
   if (url.pathname === '/browse' || url.pathname === '/browse/') {
-    return new Response(browseIndexHtml(), {
-      headers: { 'Content-Type': 'text/html; charset=utf-8', 'X-Content-Type-Options': 'nosniff' },
+    const totp = await getTotp(env);
+    const cfg = {
+      kvBound: !!authStore(env),
+      totpBound: !!totp,
+      needs2faBind: !!authStore(env) && !totp,
+      tempEnabled: !!(tempStore(env) && (env.TEMP_PASS || '').trim()),
+    };
+    return new Response(browseIndexHtml(cfg), {
+      headers: { 'Content-Type': 'text/html; charset=utf-8', 'X-Content-Type-Options': 'nosniff', 'X-Frame-Options': 'DENY', 'Cache-Control': 'no-store' },
     });
+  }
+
+  // =====================================================
+  // 两步验证（2FA / TOTP）
+  //   /browse/api/2fa/new     候选密钥（尚未生效，确认验证码后才写入 KV）
+  //   /browse/api/2fa/bind    确认绑定（已绑定时需提供当前验证码 current）
+  //   /browse/api/2fa/disable 关闭 2FA（需要当前验证码）
+  // =====================================================
+  if (url.pathname === '/browse/api/2fa/new') {
+    if (!authStore(env)) return jsonResp({ error: '未绑定 KV（BROWSE_KV / TEMP_KV），无法使用 2FA' }, 501);
+    if (rateLimited('2fa:' + clientIP(request), 20, 60000)) {
+      return new Response('Too Many Requests', { status: 429, headers: { 'Retry-After': '60' } });
+    }
+    const secret = randomBase32(20);
+    return jsonResp({ secret, otpauth: otpauthUri(env, secret), bound: !!(await getTotp(env)) });
+  }
+
+  if (url.pathname === '/browse/api/2fa/bind' && request.method === 'POST') {
+    if (!sameSitePostOk(request)) return new Response('Forbidden', { status: 403 });
+    if (!authStore(env)) return jsonResp({ error: '未绑定 KV（BROWSE_KV / TEMP_KV），无法使用 2FA' }, 501);
+    if (rateLimited('2fabind:' + clientIP(request), 10, 60000)) {
+      return new Response('Too Many Requests', { status: 429, headers: { 'Retry-After': '60' } });
+    }
+    const form = await request.formData();
+    const secret = String(form.get('secret') || '').toUpperCase().replace(/[^A-Z2-7]/g, '');
+    const code = String(form.get('code') || '');
+    const current = String(form.get('current') || '');
+    if (!/^[A-Z2-7]{16,64}$/.test(secret)) return jsonResp({ error: '密钥格式不正确' }, 400);
+    let bound = null;
+    try {
+      bound = await getTotp(env, true);
+    } catch (e) {
+      return jsonResp({ error: '服务暂时不可用，请稍后重试' }, 503);
+    }
+    if (bound && !(await verifyTotp(bound.secret, current))) {
+      await new Promise(r => setTimeout(r, 600));
+      return jsonResp({ error: '当前验证码错误' }, 401);
+    }
+    if (!(await verifyTotp(secret, code))) {
+      await new Promise(r => setTimeout(r, 600));
+      return jsonResp({ error: '验证码错误，请确认身份验证器时间准确后重试' }, 400);
+    }
+    await authStore(env).put('auth:totp', JSON.stringify({ secret, at: Date.now() }));
+    return jsonResp({ ok: true });
+  }
+
+  if (url.pathname === '/browse/api/2fa/disable' && request.method === 'POST') {
+    if (!sameSitePostOk(request)) return new Response('Forbidden', { status: 403 });
+    if (!authStore(env)) return jsonResp({ error: '未绑定 KV' }, 501);
+    if (rateLimited('2fadisable:' + clientIP(request), 10, 60000)) {
+      return new Response('Too Many Requests', { status: 429, headers: { 'Retry-After': '60' } });
+    }
+    const form = await request.formData();
+    const code = String(form.get('code') || '');
+    let bound = null;
+    try {
+      bound = await getTotp(env, true);
+    } catch (e) {
+      return jsonResp({ error: '服务暂时不可用，请稍后重试' }, 503);
+    }
+    if (bound && !(await verifyTotp(bound.secret, code))) {
+      await new Promise(r => setTimeout(r, 600));
+      return jsonResp({ error: '当前验证码错误' }, 401);
+    }
+    await authStore(env).delete('auth:totp');
+    return jsonResp({ ok: true });
   }
 
   // 列目录
@@ -390,16 +1185,32 @@ async function handleBrowse(request, env, ctx) {
       return new Response('Too Many Requests', { status: 429, headers: { 'Retry-After': '60' } });
     }
     try {
-      const prefix = url.searchParams.get('prefix') || '';
-      const token = url.searchParams.get('token') || '';
-      const data = await browseList(env, prefix, token);
+      // prefix/token 限制长度：防超长参数滥用（COS 对超长 prefix 会 400，限流兜底）
+      const prefix = (url.searchParams.get('prefix') || '').slice(0, 1024);
+      const token = (url.searchParams.get('token') || '').slice(0, 2048);
+      // per_page：每页条数（前端 30/60/100），限制 1~200，非法值回退 100
+      let perPage = parseInt(url.searchParams.get('per_page') || '', 10);
+      if (!Number.isFinite(perPage) || perPage < 1) perPage = 100;
+      if (perPage > 200) perPage = 200;
+      const data = await browseList(env, prefix, token, perPage);
+      // 魔数嗅探：对"扩展名无法识别"的文件读 COS 头部(0-15B)识别真实类型，
+      // 解决无扩展名/伪扩展名内嵌图（如 063A2F5D_247B9635.D22C7B6A00000000 实为 JPEG）
+      // 在查看器里无法显示的问题。只嗅探 oth 项，且带结果缓存避免重复请求 COS。
+      await sniffUnknownTypes(env, data.files);
       return new Response(JSON.stringify(data), {
-        headers: { 'Content-Type': 'application/json; charset=utf-8', 'X-Content-Type-Options': 'nosniff' },
+        headers: { 'Content-Type': 'application/json; charset=utf-8', 'X-Content-Type-Options': 'nosniff', 'Cache-Control': 'no-store' },
       });
     } catch (e) {
+      // 只把 error 字段回给前端：browseList 的 throw 里带 ourSTS/cosSTS/sentUrl 等排错字段，
+      // 原样返回会泄露 COS 桶域名与签名中间值；调试细节只在服务端日志
       console.error('browse list error:', e);
       const msg = String((e && e.message) || e);
-      return new Response(msg.startsWith('{') ? msg : JSON.stringify({ error: msg.slice(0, 500) }), {
+      let errMsg = msg;
+      try {
+        const parsed = JSON.parse(msg);
+        if (parsed && parsed.error) errMsg = parsed.error;
+      } catch (e2) {}
+      return new Response(JSON.stringify({ error: errMsg.slice(0, 500) }), {
         status: 500,
         headers: { 'Content-Type': 'application/json; charset=utf-8' },
       });
@@ -412,11 +1223,16 @@ async function handleBrowse(request, env, ctx) {
       return new Response('Too Many Requests', { status: 429, headers: { 'Retry-After': '60' } });
     }
     const key = url.searchParams.get('key') || '';
-    if (!key || key.startsWith('/') || key.includes('../')) {
+    // 路径穿越拦截：绝对路径(/开头) / 反斜杠 / ../
+    // （对象存储无目录上溯，但拦截这些字符可避免奇怪的 key 与回源 URL 歧义）
+    if (!key || key.startsWith('/') || key.includes('\\') || key.includes('../')) {
       return new Response('bad key', { status: 400 });
     }
     try {
-      return await browseFetchFile(env, key, ctx);
+      // 透传 Range 头：视频/音频播放器靠 Range 流式分段下载 + seek，
+      // 没有它浏览器只能全量下载完才能播，表现为"等待很久才开始"
+      const range = request.headers.get('Range') || '';
+      return await browseFetchFile(env, key, ctx, request.method, range);
     } catch (e) {
       console.error('browse file error:', e);
       return new Response('fetch failed', { status: 500 });
@@ -426,18 +1242,21 @@ async function handleBrowse(request, env, ctx) {
   return new Response('Not Found', { status: 404 });
 }
 
-function browseAuthed(request, pass) {
-  const cookies = (request.headers.get('Cookie') || '').split(';');
-  for (const c of cookies) {
-    const [k, v] = c.trim().split('=');
-    if (k === 'browse_pwd' && v === browseFingerprint(pass)) {
-      return true;
-    }
+async function browseAuthed(request, env) {
+  // 绑定 KV 后：只认 KV 会话（随机 token）。
+  // 若继续接受旧版密码指纹 cookie，知道密码的人可自行算出 cookie 绕过 2FA。
+  if (authStore(env)) {
+    return await checkSession(env, cookieValue(request, SESSION_COOKIE));
   }
-  return false;
+  // 未绑定 KV：回退旧版密码指纹 cookie（与升级前行为一致）
+  const fingerprint = await browseFingerprint(env.BROWSE_PASS);
+  return timingSafeEqual(cookieValue(request, 'browse_pwd'), fingerprint);
 }
 
 async function browseLogin(request, env) {
+  if (!sameSitePostOk(request)) {
+    return new Response('Forbidden', { status: 403 });
+  }
   const ip = clientIP(request);
   if (loginBlocked(ip)) {
     return new Response('Too Many Login Attempts', { status: 429, headers: { 'Retry-After': '600' } });
@@ -461,21 +1280,53 @@ async function browseLogin(request, env) {
       });
     }
   }
-  const p = form.get('p') || '';
-  if (p === env.BROWSE_PASS) {
+  const p = String(form.get('p') || '');
+  // 恒定时间比较（timingSafeEqual 长度不同直接 false，只泄露长度）
+  const passOk = !!env.BROWSE_PASS && timingSafeEqual(p, env.BROWSE_PASS);
+  // 2FA：绑定后必须同时校验动态验证码。
+  // 失败信息不区分「密码错误 / 验证码错误」，避免账号密码被探测。
+  // getTotp 用 strict：KV 读取失败 → 503 拒绝登录（fail-closed），不得退化为仅密码登录。
+  let totpOk = true;
+  if (passOk) {
+    let totp = null;
+    try {
+      totp = await getTotp(env, true);
+    } catch (e) {
+      console.error('2FA 读取失败（KV 异常），拒绝登录:', e);
+      return new Response('服务暂时不可用，请稍后重试', {
+        status: 503,
+        headers: { 'Content-Type': 'text/plain; charset=utf-8', 'Retry-After': '30' },
+      });
+    }
+    if (totp) totpOk = await verifyTotp(totp.secret, form.get('code') || '');
+  }
+  if (passOk && totpOk) {
     loginOk(ip);
+    // 绑定 KV：签发随机会话（KV 存储 + HttpOnly cookie）
+    if (authStore(env)) {
+      const { sid, ttl } = await createSession(env, request);
+      return new Response('', {
+        status: 302,
+        headers: {
+          Location: '/browse',
+          'Set-Cookie': SESSION_COOKIE + '=' + sid + '; Path=/; Max-Age=' + ttl + '; SameSite=Lax; HttpOnly; Secure',
+        },
+      });
+    }
+    // 未绑定 KV：回退旧版密码指纹 cookie
+    const fp = await browseFingerprint(env.BROWSE_PASS);
     return new Response('', {
       status: 302,
       headers: {
         Location: '/browse',
-        'Set-Cookie': `browse_pwd=${browseFingerprint(env.BROWSE_PASS)}; Path=/; Max-Age=604800; SameSite=Lax; HttpOnly; Secure`,
+        'Set-Cookie': 'browse_pwd=' + fp + '; Path=/; Max-Age=604800; SameSite=Lax; HttpOnly; Secure',
       },
     });
   }
   // 登录失败：计数（同 IP 5 次/10 分钟锁定）+ 强制延迟 1 秒
   loginFailRecord(ip);
   await new Promise(r => setTimeout(r, 1000));
-  return new Response('&#x5BC6;&#x7801;&#x9519;&#x8BEF;', {
+  return new Response('密码或动态验证码错误', {
     status: 401,
     headers: { 'Content-Type': 'text/html; charset=utf-8' },
   });
@@ -501,14 +1352,26 @@ async function verifyTurnstile(secret, token, ip) {
   }
 }
 
-// cookie 校验用轻量指纹（非安全加密场景；正式场景请再加 Cloudflare Access）
-function browseFingerprint(s) {
-  let h = 0x811c9dc5;
-  for (let i = 0; i < s.length; i++) {
-    h ^= s.charCodeAt(i);
-    h = Math.imul(h, 0x01000193) >>> 0;
-  }
-  return h.toString(16);
+// cookie 校验用 HMAC-SHA256 指纹。
+// 原 FNV-1a 32 位可碰撞、可用字典反推密码；HMAC-SHA256 输出 256 位，不可碰撞、
+// 单向不可逆（对强密码无法反推）。密钥为独立常量（非 BROWSE_PASS 本身），
+// 同一密码只产生唯一指纹，无法通过 cookie 值关联/推导其它信息。
+// BROWSE_PASS 在 Worker 实例生命周期内不变，缓存指纹避免每次请求重复 importKey。
+let fpCachePass = '';
+let fpCacheVal = '';
+async function browseFingerprint(pass) {
+  if (fpCachePass === pass && fpCacheVal) return fpCacheVal;
+  const key = await crypto.subtle.importKey(
+    'raw',
+    new TextEncoder().encode('cos-browse-cookie-fp-v2'),
+    { name: 'HMAC', hash: 'SHA-256' },
+    false,
+    ['sign']
+  );
+  const sig = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(pass));
+  fpCachePass = pass;
+  fpCacheVal = Array.from(new Uint8Array(sig)).map(b => b.toString(16).padStart(2, '0')).join('');
+  return fpCacheVal;
 }
 
 // ---- per-IP 速率限制（内存实现；配合 CF Access 更稳）----
@@ -525,9 +1388,19 @@ function rateLimited(key, max, windowMs) {
   return rec.c > max;
 }
 const loginFailMap = new Map();
+// 定期清理过期的失败记录，防止攻击者用海量不同 IP 把 Map 撑爆
+function loginFailGC(now) {
+  if (loginFailMap.size < 10000) return;
+  for (const [k, v] of loginFailMap) {
+    if (now - v.t > 600000) loginFailMap.delete(k);
+  }
+  if (loginFailMap.size > 20000) loginFailMap.clear();
+}
 function loginBlocked(ip) {
+  const now = Date.now();
+  loginFailGC(now);
   const rec = loginFailMap.get(ip);
-  return !!(rec && Date.now() - rec.t < 600000 && rec.c >= 5);
+  return !!(rec && now - rec.t < 600000 && rec.c >= 5);
 }
 function loginFailRecord(ip) {
   const rec = loginFailMap.get(ip);
@@ -537,7 +1410,9 @@ function loginFailRecord(ip) {
 }
 function loginOk(ip) { loginFailMap.delete(ip); }
 function clientIP(request) {
-  return request.headers.get('CF-Connecting-IP') || request.headers.get('x-forwarded-for') || 'unknown';
+  // 只信任 CF 注入的 CF-Connecting-IP：X-Forwarded-For 可被非 CF 直达请求伪造，
+  // 用于绕过登录锁定/限流（生产全走 CF 无影响；直连 workers.dev 时更严格）。
+  return request.headers.get('CF-Connecting-IP') || 'unknown';
 }
 
 // ---- S3 SigV4 工具（浏览专用，与上方 getS3v4Headers 同算法）----
@@ -586,14 +1461,18 @@ async function signingKey(sk, dateStamp, region) {
   return await h(kService, 'aws4_request');
 }
 
-// 列目录：GET ?list-type=2&delimiter=/&prefix=...&continuation-token=...
-async function browseList(env, prefix, token) {
+// 列目录：GET ?list-type=2&delimiter=/&prefix=...&continuation-token=...&max-keys=...
+async function browseList(env, prefix, token, perPage) {
   // 与附件主流程一致：密钥/地域/endpoint 必须 trim（粘贴进 CF 的环境变量常带尾随空格/换行）
   const host = new URL((env.S3_ENDPOINT || '').trim()).host;
   const region = (env.REGION || '').trim();
   const ak = (env.AWS_ACCESS_KEY_ID || '').trim();
   const sk = (env.AWS_SECRET_ACCESS_KEY || '').trim();
-  const params = { 'list-type': '2', 'encoding-type': 'url', delimiter: '/' };
+  // max-keys 由前端每页条数（per_page）决定：默认 100，支持 30/60/100 分页器，
+  // 避免一次拉回上千条导致页面渲染卡顿、响应过大
+  if (!Number.isFinite(perPage) || perPage < 1) perPage = 100;
+  if (perPage > 200) perPage = 200;
+  const params = { 'list-type': '2', 'encoding-type': 'url', delimiter: '/', 'max-keys': String(perPage) };
   if (prefix) params.prefix = prefix;
   if (token) params['continuation-token'] = token;
 
@@ -669,8 +1548,129 @@ function parseListXml(xml) {
   return { folders, files, truncated, token: tm ? tm[1] : '' };
 }
 
+// =====================================================================
+// 魔数嗅探：识别无扩展名/伪扩展名的图片等（读 COS 对象头 0-15 字节）
+// 例：邮件内嵌图 key 形如 063A2F5D_247B9635.D22C7B6A00000000（无 .jpg 后缀）
+//     —— mail web 靠 DB mimeType 可看，本查看器此前靠扩展名判定看不了。
+// 仅对"扩展名无法归类"(type 会判为 oth)的文件嗅探；命中缓存避免重复请求。
+// =====================================================================
+const sniffCache = new Map();           // key -> { t: expireTs, type: 'img'|'vid'|'aud'|null }
+const SNIFF_CACHE_TTL = 7 * 24 * 3600 * 1000; // 与文件缓存一致；COS key=内容哈希，类型恒定
+const SNIFF_CACHE_MAX = 5000;           // 内存保护：超限时清空最旧一半，防长期运行无限增长
+function sniffCacheSet(key, val) {
+  sniffCache.set(key, val);
+  if (sniffCache.size > SNIFF_CACHE_MAX) {
+    const cutoff = Math.floor(SNIFF_CACHE_MAX / 2);
+    let i = 0;
+    for (const k of sniffCache.keys()) {
+      if (i++ >= cutoff) break;
+      sniffCache.delete(k);
+    }
+  }
+}
+
+// 由扩展名得到的"可信类型"：命中则无需嗅探（返回 null 表示不用管）
+function extGuessType(name) {
+  const e = String(name || '').split('.').pop().toLowerCase();
+  const IMG = ['png','jpg','jpeg','gif','webp','bmp','svg','ico','heic','avif','jfif'];
+  const VID = ['mp4','mkv','mov','avi','webm','m4v','wmv','flv','ts','3gp','rmvb'];
+  const AUD = ['mp3','wav','flac','ogg','m4a','aac','opus','ape','amr'];
+  if (IMG.includes(e)) return 'img';
+  if (VID.includes(e)) return 'vid';
+  if (AUD.includes(e)) return 'aud';
+  return null; // 无法归类 -> 需要嗅探
+}
+
+// 前若干字节 -> 类型（魔数，与 mail-worker 魔数嗅探思路一致）
+function sniffTypeFromBytes(buf) {
+  if (!buf || buf.length < 12) return null;
+  const b = new Uint8Array(buf);
+  // JPEG: FF D8 FF
+  if (b[0] === 0xFF && b[1] === 0xD8 && b[2] === 0xFF) return 'img';
+  // PNG: 89 50 4E 47
+  if (b[0] === 0x89 && b[1] === 0x50 && b[2] === 0x4E && b[3] === 0x47) return 'img';
+  // GIF: 47 49 46 38
+  if (b[0] === 0x47 && b[1] === 0x49 && b[2] === 0x46 && b[3] === 0x38) return 'img';
+  // WEBP: RIFF....WEBP
+  if (b[0] === 0x52 && b[1] === 0x49 && b[2] === 0x46 && b[3] === 0x46 &&
+      b[8] === 0x57 && b[9] === 0x45 && b[10] === 0x42 && b[11] === 0x50) return 'img';
+  // BMP: 42 4D
+  if (b[0] === 0x42 && b[1] === 0x4D) return 'img';
+  // AVIF/HEIC: ....ftyp(avif|heic|heix|hevc|mif1)
+  if (b[4] === 0x66 && b[5] === 0x74 && b[6] === 0x79 && b[7] === 0x70) {
+    const brand = String.fromCharCode(b[8], b[9], b[10], b[11]).toLowerCase();
+    if (['avif','heic','heix','hevc','mif1','msf1'].includes(brand)) return 'img';
+  }
+  // MP4/M4V 视频: ....ftyp(....)
+  if (b[4] === 0x66 && b[5] === 0x74 && b[6] === 0x79 && b[7] === 0x70) {
+    const brand = String.fromCharCode(b[8], b[9], b[10], b[11]).toLowerCase();
+    if (['mp42','mp41','isom','iso2','avc1','m4v ','dash'].includes(brand)) return 'vid';
+  }
+  // MP3: ID3 或 FF FB / FF F3 / FF F2
+  if (b[0] === 0x49 && b[1] === 0x44 && b[2] === 0x33) return 'aud';
+  if (b[0] === 0xFF && (b[1] === 0xFB || b[1] === 0xF3 || b[1] === 0xF2)) return 'aud';
+  // FLAC: 66 4C 61 43
+  if (b[0] === 0x66 && b[1] === 0x4C && b[2] === 0x61 && b[3] === 0x43) return 'aud';
+  // OGG: 4F 67 67 53
+  if (b[0] === 0x4F && b[1] === 0x67 && b[2] === 0x67 && b[3] === 0x53) return 'aud';
+  return null;
+}
+
+// 对单个 COS 对象做 Range GET(0-15B) 读魔数
+async function sniffOne(env, key) {
+  const cached = sniffCache.get(key);
+  if (cached && cached.t > Date.now()) return cached.type;
+  if (cached && cached.type === null && cached.attempts > 3) return null; // 之前嗅探失败过，不再重复打 COS
+
+  const rawEndpoint = (env.S3_ENDPOINT || '').trim().replace(/\/+$/, '');
+  const region = (env.REGION || '').trim();
+  const ak = (env.AWS_ACCESS_KEY_ID || '').trim();
+  const sk = (env.AWS_SECRET_ACCESS_KEY || '').trim();
+  const encodedPath = '/' + key.split('/').map(enc).join('/');
+  const targetUrl = new URL(encodedPath, rawEndpoint);
+  try {
+    const signedHeaders = await getS3v4Headers({ method: 'GET', url: targetUrl, region, accessKeyId: ak, secretAccessKey: sk });
+    const headersForFetch = { ...signedHeaders };
+    delete headersForFetch['host'];
+    delete headersForFetch['Host'];
+    headersForFetch['Range'] = 'bytes=0-15';
+    const res = await fetch(targetUrl.toString(), { method: 'GET', headers: headersForFetch, signal: AbortSignal.timeout(5000) });
+    if (!res.ok || (res.status !== 200 && res.status !== 206)) {
+      sniffCacheSet(key, { t: Date.now() + 3600000, type: null, attempts: (cached?.attempts || 0) + 1 });
+      return null;
+    }
+    const ab = await res.arrayBuffer();
+    const type = sniffTypeFromBytes(ab);
+    sniffCacheSet(key, { t: Date.now() + SNIFF_CACHE_TTL, type, attempts: 0 });
+    return type;
+  } catch (e) {
+    sniffCacheSet(key, { t: Date.now() + 3600000, type: null, attempts: (cached?.attempts || 0) + 1 });
+    return null;
+  }
+}
+
+// 只嗅探无法靠扩展名归类的文件；受限并发（同时 ≤4）+ 单次上限，避免瞬时打满 COS/超时
+async function sniffUnknownTypes(env, files) {
+  if (!files || files.length === 0) return;
+  const unknown = files.filter(f => f && f.key && !extGuessType(f.key.split('/').pop()));
+  if (unknown.length === 0) return;
+  const MAX_SNIFF = 24;   // 单次 list 最多嗅探 24 个（列表页已 ≥分页，防止极端目录拖慢响应）
+  const pool = unknown.slice(0, MAX_SNIFF);
+  let idx = 0;
+  const worker = async () => {
+    while (idx < pool.length) {
+      const cur = idx++;
+      const type = await sniffOne(env, pool[cur].key);
+      if (type) pool[cur].type = type;
+    }
+  };
+  await Promise.all([worker(), worker(), worker(), worker()]);
+}
+
 // 下载：经本 Worker 回源 COS（S3 签名 GET），不直连 COS 默认域名
-async function browseFetchFile(env, key, ctx) {
+async function browseFetchFile(env, key, ctx, method, range) {
+  method = method || 'GET';
+  range = range || '';
   const rawEndpoint = (env.S3_ENDPOINT || '').trim().replace(/\/+$/, '');
   const region = (env.REGION || '').trim();
   const ak = (env.AWS_ACCESS_KEY_ID || '').trim();
@@ -678,10 +1678,15 @@ async function browseFetchFile(env, key, ctx) {
   const encodedPath = '/' + key.split('/').map(enc).join('/');
   const targetUrl = new URL(encodedPath, rawEndpoint);
 
-  // Cache API 按 key 缓存（缩略图/预览会反复请求同一文件，7 天内只回源一次）
+  // Cache API 按 key 缓存（缩略图/预览会反复请求同一文件，7 天内只回源一次）。
+  // Range 请求（视频/音频流式播放、拖动 seek）跳过缓存：Cache API 不支持 206/Range，
+  // 且大视频不适合 Worker Cache。直接回源透传 Range，浏览器按段下载，首帧更快。
+  const isRange = range !== '';
   const cacheKey = new Request('https://' + new URL(rawEndpoint).host + '/_browse/' + encodedPath);
-  const cached = await caches.default.match(cacheKey);
-  if (cached) return cached;
+  if (!isRange) {
+    const cached = await caches.default.match(cacheKey);
+    if (cached) return cached;
+  }
 
   const signedHeaders = await getS3v4Headers({
     method: 'GET',
@@ -693,6 +1698,7 @@ async function browseFetchFile(env, key, ctx) {
   const headersForFetch = { ...signedHeaders };
   delete headersForFetch['host'];
   delete headersForFetch['Host'];
+  if (range) headersForFetch['Range'] = range;
 
   const res = await fetch(targetUrl.toString(), { method: 'GET', headers: headersForFetch, signal: AbortSignal.timeout(10000) });
   let final = res;
@@ -707,7 +1713,9 @@ async function browseFetchFile(env, key, ctx) {
   newHeaders.set('X-Content-Type-Options', 'nosniff');
   // 非 200 时标记上游状态：X-Upstream-Status 存在 = 429 来自 COS；不存在 = 429 来自 CF（worker 前被拒）
   if (!final.ok) newHeaders.set('X-Upstream-Status', String(final.status));
-  if (final.ok) {
+  // 只对 GET 写缓存：HEAD 无 body、Range 的 206 分段都不写入（否则污染同 key 的
+  // 完整 GET 缓存；视频等大文件也不适合 Worker Cache，交给 COS 回源）
+  if (final.ok && method === 'GET' && !isRange) {
     newHeaders.set('Cache-Control', 'private, max-age=604800');
     const cacheResp = new Response(final.body, { status: final.status, statusText: final.statusText, headers: newHeaders });
     ctx.waitUntil(caches.default.put(cacheKey, cacheResp.clone()));
@@ -717,436 +1725,1596 @@ async function browseFetchFile(env, key, ctx) {
 }
 
 // ---- 页面（全部 ASCII：中文/emoji 用 HTML 实体，免疫粘贴编码问题）----
-function browseLoginHtml(env) {
+
+// ===== BROWSE-PAGES-START =====
+// =====================================================================
+// 【文件浏览器】/browse —— Alist 风格个人只读网盘页面（登录页 + 主界面）
+// ---------------------------------------------------------------------
+// 参照 Alist 前端（AlistGo/alist-web，SolidJS + HopeUI）的设计语言重制：
+//   - 主色 #1890ff（getMainColor 默认值），页面背景 #f7f8fa，hover 底色
+//     rgba(132,133,141,0.18)，内容容器 min(99%, 980px)，字体栈与 Alist 一致；
+//   - 文件列表放在白色圆角卡片内（Obj 卡片风格，rounded 12px + 阴影）；
+//   - 网格卡片悬停 scale(1.05) + hover 底色，图标为主色单色 SVG；
+//   - 列表三列（名称 / 大小 / 修改时间），移动端隐藏修改时间列；
+//   - 文件大小格式同 Alist getFileSize（1.02K / 1.00M / 2.00G），
+//     时间格式 YYYY-MM-DD HH:MM:SS。
+// 新增（2026-09）：
+//   - 两步验证 2FA（TOTP）：首次登录主动弹出绑定提示；绑定后登录需
+//     「访问密码 + 动态验证码」；侧栏「安全」可重新绑定/关闭。
+//   - 临时网盘已拆分为独立入口 /temp（独立密码 TEMP_PASS、独立 KV、
+//     普通密码登录无 2FA）；本页面仅在顶栏保留入口按钮。
+//     临时网盘页面见本文件末尾 tempLoginHtml / tempIndexHtml。
+// 实现方式：本文件由 _parts/ 分块拼接（_build-pages.mjs），再由
+// _build-browse.mjs 合并进 cos-proxy-worker.js（原附件代理/签名/浏览后端
+// 逻辑保持逐字节不变）。中文/emoji 由构建器转成 <script> 内 \uXXXX、
+// 其余 HTML 实体，保证 served 页面纯 ASCII。手写模板时不要引入反引号
+// 与 ${}（页面内声明的插值除外），也不要在内联 JS 里写反斜杠正则。
+// =====================================================================
+async function browseLoginHtml(env) {
   const sitekey = (env && env.TURNSTILE_SITEKEY) || '';
   const tsScript = sitekey ? '<script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>' : '';
-  const tsWidget = sitekey ? '<div class="cf-turnstile" data-sitekey="' + sitekey + '" data-callback="onTs" style="margin-bottom:14px"></div>' : '';
+  const tsWidget = sitekey ? '<div class="cf-turnstile" data-sitekey="' + sitekey + '" data-callback="onTs"></div>' : '';
   const tsJs = sitekey ? '<script>function onTs(){var b=document.getElementById("loginBtn");if(b){b.disabled=false;}}</script>' : '';
+  // 已绑定 2FA 时显示动态验证码输入框（服务端渲染，避免前端多一次请求）
+  const bound = env.BROWSE_KV ? !!(await getTotp(env)) : false;
+  const codeField = bound ? '<input type="text" name="code" inputmode="numeric" autocomplete="one-time-code" maxlength="6" placeholder="动态验证码" required>' : '';
+  const subText = bound ? '已开启两步验证，请输入访问密码与动态验证码' : '输入访问密码以继续';
   return `<!DOCTYPE html>
-<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>&#x767B;&#x5F55; - COS &#x6587;&#x4EF6;&#x6D4F;&#x89C8;</title>
+<html lang="zh-CN"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#3573FF">
+<title>&#x767B;&#x5F55; &#xB7; COS &#x7F51;&#x76D8;</title>
+<style>
+:root{--primary:#3573FF;--text:#1f2329;--muted:#9aa0a8}
+body.dark{--primary:#4c8dff;--text:#e8eaed;--muted:#6b7280}
+*{box-sizing:border-box}
+body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif,"Apple Color Emoji","Segoe UI Emoji","Segoe UI Symbol";background:#f7f8fa;color:var(--text);display:flex;align-items:center;justify-content:center;min-height:100vh;padding:20px;transition:background .2s,color .2s}
+body.dark{background:#0f1013}
+.card{width:min(92vw,360px);background:#fff;border-radius:12px;padding:36px 30px 26px;box-shadow:0 10px 30px -5px rgba(0,0,0,.08);text-align:center}
+body.dark .card{background:#1b1d21;box-shadow:0 10px 30px -5px rgba(0,0,0,.5)}
+.logo{width:52px;height:52px;margin:0 auto 12px;color:var(--primary)}
+h1{font-size:21px;margin:0 0 6px;font-weight:700}
+.sub{font-size:13px;color:var(--muted);margin:0 0 24px}
+input[type=password],input[type=text]{width:100%;height:45px;border:1px solid #e4e7ec;border-radius:12px;padding:0 15px;font-size:15px;outline:none;background:#f7f8fa;margin-bottom:14px;color:var(--text);transition:border .15s,background .15s}
+input[type=password]:focus,input[type=text]:focus{border-color:var(--primary);background:#fff}
+body.dark input[type=password],body.dark input[type=text]{background:#232529;border-color:#2a2c30}
+body.dark input[type=password]:focus,body.dark input[type=text]:focus{background:#232529}
+.cf-turnstile{margin-bottom:14px;display:flex;justify-content:center}
+button[type=submit]{width:100%;height:45px;border:0;border-radius:12px;background:var(--primary);color:#fff;font-size:16px;font-weight:bold;cursor:pointer;transition:background .15s,opacity .15s}
+button[type=submit]:hover{background:#2B5CD9}
+button[type=submit]:active{background:#1E40AF}
+button[type=submit]:disabled{opacity:.5;cursor:not-allowed}
+.err{min-height:20px;margin:10px 0 0;font-size:13px;color:#e5484d;line-height:20px}
+.hint{margin-top:22px;font-size:11px;color:#b9bec6}
+body.dark .hint{color:#626a78}
+.theme-btn{position:fixed;top:14px;right:14px;width:36px;height:36px;border:0;border-radius:10px;background:#fff;color:#1f2329;font-size:16px;cursor:pointer;box-shadow:0 2px 8px rgba(0,0,0,.08)}
+body.dark .theme-btn{background:#1b1d21;color:#e8eaed}
+</style></head><body>
+<button class="theme-btn" id="themeBtn" title="&#x4E3B;&#x9898;">&#x1F319;</button>
+<div class="card">
+  <svg class="logo" viewBox="0 0 24 24" fill="currentColor"><path d="M19.35 10.04C18.67 6.59 15.64 4 12 4 9.11 4 6.6 5.64 5.35 8.04 2.34 8.36 0 10.91 0 14c0 3.31 2.69 6 6 6h13c2.76 0 5-2.24 5-5 0-2.64-2.05-4.78-4.65-4.96z"/></svg>
+  <h1>COS &#x7F51;&#x76D8;</h1>
+  <p class="sub">${subText}</p>
+  <form method="post" action="/browse/login" id="loginForm">
+    <input type="password" name="p" placeholder="&#x8BBF;&#x95EE;&#x5BC6;&#x7801;" required autofocus>
+    ${codeField}
+    ${tsWidget}
+    <button type="submit" id="loginBtn"${sitekey ? ' disabled' : ''}>&#x767B;&#x5F55;</button>
+  </form>
+  <div class="err" id="loginErr"></div>
+  <div class="hint">&#x53EA;&#x8BFB;&#x6D4F;&#x89C8; &middot; cos-exchange</div>
+</div>
 ${tsScript}
 ${tsJs}
-<style>
-body{font-family:system-ui,-apple-system,'PingFang SC','Microsoft YaHei',sans-serif;background:#f5f6f8;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0}
-.card{background:#fff;border-radius:12px;padding:32px;width:min(90vw,340px);box-shadow:0 4px 24px rgba(0,0,0,.08)}
-h1{font-size:18px;margin:0 0 20px;text-align:center;color:#1a1a2e}
-input{width:100%;box-sizing:border-box;padding:10px 12px;border:1px solid #ddd;border-radius:8px;margin-bottom:14px;font-size:15px}
-button{width:100%;padding:11px;border:0;border-radius:8px;background:#3b82f6;color:#fff;font-size:15px;cursor:pointer}
-button:disabled{opacity:.5;cursor:not-allowed}
-</style></head><body>
-<div class="card"><h1>&#x1F510; COS &#x6587;&#x4EF6;&#x6D4F;&#x89C8;</h1>
-<form method="post" action="/browse/login"><input type="password" name="p" placeholder="&#x8BBF;&#x95EE;&#x5BC6;&#x7801;" required autofocus>${tsWidget}<button type="submit" id="loginBtn"${sitekey ? ' disabled' : ''}>&#x767B; &#x5F55;</button></form>
-</div></body></html>`;
-}
-function browseIndexHtml() {
-  return `<!DOCTYPE html>
-<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>COS &#x6587;&#x4EF6;&#x6D4F;&#x89C8;</title>
-<style>
-:root{--bg:#f3f4f6;--card:#ffffff;--text:#1f2430;--muted:#9aa3b2;--line:#e5e7eb;--accent:#3b82f6;--shadow:0 1px 4px rgba(0,0,0,.06)}
-body.dark{--bg:#0f1115;--card:#191c23;--text:#e6e9ef;--muted:#8a93a5;--line:#262b34;--accent:#60a5fa;--shadow:0 1px 4px rgba(0,0,0,.4)}
-*{box-sizing:border-box}
-body{font-family:system-ui,-apple-system,'PingFang SC','Microsoft YaHei',sans-serif;background:var(--bg);color:var(--text);margin:0;transition:background .2s,color .2s}
-header{position:sticky;top:0;z-index:20;background:var(--card);border-bottom:1px solid var(--line);padding:10px 14px;display:flex;align-items:center;gap:10px}
-header h1{font-size:16px;margin:0;flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.iconbtn{border:1px solid var(--line);background:var(--card);color:var(--text);border-radius:8px;padding:6px 10px;font-size:13px;cursor:pointer}
-.toolbar{position:sticky;top:49px;z-index:15;background:var(--bg);padding:8px 14px;display:flex;flex-wrap:wrap;gap:8px;align-items:center;border-bottom:1px solid var(--line)}
-.search{flex:1 1 140px;min-width:110px;padding:7px 10px;border:1px solid var(--line);border-radius:8px;background:var(--card);color:var(--text);font-size:14px}
-.chips{display:flex;gap:6px;flex-wrap:wrap}
-.chip{border:1px solid var(--line);background:var(--card);color:var(--text);border-radius:999px;padding:5px 11px;font-size:12px;cursor:pointer}
-.chip.on{background:var(--accent);border-color:var(--accent);color:#fff}
-select{padding:6px 8px;border:1px solid var(--line);border-radius:8px;background:var(--card);color:var(--text);font-size:12px}
-#crumbs{padding:8px 14px;font-size:13px;background:var(--card);border-bottom:1px solid var(--line);overflow-x:auto;white-space:nowrap}
-#crumbs .crumb{color:var(--accent);cursor:pointer;margin-right:6px}
-#grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:12px;padding:4px 0 0}
-.card{background:var(--card);border:1px solid var(--line);border-radius:12px;overflow:hidden;cursor:pointer;box-shadow:var(--shadow);position:relative}
-.card:hover{border-color:var(--accent)}
-.cimg{width:100%;aspect-ratio:1;object-fit:cover;background:var(--bg);display:block}
-.cicon{width:100%;aspect-ratio:1;display:flex;align-items:center;justify-content:center;font-size:46px;background:var(--bg)}
-.cbody{padding:8px 10px}
-.cname{font-size:13px;word-break:break-all;line-height:1.35;max-height:2.7em;overflow:hidden}
-.cmeta{font-size:11px;color:var(--muted);margin-top:4px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.dl{position:absolute;top:8px;right:8px;width:30px;height:30px;border-radius:8px;border:0;background:rgba(0,0,0,.45);color:#fff;font-size:15px;cursor:pointer;z-index:5}
-#loadmore{display:block;width:min(380px,88%);margin:14px auto;padding:10px;border:1px solid var(--line);background:var(--card);border-radius:10px;color:var(--accent);font-size:14px;cursor:pointer}
-#status{text-align:center;color:var(--muted);font-size:13px;padding:30px}
-#lightbox{position:fixed;inset:0;background:rgba(0,0,0,.93);z-index:100;display:none}
-#lightbox.show{display:block}
-#lightbox img{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);max-width:94vw;max-height:84vh;object-fit:contain;border-radius:4px}
-.lbbtn{position:fixed;z-index:101;border:0;background:rgba(255,255,255,.16);color:#fff;font-size:22px;width:44px;height:44px;border-radius:50%;cursor:pointer}
-.lb-close{top:14px;right:14px}
-.lb-prev{left:12px;top:50%;transform:translateY(-50%)}
-.lb-next{right:12px;top:50%;transform:translateY(-50%)}
-#lbcap{position:fixed;bottom:16px;left:0;right:0;text-align:center;color:#ccc;font-size:13px;z-index:101;padding:0 70px;word-break:break-all}
-#modal{position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:90;display:none;align-items:center;justify-content:center;padding:16px}
-#modal.show{display:flex}
-#modal .box{background:var(--card);color:var(--text);border-radius:12px;width:min(94vw,860px);max-height:92vh;display:flex;flex-direction:column;overflow:hidden}
-#modal .head{display:flex;align-items:center;padding:10px 14px;border-bottom:1px solid var(--line);gap:10px}
-#modal .t{flex:1;font-size:14px;word-break:break-all}
-#modal .body{flex:1;overflow:auto;min-height:180px;background:var(--card)}
-#modal iframe,#modal video,#modal audio{width:100%;border:0;display:block;background:#000}
-#modal pre{margin:0;padding:14px;font-size:13px;white-space:pre-wrap;word-break:break-all;font-family:ui-monospace,Consolas,monospace;background:var(--bg);color:var(--text)}
-.layout{display:flex;max-width:1180px;margin:0 auto}
-.main{flex:1;min-width:0;padding:0 6px}
-#side{width:258px;flex-shrink:0;padding:12px;display:none;align-self:flex-start;position:sticky;top:108px}
-#side.show{display:block}
-#side .side-thumb{width:100%;aspect-ratio:1;object-fit:cover;border-radius:12px;background:var(--bg)}
-#side .side-ic{width:100%;aspect-ratio:1;display:flex;align-items:center;justify-content:center;font-size:64px;background:var(--bg);border-radius:12px}
-#side .sname{font-size:14px;font-weight:600;margin:10px 0 6px;word-break:break-all}
-#side .smeta{font-size:12px;color:var(--muted);line-height:1.9;word-break:break-all}
-#side .sbtns{display:flex;gap:6px;margin-top:10px;flex-wrap:wrap}
-#side .sbtns .btn{flex:1;text-align:center;min-width:64px}
-#viewbar{display:flex;gap:6px;align-items:center;padding:6px 0}
-#tableWrap{overflow-x:auto;border:1px solid var(--line);border-radius:10px;background:var(--card)}
-#table{width:100%;border-collapse:collapse;font-size:13px}
-#table th,#table td{padding:8px 10px;border-bottom:1px solid var(--line);text-align:left;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-#table thead th{background:var(--card);color:var(--muted);font-size:12px;font-weight:700;cursor:pointer;user-select:none;border-bottom:2px solid var(--line)}
-#table thead th:hover{color:var(--accent)}
-#table tr{cursor:pointer}
-#table tr:hover{background:var(--bg)}
-#table tr.sel{background:var(--accent);color:#fff}
-#table tr.sel .tmeta{color:#fff}
-#table tbody tr:last-child td{border-bottom:0}
-#table .tname{max-width:46vw;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-#table .tthumb{width:28px;height:28px;object-fit:cover;border-radius:6px;vertical-align:middle;margin-right:8px;background:var(--bg)}
-@media (max-width:900px){#side{position:fixed;right:0;top:0;bottom:0;width:280px;z-index:80;background:var(--card);box-shadow:-8px 0 24px rgba(0,0,0,.25);overflow:auto}}
-footer{position:fixed;bottom:0;left:0;right:0;text-align:center;font-size:11px;color:var(--muted);padding:6px;background:var(--bg)}
-</style></head><body>
-<header><h1>&#x1F4C1; COS &#x6587;&#x4EF6;&#x6D4F;&#x89C8;</h1><button class="iconbtn" id="modeBtn" title="&#x6DF1;&#x8272;&#x6A21;&#x5F0F;">&#x1F319;</button></header>
-<div class="toolbar">
-  <input class="search" id="search" placeholder="&#x641C;&#x7D22;&#x6587;&#x4EF6;&#x540D;..." autocomplete="off">
-  <div class="chips" id="chips">
-    <span class="chip on" data-f="all">&#x5168;&#x90E8;</span>
-    <span class="chip" data-f="img">&#x56FE;&#x7247;</span>
-    <span class="chip" data-f="vid">&#x89C6;&#x9891;</span>
-    <span class="chip" data-f="doc">&#x6587;&#x6863;</span>
-    <span class="chip" data-f="arc">&#x538B;&#x7F29;&#x5305;</span>
-    <span class="chip" data-f="oth">&#x5176;&#x4ED6;</span>
-  </div>
-  <select id="sort">
-    <option value="name-asc">&#x540D;&#x79F0; &#x2191;</option>
-    <option value="name-desc">&#x540D;&#x79F0; &#x2193;</option>
-    <option value="size-desc" selected>&#x5927;&#x5C0F; &#x2193;</option>
-    <option value="size-asc">&#x5927;&#x5C0F; &#x2191;</option>
-    <option value="time-desc">&#x4FEE;&#x6539;&#x65F6;&#x95F4; &#x2193;</option>
-    <option value="time-asc">&#x4FEE;&#x6539;&#x65F6;&#x95F4; &#x2191;</option>
-  </select>
-  <button class="iconbtn" id="upBtn" title="&#x8FD4;&#x56DE;&#x4E0A;&#x7EA7;">&#x2B06;&#xFE0F;</button>
-</div>
-<div class="layout">
-  <div class="main">
-    <div id="crumbs"></div>
-    <div id="viewbar"><button class="iconbtn" id="viewBtn">&#x8868;&#x683C;</button></div>
-    <div id="grid"><div id="status">&#x52A0;&#x8F7D;&#x4E2D;&#x2026;</div></div>
-    <div id="tableWrap" style="display:none"><table id="table"><thead><tr><th data-s="name">&#x540D;&#x79F0;</th><th data-s="size">&#x5927;&#x5C0F;</th><th data-s="time">&#x4FEE;&#x6539;&#x65F6;&#x95F4;</th><th>&#x7C7B;&#x578B;</th></tr></thead><tbody id="tbody"></tbody></table></div>
-  </div>
-  <aside id="side"></aside>
-</div>
-<footer>&#x53EA;&#x8BFB;&#x6D4F;&#x89C8; &#xB7; cos-exchange</footer>
-<div id="lightbox"><button class="lbbtn lb-close">&#x2715;</button><button class="lbbtn lb-prev">&#x2039;</button><img id="lbImg" alt=""><button class="lbbtn lb-next">&#x203A;</button><div id="lbcap"></div></div>
-<div id="modal"><div class="box"><div class="head"><span class="t" id="modalTitle"></span><button class="iconbtn" id="modalClose">&#x5173;&#x95ED;</button></div><div class="body" id="modalBody"></div></div></div>
 <script>
-let prefix = '';
-let token = '';
-let truncated = false;
-let filter = 'all';
-let keyword = '';
-let sortVal = 'size-desc';
-let allData = null;
-let imgs = [];
-let imgIdx = 0;
-const $ = id => document.getElementById(id);
-const esc = s => String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/'/g,'&#39;').replace(/"/g,'&quot;');
-const escAttr = s => String(s).replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;');
-const IMG = ['png','jpg','jpeg','gif','webp','bmp','svg'];
-const VID = ['mp4','mkv','mov','avi','webm','m4v'];
-const AUD = ['mp3','wav','flac','ogg','m4a'];
-const DOC = ['pdf','doc','docx','xls','xlsx','ppt','pptx','txt','md','csv','json','html','htm'];
-const ARC = ['zip','rar','7z','tar','gz','bz2','xz'];
-const icons = {jpg:'&#x1F5BC;&#xFE0F;',jpeg:'&#x1F5BC;&#xFE0F;',png:'&#x1F5BC;&#xFE0F;',gif:'&#x1F5BC;&#xFE0F;',webp:'&#x1F5BC;&#xFE0F;',bmp:'&#x1F5BC;&#xFE0F;',svg:'&#x1F5BC;&#xFE0F;',pdf:'&#x1F4D5;',zip:'&#x1F5DC;&#xFE0F;',rar:'&#x1F5DC;&#xFE0F;','7z':'&#x1F5DC;&#xFE0F;',tar:'&#x1F5DC;&#xFE0F;',gz:'&#x1F5DC;&#xFE0F;',mp3:'&#x1F3B5;',wav:'&#x1F3B5;',flac:'&#x1F3B5;',ogg:'&#x1F3B5;',mp4:'&#x1F3AC;',mkv:'&#x1F3AC;',mov:'&#x1F3AC;',avi:'&#x1F3AC;',webm:'&#x1F3AC;',doc:'&#x1F4C4;',docx:'&#x1F4C4;',txt:'&#x1F4C3;',md:'&#x1F4C3;',csv:'&#x1F4C3;',xls:'&#x1F4CA;',xlsx:'&#x1F4CA;',ppt:'&#x1F4FD;&#xFE0F;',pptx:'&#x1F4FD;&#xFE0F;',html:'&#x1F310;',htm:'&#x1F310;',exe:'&#x2699;&#xFE0F;',apk:'&#x1F4F1;'};
-const ext = n => (n.split('.').pop() || '').toLowerCase();
-const iconOf = n => icons[ext(n)] || '&#x1F4E6;';
-const fmt = s => s < 1024 ? s+' B' : s < 1048576 ? (s/1024).toFixed(1)+' KB' : (s/1048576).toFixed(1)+' MB';
-const fmtT = t => { if(!t) return ''; const d = new Date(t); if(isNaN(d)) return ''; const p = n => String(n).padStart(2,'0'); return d.getFullYear()+'-'+p(d.getMonth()+1)+'-'+p(d.getDate())+' '+p(d.getHours())+':'+p(d.getMinutes()); };
-const urlOf = k => '/browse/api/file?key=' + encodeURIComponent(k);
-const typeOf = n => { const e = ext(n); if(IMG.includes(e)) return 'img'; if(VID.includes(e)||AUD.includes(e)) return 'vid'; if(DOC.includes(e)) return 'doc'; if(ARC.includes(e)) return 'arc'; return 'oth'; };
-async function load(reset) {
-  if (reset) { token = ''; truncated = false; }
-  const q = new URLSearchParams({prefix});
-  if (token) q.set('token', token);
-  $('grid').innerHTML = '<div id="status">&#x52A0;&#x8F7D;&#x4E2D;&#x2026;</div>';
-  try {
-    const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), 15000);
-    const res = await fetch('/browse/api/list?' + q, { signal: ctrl.signal });
-    clearTimeout(timer);
-    if (res.status === 429) {
-      $('grid').innerHTML = '<div id="status">&#x8BF7;&#x6C42;&#x8FC7;&#x4E8E;&#x9891;&#x7E41;(429)&#xFF0C;&#x7A0D;&#x540E;&#x81EA;&#x52A8;&#x91CD;&#x8BD5;&#x2026;</div>';
-      setTimeout(() => load(reset), 4000);
-      return;
-    }
-    if (!res.ok) {
-      $('grid').innerHTML = '<div id="status">&#x52A0;&#x8F7D;&#x5931;&#x8D25;(HTTP ' + res.status + ')</div>';
-      return;
-    }
-    let data;
-    try { data = await res.json(); } catch (e) {
-      $('grid').innerHTML = '<div id="status">&#x52A0;&#x8F7D;&#x5931;&#x8D25;(&#x4E0D;&#x662F;&#x6709;&#x6548;&#x54CD;&#x5E94;) HTTP ' + res.status + '</div>';
-      return;
-    }
-    if (data.error) { $('grid').innerHTML = '<div id="status">&#x52A0;&#x8F7D;&#x5931;&#x8D25;: ' + esc(data.error) + '</div>'; return; }
-    allData = data;
-    truncated = data.truncated;
-    token = data.token || '';
-    render();
-  } catch (e) {
-    $('grid').innerHTML = '<div id="status">&#x52A0;&#x8F7D;&#x5931;&#x8D25;: ' + esc(String((e && e.message) || e)) + '</div>';
-  }
+var btn=document.getElementById('loginBtn');
+var form=document.getElementById('loginForm');
+var err=document.getElementById('loginErr');
+var original=btn.textContent;
+function onTs(){ if(btn){ btn.disabled=false; } }
+function setDark(d){
+  document.body.classList.toggle('dark',d);
+  try{ localStorage.setItem('browseLoginDark',d?'1':'0'); }catch(e){}
+  var b=document.getElementById('themeBtn');
+  if(b){ b.innerHTML=d?'&#x2600;&#xFE0F;':'&#x1F319;'; }
 }
-
-function visibleList() {
-  let list = [];
-  for (const f of (allData.files || [])) {
-    const name = f.key.split('/').pop();
-    list.push({ key: f.key, name, size: f.size || 0, mtime: f.mtime || '', type: typeOf(name) });
-  }
-  if (filter !== 'all') list = list.filter(o => o.type === filter);
-  if (keyword) { const kw = keyword.toLowerCase(); list = list.filter(o => o.name.toLowerCase().includes(kw)); }
-  const [field, dir] = sortVal.split('-');
-  const mul = dir === 'asc' ? 1 : -1;
-  list.sort((a, b) => {
-    if (field === 'size') return (a.size - b.size) * mul;
-    if (field === 'time') return (a.mtime < b.mtime ? -1 : a.mtime > b.mtime ? 1 : 0) * mul;
-    return a.name.localeCompare(b.name) * mul;
+try{
+  var saved=localStorage.getItem('browseLoginDark');
+  setDark(saved==='1'||(saved===null&&window.matchMedia&&window.matchMedia('(prefers-color-scheme: dark)').matches));
+}catch(e){}
+var tb=document.getElementById('themeBtn');
+if(tb){ tb.onclick=function(){ setDark(!document.body.classList.contains('dark')); }; }
+form.addEventListener('submit',function(ev){
+  ev.preventDefault();
+  if(btn.disabled){ return; }
+  btn.disabled=true;
+  btn.textContent='\\u767B\\u5F55\\u4E2D\\u2026';
+  var fd=new FormData(form);
+  fetch(form.action,{method:'POST',body:fd,credentials:'same-origin'})
+  .then(function(r){
+    if(r.redirected||(r.ok&&r.url.indexOf('/browse')>=0)){ window.location.href='/browse'; return null; }
+    return r.text().then(function(t){ return {status:r.status,text:t}; });
+  })
+  .then(function(o){
+    if(!o){ return; }
+    if(o.status===429){ err.innerHTML='\\u8BF7\\u6C42\\u8FC7\\u4E8E\\u9891\\u7E41\\uFF0C\\u8BF7\\u7A0D\\u540E\\u518D\\u8BD5'; }
+    else if(o.text){ err.innerHTML=o.text; }
+    else { err.innerHTML='\\u767B\\u5F55\\u5931\\u8D25\\uFF0C\\u8BF7\\u91CD\\u8BD5'; }
+    btn.disabled=false;
+    btn.textContent=original;
+  })
+  .catch(function(){
+    err.innerHTML='\\u7F51\\u7EDC\\u9519\\u8BEF\\uFF0C\\u8BF7\\u91CD\\u8BD5';
+    btn.disabled=false;
+    btn.textContent=original;
+  });
+});
+</script>
+</body></html>`;
+}
+function browseIndexHtml(cfg) {
+  const cfgJson = JSON.stringify(cfg || {}).replace(/</g, '\\u003c');
+  const tempBtnHtml = (cfg && cfg.tempEnabled)
+    ? '<a class="iconbtn" href="/temp" title="临时网盘" style="text-decoration:none"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M11.99 2C6.47 2 2 6.48 2 12s4.47 10 9.99 10C17.52 22 22 17.52 22 12S17.52 2 11.99 2zM12 20c-4.42 0-8-3.58-8-8s3.58-8 8-8 8 3.58 8 8-3.58 8-8 8zm.5-13H11v6l5.25 3.15.75-1.23-4.5-2.67z"/></svg></a>'
+    : '';
+  return `<!DOCTYPE html>
+<html lang="zh-CN"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#1890ff">
+<title>COS &#x7F51;&#x76D8;</title>
+<style>
+:root{--primary:#1890ff;--primary-weak:rgba(24,144,255,.15);--bg:#f7f8fa;--card:#ffffff;--text:#1f2329;--sub:#7a828e;--muted:#9aa0a8;--hover:rgba(132,133,141,0.18);--line:rgba(0,0,0,.08);--shadow:0 10px 30px -5px rgba(0,0,0,.08);--radius:12px}
+body.dark{--primary:#4d9fff;--primary-weak:rgba(77,159,255,.15);--bg:#0f1013;--card:#1b1d21;--text:#e8eaed;--sub:#9aa0aa;--muted:#6b7280;--hover:rgba(255,255,255,.12);--line:rgba(255,255,255,.08);--shadow:0 10px 30px -5px rgba(0,0,0,.5)}
+*{box-sizing:border-box}
+html,body{margin:0;padding:0}
+body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif,"Apple Color Emoji","Segoe UI Emoji","Segoe UI Symbol";background:var(--bg);color:var(--text);-webkit-font-smoothing:antialiased;transition:background .2s,color .2s}
+button{font-family:inherit;color:var(--text);cursor:pointer}
+.topbar{position:sticky;top:0;z-index:60;display:flex;align-items:center;height:60px;padding:0 12px;background:var(--bg);transition:background .2s}
+.brand{display:flex;align-items:center;gap:10px;font-size:16px;font-weight:700;cursor:pointer;user-select:none;white-space:nowrap}
+.brand .logo{width:30px;height:30px;color:var(--primary)}
+.hright{display:flex;align-items:center;gap:8px;margin-left:auto}
+.pill{display:inline-flex;align-items:center;gap:6px;height:34px;padding:0 12px;border:0;border-radius:8px;background:var(--primary-weak);color:var(--primary);font-size:14px;cursor:pointer;transition:background .15s}
+.pill:hover{background:rgba(24,144,255,.25)}
+body.dark .pill:hover{background:rgba(77,159,255,.25)}
+.pill svg{width:16px;height:16px}
+.pill .kbd{font-size:11px;opacity:.75;border:1px solid currentColor;border-radius:4px;padding:0 4px;font-family:inherit}
+.iconbtn{width:34px;height:34px;border:0;border-radius:8px;background:transparent;color:var(--sub);font-size:16px;display:inline-flex;align-items:center;justify-content:center;transition:background .15s,color .15s}
+.iconbtn:hover{background:var(--hover);color:var(--text)}
+.iconbtn:active{transform:scale(.94)}
+.iconbtn svg{width:18px;height:18px}
+.layout{display:flex;max-width:min(99%,980px);margin:0 auto;min-height:calc(100vh - 60px);padding:0 12px 30px;gap:14px}
+.sidebar{width:180px;flex-shrink:0;padding:16px 6px 12px;display:flex;flex-direction:column}
+.sb-item{display:flex;align-items:center;gap:10px;padding:9px 12px;border-radius:8px;font-size:14px;color:var(--sub);cursor:pointer;user-select:none;transition:background .15s,color .15s}
+.sb-item .sic{width:20px;text-align:center;font-size:16px;flex-shrink:0}
+.sb-item:hover{background:var(--hover);color:var(--text)}
+.sb-item.on{background:var(--primary-weak);color:var(--primary);font-weight:600}
+.sb-foot{margin-top:auto;padding:12px 8px 2px;font-size:11px;color:var(--muted)}
+.main{flex:1;min-width:0}
+.crumbs{display:flex;align-items:center;gap:2px;padding:16px 0 10px;font-size:15px;overflow-x:auto;white-space:nowrap;scrollbar-width:none}
+.crumbs::-webkit-scrollbar{display:none}
+.crumb{display:inline-flex;align-items:center;gap:4px;color:var(--text);cursor:pointer;padding:4px 6px;border-radius:6px}
+.crumb:hover{background:var(--hover)}
+.crumb .cico{display:inline-flex;color:var(--primary)}
+.crumb .cico svg{width:17px;height:17px}
+.crumb.last{font-weight:600;cursor:default}
+.crumb.last:hover{background:transparent}
+.csep{color:var(--muted);margin:0 2px;user-select:none}
+.searchbar{padding:0 0 10px}
+.searchbar input{width:100%;height:40px;border:1px solid var(--line);border-radius:10px;background:var(--card);color:var(--text);padding:0 14px;font-size:14px;outline:none;transition:border .15s}
+.searchbar input:focus{border-color:var(--primary)}
+.toolbar{display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:2px 0 10px}
+.tleft{display:flex;align-items:center;gap:6px;margin-right:auto}
+select{height:32px;border:1px solid var(--line);border-radius:8px;background:var(--card);color:var(--text);font-size:13px;padding:0 6px;outline:none;cursor:pointer}
+.chips{display:flex;gap:6px;flex-wrap:wrap;align-items:center}
+.chip{height:28px;padding:0 11px;border:1px solid var(--line);border-radius:999px;background:var(--card);color:var(--sub);font-size:12px;display:inline-flex;align-items:center;cursor:pointer;transition:all .15s;user-select:none}
+.chip:hover{color:var(--text);border-color:var(--primary)}
+.chip.on{background:var(--primary);border-color:var(--primary);color:#fff;font-weight:600}
+.objcard{background:var(--card);border-radius:var(--radius);padding:10px;box-shadow:var(--shadow);transition:background .2s,box-shadow .2s}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(110px,1fr));gap:6px}
+.item{position:relative;padding:6px 4px;border-radius:8px;cursor:pointer;text-align:center;user-select:none;transition:background .15s,transform .1s;animation:itemIn .2s ease}
+.item:hover{background:var(--hover);transform:scale(1.05)}
+.item:active{transform:scale(.98)}
+@keyframes itemIn{from{opacity:0;transform:scale(.9)}to{opacity:1;transform:scale(1)}}
+.it-ic{height:90px;display:flex;align-items:center;justify-content:center;color:var(--primary);overflow:hidden}
+.it-ic svg{width:60px;height:60px}
+.it-ic img.it-img{width:100%;height:100%;object-fit:cover;border-radius:8px;display:block}
+.it-name{font-size:14px;line-height:1.4;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;padding:0 2px;margin-top:2px}
+.it-more{position:absolute;top:4px;right:4px;width:26px;height:26px;border:0;border-radius:7px;background:rgba(0,0,0,.45);color:#fff;font-size:14px;line-height:1;cursor:pointer;opacity:0;transition:opacity .15s;z-index:3}
+.item:hover .it-more,.item:focus-within .it-more{opacity:1}
+@media (hover:none){.it-more{opacity:.9}}
+.lhead{display:flex;align-items:center;gap:8px;padding:8px 12px;color:var(--muted);font-size:14px;font-weight:700;border-bottom:1px solid var(--line)}
+.lhead .lcol{cursor:pointer;user-select:none;white-space:nowrap}
+.lhead .lcol:hover{color:var(--primary)}
+.lname{flex:1;min-width:0;display:flex;align-items:center;gap:10px;overflow:hidden}
+.lhead .lname{cursor:pointer;user-select:none;white-space:nowrap}
+.lhead .lname:hover{color:var(--primary)}
+.lname .lic{flex-shrink:0;color:var(--primary);display:inline-flex}
+.lname .lic svg{width:22px;height:22px}
+.lname .lnm{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.lrow{display:flex;align-items:center;gap:8px;padding:10px 12px;border-radius:8px;cursor:pointer;transition:background .15s;animation:itemIn .2s ease}
+.lrow:hover{background:var(--hover)}
+.lrow.act{background:var(--hover)}
+.lsize{width:28%;text-align:right;flex-shrink:0;color:var(--sub);font-size:14px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.lmod{width:24%;text-align:right;flex-shrink:0;color:var(--muted);font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.status{display:flex;flex-direction:column;align-items:center;gap:12px;padding:46px 0;color:var(--muted);font-size:14px}
+.spinner{width:26px;height:26px;border:3px solid var(--line);border-top-color:var(--primary);border-radius:50%;animation:spin .8s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+.pager{padding:6px 0 2px}
+.pagerbar{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;padding:10px 2px 6px}
+.pg-nav{display:flex;align-items:center;gap:4px;flex-wrap:wrap}
+.pg-btn{min-width:30px;height:30px;padding:0 8px;border:1px solid var(--line);border-radius:8px;background:var(--card);color:var(--sub);font-size:13px;cursor:pointer;transition:all .15s;line-height:1}
+.pg-btn:hover{border-color:var(--primary);color:var(--primary)}
+.pg-btn.cur{background:var(--primary);border-color:var(--primary);color:#fff;font-weight:600}
+.pg-dots{color:var(--muted);padding:0 2px;user-select:none}
+#perPageSel{height:30px;border:1px solid var(--line);border-radius:8px;background:var(--card);color:var(--text);font-size:13px;padding:0 6px;outline:none;cursor:pointer}
+.pg-goto{display:inline-flex;align-items:center;gap:4px;color:var(--muted);font-size:13px;margin-left:6px;white-space:nowrap}
+.pg-goto input{width:52px;height:30px;border:1px solid var(--line);border-radius:8px;background:var(--card);color:var(--text);font-size:13px;text-align:center;outline:none;padding:0 4px;-moz-appearance:textfield}
+.pg-goto input::-webkit-outer-spin-button,.pg-goto input::-webkit-inner-spin-button{-webkit-appearance:none;margin:0}
+.pg-goto input:focus{border-color:var(--primary)}
+.pg-goto .pg-btn{min-width:auto;padding:0 10px}
+.footer{text-align:center;font-size:12px;color:var(--muted);padding:20px 0 6px}
+#lightbox{position:fixed;inset:0;background:rgba(0,0,0,.94);z-index:120;display:none;flex-direction:column}
+#lightbox.show{display:flex}
+.lb-top{position:absolute;top:0;left:0;right:0;display:flex;align-items:center;padding:10px 12px;color:#fff;z-index:2}
+.lb-cap{flex:1;font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;padding:0 10px}
+.lb-btn{width:40px;height:40px;border:0;border-radius:50%;background:rgba(255,255,255,.14);color:#fff;font-size:18px;cursor:pointer;flex-shrink:0;display:inline-flex;align-items:center;justify-content:center}
+.lb-btn:hover{background:rgba(255,255,255,.28)}
+#lbImg{flex:1;min-height:0;object-fit:contain;max-width:100%;max-height:100%;margin:auto}
+.lb-nav{position:absolute;top:50%;transform:translateY(-50%);z-index:2}
+.lb-prev{left:12px}
+.lb-next{right:12px}
+#sheet{position:fixed;left:0;right:0;bottom:0;z-index:110;background:var(--card);border-radius:16px 16px 0 0;box-shadow:0 -8px 30px rgba(0,0,0,.22);max-height:90vh;display:flex;flex-direction:column;transform:translateY(104%);transition:transform .28s ease;visibility:hidden}
+#sheet.show{transform:none;visibility:visible}
+.sh-grab{width:36px;height:4px;border-radius:2px;background:var(--line);margin:8px auto 2px}
+.sh-head{display:flex;align-items:center;gap:10px;padding:8px 16px 10px;border-bottom:1px solid var(--line)}
+.sh-title{flex:1;font-size:15px;font-weight:600;word-break:break-all;line-height:1.4;max-height:2.8em;overflow:hidden}
+.sh-body{flex:1;overflow:auto;padding:14px 16px 6px;min-height:120px}
+.sh-meta{font-size:12px;color:var(--sub);line-height:2;word-break:break-all}
+.sh-meta b{color:var(--muted);font-weight:500;display:inline-block;min-width:64px}
+.sh-actions{display:flex;gap:8px;padding:12px 16px calc(14px + env(safe-area-inset-bottom))}
+.btn{flex:1;height:38px;border:1px solid var(--line);border-radius:8px;background:var(--card);color:var(--text);font-size:13px;display:inline-flex;align-items:center;justify-content:center;gap:5px;transition:background .15s}
+.btn:hover{background:var(--hover)}
+.btn.primary{background:var(--primary);border-color:var(--primary);color:#fff}
+.btn.primary:hover{filter:brightness(1.06)}
+.preview{background:#000;border-radius:10px;overflow:hidden;margin:0 0 12px;min-height:60px}
+.preview img{display:block;max-width:100%;max-height:56vh;object-fit:contain;margin:0 auto}
+.preview video,.preview audio{width:100%;max-height:56vh;border:0;display:block}
+.preview iframe{width:100%;height:56vh;border:0;background:#fff;display:block}
+.preview pre{margin:0;padding:12px;font-size:12.5px;white-space:pre-wrap;word-break:break-all;font-family:ui-monospace,Consolas,'Courier New',monospace;background:var(--bg);color:var(--text);max-height:48vh;overflow:auto}
+.preview .ph{color:#c5c9d0;text-align:center;padding:30px 12px;font-size:13px}
+.preview .ph .big{width:44px;height:44px;display:inline-block;color:#fff;margin-bottom:8px}
+#toast{position:fixed;left:50%;bottom:26px;transform:translateX(-50%) translateY(20px);background:rgba(20,22,26,.92);color:#fff;padding:9px 16px;border-radius:10px;font-size:13px;opacity:0;pointer-events:none;transition:all .25s;z-index:200;max-width:86vw;text-align:center}
+#toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
+.scrim{position:fixed;inset:0;background:rgba(0,0,0,.45);z-index:75;opacity:0;pointer-events:none;transition:opacity .25s}
+.scrim.show{opacity:1;pointer-events:auto}
+@media (max-width:760px){
+  #menuBtn{display:inline-flex}
+  .sidebar{position:fixed;left:0;top:0;bottom:0;width:240px;z-index:85;background:var(--card);border-right:0;box-shadow:8px 0 30px rgba(0,0,0,.25);transform:translateX(-104%);transition:transform .28s ease;padding-top:20px}
+  .sidebar.open{transform:none}
+  .sb-foot{display:none}
+  .brand .bname{display:none}
+  .layout{padding:0 6px 20px;gap:0}
+  .grid{grid-template-columns:repeat(auto-fill,minmax(90px,1fr));gap:4px}
+  .item{padding:4px 2px}
+  .it-ic{height:72px}
+  .it-ic svg{width:50px;height:50px}
+  .it-name{font-size:13px}
+  .lsize{width:76px}
+  .lmod{display:none}
+  .crumbs{padding:12px 0 8px;font-size:14px}
+  .pill .kbd{display:none}
+  .searchbar input{height:38px}
+}
+@media (min-width:761px){
+  #menuBtn{display:none}
+  #sheet{left:50%;right:auto;bottom:auto;top:50%;transform:translate(-50%,-50%) scale(.96);width:min(560px,94vw);max-height:88vh;border-radius:16px;visibility:hidden}
+  #sheet.show{transform:translate(-50%,-50%) scale(1)}
+  .sh-grab{display:none}
+}
+.modal{position:fixed;inset:0;background:rgba(0,0,0,.45);z-index:130;display:none;align-items:center;justify-content:center;padding:18px}
+.modal.show{display:flex}
+.modal-box{width:min(520px,94vw);max-height:88vh;overflow:auto;background:var(--card);border-radius:14px;box-shadow:var(--shadow);display:flex;flex-direction:column}
+.modal-head{display:flex;align-items:center;gap:8px;padding:14px 16px;border-bottom:1px solid var(--line)}
+.modal-title{flex:1;font-size:15px;font-weight:600}
+.modal-body{padding:14px 16px;font-size:13px;color:var(--text)}
+.modal-foot{display:flex;gap:8px;padding:12px 16px calc(12px + env(safe-area-inset-bottom));border-top:1px solid var(--line)}
+.mstep{margin:0 0 12px;line-height:1.8;color:var(--sub)}
+.mstep input{height:38px;border:1px solid var(--line);border-radius:8px;background:var(--bg);color:var(--text);padding:0 10px;font-size:15px;outline:none;width:150px;letter-spacing:2px;margin-left:6px}
+.mstep input:focus{border-color:var(--primary)}
+.msecret{display:flex;align-items:center;gap:8px;margin:0 0 12px;flex-wrap:wrap}
+.msecret code{flex:1;min-width:180px;background:var(--bg);border:1px dashed var(--line);border-radius:8px;padding:9px 10px;font-family:ui-monospace,Consolas,'Courier New',monospace;font-size:13px;word-break:break-all;user-select:all;color:var(--text)}
+.muri{margin:0 0 12px;word-break:break-all;font-size:12px}
+.muri a{color:var(--primary)}
+.merr{min-height:18px;color:#e5484d;font-size:12px}
+</style></head><body>
+<header class="topbar">
+  <button class="iconbtn" id="menuBtn" title="&#x83DC;&#x5355;">&#x2630;</button>
+  <div class="brand" id="brand">
+    <svg class="logo" viewBox="0 0 24 24" fill="currentColor"><path d="M19.35 10.04C18.67 6.59 15.64 4 12 4 9.11 4 6.6 5.64 5.35 8.04 2.34 8.36 0 10.91 0 14c0 3.31 2.69 6 6 6h13c2.76 0 5-2.24 5-5 0-2.64-2.05-4.78-4.65-4.96z"/></svg>
+    <span class="bname">COS &#x7F51;&#x76D8;</span>
+  </div>
+  <div class="hright">
+    <button class="pill" id="searchBtn" title="&#x641C;&#x7D22; (Ctrl+K)">
+      <svg viewBox="0 0 24 24" fill="currentColor"><path d="M15.5 14h-.79l-.28-.27C15.41 12.59 16 11.11 16 9.5 16 5.91 13.09 3 9.5 3S3 5.91 3 9.5 5.91 16 9.5 16c1.61 0 3.09-.59 4.23-1.57l.27.28v.79l5 4.99L20.49 19l-4.99-5zm-6 0C7.01 14 5 11.99 5 9.5S7.01 5 9.5 5 14 7.01 14 9.5 11.99 14 9.5 14z"/></svg>
+      <span class="kbd">Ctrl K</span>
+    </button>
+    <button class="pill" id="viewBtn" title="&#x5207;&#x6362;&#x89C6;&#x56FE;">
+      <svg id="viewIc" viewBox="0 0 24 24" fill="currentColor"><path d="M3 14h4v-4H3v4zm0 5h4v-4H3v4zM3 9h4V5H3v4zm5 5h13v-4H8v4zm0 5h13v-4H8v4zM8 5v4h13V5H8z"/></svg>
+    </button>
+    <button class="iconbtn" id="themeBtn" title="&#x4E3B;&#x9898;">&#x1F319;</button>
+    ${tempBtnHtml}
+    <button class="iconbtn" id="mailBtn" title="&#x8FD4;&#x56DE;&#x90AE;&#x4EF6;">
+      <svg viewBox="0 0 24 24" fill="currentColor"><path d="M20 4H4c-1.1 0-1.99.9-1.99 2L2 18c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V6c0-1.1-.9-2-2-2zm0 4l-8 5-8-5V6l8 5 8-5v2z"/></svg>
+    </button>
+    <button class="iconbtn" id="logoutBtn" title="&#x9000;&#x51FA;">
+      <svg viewBox="0 0 24 24" fill="currentColor"><path d="M10.09 15.59L11.5 17l5-5-5-5-1.41 1.41L12.67 11H3v2h9.67l-2.58 2.59zM19 3H5c-1.11 0-2 .9-2 2v4h2V5h14v14H5v-4H3v4c0 1.1.89 2 2 2h14c1.1 0 2-.9 2-2V5c0-1.1-.9-2-2-2z"/></svg>
+    </button>
+  </div>
+</header>
+<div class="layout">
+  <div class="scrim" id="scrim"></div>
+  <aside class="sidebar" id="sidebar">
+    <div class="sb-item on" data-nav="home"><span class="sic">&#x1F3E0;</span><span>&#x9996;&#x9875;</span></div>
+    <div class="sb-item" data-nav="recent"><span class="sic">&#x23F3;</span><span>&#x6700;&#x8FD1;</span></div>
+    <div class="sb-item" data-nav="fav"><span class="sic">&#x2B50;</span><span>&#x6536;&#x85CF;</span></div>
+    <div class="sb-item" data-nav="sec"><span class="sic">&#x1F512;</span><span>&#x5B89;&#x5168;</span></div>
+    <div class="sb-foot">&#x53EA;&#x8BFB;&#x6D4F;&#x89C8; &middot; cos-exchange</div>
+  </aside>
+  <main class="main">
+    <nav class="crumbs" id="crumbs"></nav>
+    <div class="searchbar" id="searchbar" style="display:none">
+      <input id="search" placeholder="&#x641C;&#x7D22;&#x5F53;&#x524D;&#x76EE;&#x5F55;..." autocomplete="off">
+    </div>
+    <div class="toolbar">
+      <div class="tleft">
+        <button class="iconbtn" id="upBtn" title="&#x4E0A;&#x4E00;&#x7EA7;">&#x2191;</button>
+        <select id="sort" title="&#x6392;&#x5E8F;">
+          <option value="name-asc" selected>&#x540D;&#x79F0; &#x2191;</option>
+          <option value="name-desc">&#x540D;&#x79F0; &#x2193;</option>
+          <option value="size-desc">&#x5927;&#x5C0F; &#x2193;</option>
+          <option value="size-asc">&#x5927;&#x5C0F; &#x2191;</option>
+          <option value="time-desc">&#x4FEE;&#x6539;&#x65F6;&#x95F4; &#x2193;</option>
+          <option value="time-asc">&#x4FEE;&#x6539;&#x65F6;&#x95F4; &#x2191;</option>
+        </select>
+      </div>
+      <div class="chips" id="chips">
+        <span class="chip on" data-f="all">&#x5168;&#x90E8;</span>
+        <span class="chip" data-f="img">&#x56FE;&#x7247;</span>
+        <span class="chip" data-f="vid">&#x89C6;&#x9891;</span>
+        <span class="chip" data-f="aud">&#x97F3;&#x9891;</span>
+        <span class="chip" data-f="doc">&#x6587;&#x6863;</span>
+        <span class="chip" data-f="arc">&#x538B;&#x7F29;</span>
+        <span class="chip" data-f="oth">&#x5176;&#x4ED6;</span>
+      </div>
+    </div>
+    <div class="objcard">
+      <div id="filelist"></div>
+      <div class="pager" id="pager"></div>
+    </div>
+    <footer class="footer">&#x53EA;&#x8BFB;&#x6D4F;&#x89C8; &middot; cos-exchange</footer>
+  </main>
+</div>
+<div id="lightbox">
+  <div class="lb-top"><span class="lb-cap" id="lbCap"></span><button class="lb-btn" id="lbClose">&#x2715;</button></div>
+  <button class="lb-btn lb-nav lb-prev" id="lbPrev">&#x2039;</button>
+  <img id="lbImg" alt="">
+  <button class="lb-btn lb-nav lb-next" id="lbNext">&#x203A;</button>
+</div>
+<div id="sheet">
+  <div class="sh-grab"></div>
+  <div class="sh-head"><span class="sh-title" id="shTitle"></span><button class="iconbtn" id="shClose">&#x2715;</button></div>
+  <div class="sh-body">
+    <div class="preview" id="shPreview"></div>
+    <div class="sh-meta" id="shMeta"></div>
+  </div>
+  <div class="sh-actions">
+    <button class="btn" id="shFavBtn">&#x2606; &#x6536;&#x85CF;</button>
+    <button class="btn primary" id="shDlBtn">&#x2B07; &#x4E0B;&#x8F7D;</button>
+  </div>
+</div>
+<div id="bindModal" class="modal">
+  <div class="modal-box">
+    <div class="modal-head"><span class="modal-title" id="bindTitle">&#x7ED1;&#x5B9A;&#x4E24;&#x6B65;&#x9A8C;&#x8BC1;&#xFF08;2FA&#xFF09;</span><button class="iconbtn" id="bindClose" type="button">&#x2715;</button></div>
+    <div class="modal-body">
+      <div class="mstep">1. &#x5728;&#x8EAB;&#x4EFD;&#x9A8C;&#x8BC1;&#x5668; App&#xFF08;Google Authenticator / Microsoft Authenticator / 1Password &#x7B49;&#xFF09;&#x4E2D;&#x6DFB;&#x52A0;&#x8D26;&#x6237;</div>
+      <div class="msecret"><code id="bindSecret">&#x52A0;&#x8F7D;&#x4E2D;...</code><button class="btn" id="bindCopy" type="button">&#x590D;&#x5236;&#x5BC6;&#x94A5;</button></div>
+      <div class="mstep">2. &#x4E5F;&#x53EF;&#x70B9;&#x51FB;&#x94FE;&#x63A5;&#x76F4;&#x63A5;&#x6DFB;&#x52A0;&#xFF1A;<a id="bindUri" href="#">otpauth &#x94FE;&#x63A5;</a></div>
+      <div class="mstep" id="bindCurStep" style="display:none">&#x5F53;&#x524D;&#x52A8;&#x6001;&#x9A8C;&#x8BC1;&#x7801;&#xFF08;&#x539F;&#x7ED1;&#x5B9A;&#xFF09;&#xFF1A;<input id="bindCurrent" type="text" inputmode="numeric" maxlength="6" autocomplete="one-time-code" placeholder="6 &#x4F4D;&#x6570;&#x5B57;"></div>
+      <div class="mstep">&#x8F93;&#x5165; App &#x663E;&#x793A;&#x7684; 6 &#x4F4D;&#x9A8C;&#x8BC1;&#x7801;&#xFF1A;<input id="bindCode" type="text" inputmode="numeric" maxlength="6" autocomplete="one-time-code" placeholder="6 &#x4F4D;&#x6570;&#x5B57;"></div>
+      <div class="merr" id="bindErr"></div>
+    </div>
+    <div class="modal-foot">
+      <button class="btn" id="bindLater" type="button">&#x7A0D;&#x540E;</button>
+      <button class="btn primary" id="bindOk" type="button">&#x786E;&#x8BA4;&#x7ED1;&#x5B9A;</button>
+    </div>
+  </div>
+</div>
+<div id="secModal" class="modal">
+  <div class="modal-box">
+    <div class="modal-head"><span class="modal-title">&#x5B89;&#x5168;&#x8BBE;&#x7F6E;</span><button class="iconbtn" id="secClose" type="button">&#x2715;</button></div>
+    <div class="modal-body">
+      <div class="mstep">&#x4E24;&#x6B65;&#x9A8C;&#x8BC1;&#xFF08;2FA&#xFF09;&#xFF1A;<b id="secStatus">&#x672A;&#x7ED1;&#x5B9A;</b></div>
+      <div class="mstep">&#x5F00;&#x542F;&#x540E;&#xFF0C;&#x767B;&#x5F55;&#x9700;&#x8981;&#x300C;&#x8BBF;&#x95EE;&#x5BC6;&#x7801; + &#x52A8;&#x6001;&#x9A8C;&#x8BC1;&#x7801;&#x300D;&#xFF1B;&#x52A8;&#x6001;&#x9A8C;&#x8BC1;&#x7801;&#x6BCF; 30 &#x79D2;&#x66F4;&#x65B0;&#x4E00;&#x6B21;&#x3002;</div>
+      <div class="mstep" id="secCodeStep" style="display:none">&#x5F53;&#x524D;&#x52A8;&#x6001;&#x9A8C;&#x8BC1;&#x7801;&#xFF1A;<input id="secCode" type="text" inputmode="numeric" maxlength="6" autocomplete="one-time-code" placeholder="6 &#x4F4D;&#x6570;&#x5B57;"></div>
+      <div class="merr" id="secErr"></div>
+    </div>
+    <div class="modal-foot">
+      <button class="btn" id="secDisable" type="button">&#x5173;&#x95ED; 2FA</button>
+      <button class="btn primary" id="secBind" type="button">&#x7ED1;&#x5B9A; 2FA</button>
+    </div>
+  </div>
+</div>
+<div id="toast"></div>
+<script>
+var CFG=${cfgJson};
+var $=function(id){return document.getElementById(id);};
+var esc=function(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/'/g,'&#39;').replace(/"/g,'&quot;');};
+var IMG=['png','jpg','jpeg','gif','webp','bmp','svg','ico','heic','avif','jfif'];
+var VID=['mp4','mkv','mov','avi','webm','m4v','wmv','flv','ts','3gp','rmvb'];
+var AUD=['mp3','wav','flac','ogg','m4a','aac','opus','ape','amr'];
+var DOC=['doc','docx','xls','xlsx','ppt','pptx'];
+var ARC=['zip','rar','7z','tar','gz','bz2','xz','7zip','tgz'];
+var CODE=['js','css','ts','py','sh','json','html','htm','xml','yaml','yml','ini','conf','cfg','bat'];
+var TXT=['txt','md','csv','log'];
+var SVGICONS={
+  folder:'<svg viewBox="0 0 24 24" fill="currentColor"><path d="M10 4H4c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V8c0-1.1-.9-2-2-2h-8l-2-2z"/></svg>',
+  img:'<svg viewBox="0 0 24 24" fill="currentColor"><path d="M21 19V5c0-1.1-.9-2-2-2H5c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h14c1.1 0 2-.9 2-2zM8.5 13.5l2.5 3.01L14.5 12l4.5 6H5l3.5-4.5z"/></svg>',
+  vid:'<svg viewBox="0 0 24 24" fill="currentColor"><path d="M18 4l2 4h-3l-2-4h-2l2 4h-3l-2-4H8l2 4H7L5 4H4c-1.1 0-1.99.9-1.99 2L2 18c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V4h-4z"/></svg>',
+  aud:'<svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 3v10.55A4 4 0 1 0 14 17V7h4V3h-6z"/></svg>',
+  pdf:'<svg viewBox="0 0 24 24" fill="currentColor"><path d="M14 2H6c-1.1 0-2 .9-2 2v16c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V8l-6-6zm1 9l-3 3-1.5-1.5L8 15h8l-1-4z"/></svg>',
+  arc:'<svg viewBox="0 0 24 24" fill="currentColor"><path d="M20.54 5.23l-1.39-1.68C18.88 3.21 18.47 3 18 3H6c-.47 0-.88.21-1.16.55L3.46 5.23C3.17 5.57 3 6.02 3 6.5V19c0 1.1.9 2 2 2h14c1.1 0 2-.9 2-2V6.5c0-.48-.17-.93-.46-1.27zM12 17.5L6.5 12H10v-2h4v2h3.5L12 17.5zM5.12 5l.81-1h12l.94 1H5.12z"/></svg>',
+  doc:'<svg viewBox="0 0 24 24" fill="currentColor"><path d="M14 2H6c-1.1 0-2 .9-2 2v16c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V8l-6-6zm2 16H8v-2h8v2zm0-4H8v-2h8v2zm-3-5V3.5L18.5 9H13z"/></svg>',
+  txt:'<svg viewBox="0 0 24 24" fill="currentColor"><path d="M14 2H6c-1.1 0-2 .9-2 2v16c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V8l-6-6zm2 16H8v-2h8v2zm0-4H8v-2h8v2zm-3-5V3.5L18.5 9H13z"/></svg>',
+  code:'<svg viewBox="0 0 24 24" fill="currentColor"><path d="M9.4 16.6L4.8 12l4.6-4.6L8 6l-6 6 6 6 1.4-1.4zm5.2 0l4.6-4.6-4.6-4.6L16 6l6 6-6 6-1.4-1.4z"/></svg>',
+  other:'<svg viewBox="0 0 24 24" fill="currentColor"><path d="M14 2H6c-1.1 0-1.99.9-1.99 2L4 20c0 1.1.89 2 1.99 2H18c1.1 0 2-.9 2-2V8l-6-6zM16 18H8v-2h8v2zm0-4H8v-2h8v2zm-3-5V3.5L18.5 9H13z"/></svg>'
+};
+var ext=function(n){return (n.split('.').pop()||'').toLowerCase();};
+var icOf=function(o){
+  var e=ext(o.name);
+  if(o.type==='img'){return SVGICONS.img;}
+  if(o.type==='vid'){return SVGICONS.vid;}
+  if(o.type==='aud'){return SVGICONS.aud;}
+  if(o.type==='arc'){return SVGICONS.arc;}
+  if(e==='pdf'){return SVGICONS.pdf;}
+  if(CODE.indexOf(e)>=0){return SVGICONS.code;}
+  if(o.type==='doc'){return SVGICONS.doc;}
+  if(TXT.indexOf(e)>=0){return SVGICONS.txt;}
+  return SVGICONS.other;
+};
+var fmt=function(s){
+  if(!s){return '-';}
+  var n=1024;
+  if(s<n){return s+'B';}
+  if(s<n*n){return (s/n).toFixed(2)+'K';}
+  if(s<n*n*n){return (s/(n*n)).toFixed(2)+'M';}
+  if(s<n*n*n*n){return (s/(n*n*n)).toFixed(2)+'G';}
+  return (s/(n*n*n*n)).toFixed(2)+'T';
+};
+var fmtT=function(t){
+  if(!t){return '';}
+  var d=new Date(t);
+  if(isNaN(d.getTime())){return '';}
+  var p=function(x){return String(x).padStart(2,'0');};
+  return d.getFullYear()+'-'+p(d.getMonth()+1)+'-'+p(d.getDate())+' '+p(d.getHours())+':'+p(d.getMinutes())+':'+p(d.getSeconds());
+};
+var urlOf=function(k){return '/browse/api/file?key='+encodeURIComponent(k);};
+var typeOf=function(n,serverType){if(serverType){return serverType;}var e=ext(n);if(IMG.indexOf(e)>=0){return 'img';}if(VID.indexOf(e)>=0){return 'vid';}if(AUD.indexOf(e)>=0){return 'aud';}if(DOC.indexOf(e)>=0){return 'doc';}if(ARC.indexOf(e)>=0){return 'arc';}return 'oth';};
+var typeLabel={'img':'\\u56FE\\u7247','vid':'\\u89C6\\u9891','aud':'\\u97F3\\u9891','doc':'\\u6587\\u6863','arc':'\\u538B\\u7F29','oth':'\\u5176\\u4ED6'};
+var prefix='';
+// \\u5206\\u9875\\uFF08\\u6587\\u4EF6\\u5217\\u8868\\uFF09\\uFF1ACOS continuation-token \\u987A\\u5E8F\\u7FFB\\u9875\\uFF0CpageTokens[i] \\u7F13\\u5B58\\u8FDB\\u5165\\u7B2C i \\u9875\\u6240\\u9700\\u7684 token
+var perPage=60;        // \\u6BCF\\u9875\\u6761\\u6570\\uFF0830/60/100\\uFF09
+var pageNo=1;          // \\u5F53\\u524D\\u9875
+var pageTokens=[];     // pageTokens[i] = \\u7B2C i \\u9875\\u8BF7\\u6C42\\u7528\\u7684 continuation-token\\uFF08\\u7B2C 1 \\u9875\\u4E3A ''\\uFF09
+var maxLoadedPage=1;   // \\u5DF2\\u8BBF\\u95EE\\u7684\\u6700\\u5927\\u9875
+var hasMore=false;     // \\u662F\\u5426\\u8FD8\\u6709\\u4E0B\\u4E00\\u9875\\uFF08COS IsTruncated\\uFF09
+var filter='all';
+var keyword='';
+var sortVal='name-asc';
+var view='list';
+var page='home';
+var allData=null;
+var folders=[];
+var files=[];
+var activeItems=[];
+var imgs=[];
+var imgIdx=0;
+var curItem=null;
+var favs=loadArray('browse_fav');
+var recents=loadArray('browse_recent');
+var localPage=1;       // \\u672C\\u5730\\u9875\\u9762\\uFF08\\u6700\\u8FD1/\\u6536\\u85CF\\uFF09\\u5F53\\u524D\\u9875\\uFF0C\\u6BCF\\u9875 perPage \\u6761
+function loadArray(k){try{var v=JSON.parse(localStorage.getItem(k)||'[]');return v instanceof Array?v:[];}catch(e){return [];}}
+function applyFilter(list){
+  if(filter!=='all'){list=list.filter(function(o){return o.type===filter;});}
+  if(keyword){var kw=keyword.toLowerCase();list=list.filter(function(o){return o.name.toLowerCase().indexOf(kw)>=0;});}
+  return list;
+}
+function sortList(list){
+  var p=sortVal.split('-'),field=p[0],dir=p[1],mul=dir==='asc'?1:-1;
+  list.sort(function(a,b){
+    if(field==='size'){return (a.size-b.size)*mul;}
+    if(field==='time'){return (a.mtime<b.mtime?-1:(a.mtime>b.mtime?1:0))*mul;}
+    return a.name.localeCompare(b.name)*mul;
   });
   return list;
 }
-
-function render() {
-  const folders = allData ? (allData.folders || []) : [];
-  const files = visibleList();
-  imgs = files.filter(o => o.type === 'img');
-  const box = $('grid');
-  const crumb = $('crumbs');
-  let html = '';
-  for (const f of folders) {
-    const name = f.slice(0, -1).split('/').pop();
-    html += '<div class="card" data-act="open" data-key="' + escAttr(f) + '"><div class="cicon">&#x1F4C1;</div><div class="cbody"><div class="cname">' + esc(name) + '</div><div class="cmeta">&#x6587;&#x4EF6;&#x5939;</div></div></div>';
+function norm(f){
+  var n=f.key.split('/').pop();
+  return {key:f.key,name:n,size:f.size||0,mtime:f.mtime||'',type:typeOf(n,f.type)};
+}
+function findItem(key){
+  for(var i=0;i<activeItems.length;i++){if(activeItems[i].key===key){return activeItems[i];}}
+  return null;
+}
+function statusHtml(msg,spin){
+  return '<div class="status">'+(spin?'<div class="spinner"></div>':'')+esc(msg)+'</div>';
+}
+function load(reset){
+  if(page!=='home'){renderLocal();return;}
+  if(reset){pageTokens=[];pageNo=1;maxLoadedPage=1;hasMore=false;}
+  loadPage(pageNo);
+}
+// \\u52A0\\u8F7D\\u7B2C n \\u9875\\uFF08token \\u7F13\\u5B58\\u81EA pageTokens\\uFF0C\\u5DF2\\u8BBF\\u95EE\\u9875\\u53EF\\u56DE\\u7FFB\\uFF1B\\u4E0B\\u4E00\\u9875\\u65F6 maxLoadedPage+1\\uFF09
+function loadPage(n){
+  var token=pageTokens[n]||'';
+  var box=$('filelist');
+  var q=new URLSearchParams({prefix:prefix,per_page:String(perPage)});
+  if(token){q.set('token',token);}
+  box.innerHTML=statusHtml('\\u52A0\\u8F7D\\u4E2D...',true);
+  var ctrl=new AbortController();
+  var timer=setTimeout(function(){ctrl.abort();},15000);
+  fetch('/browse/api/list?'+q.toString(),{signal:ctrl.signal})
+  .then(function(res){
+    if(res.status===429){
+      box.innerHTML=statusHtml('\\u8BF7\\u6C42\\u8FC7\\u4E8E\\u9891\\u7E41(429)\\uFF0C\\u7A0D\\u540E\\u81EA\\u52A8\\u91CD\\u8BD5...',true);
+      setTimeout(function(){loadPage(n);},4000);
+      return null;
+    }
+    if(!res.ok){throw new Error('HTTP '+res.status);}
+    return res.json();
+  })
+  .then(function(data){
+    if(data===null){return;}
+    if(data.error){
+      box.innerHTML=statusHtml('\\u52A0\\u8F7D\\u5931\\u8D25: '+data.error,false);
+      return;
+    }
+    allData=data;
+    pageTokens[n]=token;
+    pageTokens[n+1]=data.token||'';
+    hasMore=!!data.truncated;
+    folders=data.folders||[];
+    files=data.files||[];
+    pageNo=n;
+    if(n>maxLoadedPage){maxLoadedPage=n;}
+    render();
+  })
+  .catch(function(e){
+    if(ctrl.signal.aborted){
+      box.innerHTML=statusHtml('\\u52A0\\u8F7D\\u8D85\\u65F6\\uFF0C\\u8BF7\\u91CD\\u8BD5',false);
+    }else{
+      box.innerHTML=statusHtml('\\u52A0\\u8F7D\\u5931\\u8D25: '+String((e&&e.message)||e),false);
+    }
+  })
+  .then(function(){clearTimeout(timer);});
+}
+function render(){
+  if(page==='home'){renderHome();}else{renderLocal();}
+}
+function renderHome(){
+  var list=sortList(applyFilter(files.map(norm)));
+  activeItems=list;
+  imgs=list.filter(function(o){return o.type==='img';});
+  var box=$('filelist');
+  var html='';
+  if(view==='grid'){
+    html=gridHtml(folders,list);
+    if(!html&&!(allData&&allData.raw)){html=statusHtml('\\uFF08\\u7A7A\\u76EE\\u5F55\\uFF09',false);}
+  }else{
+    html='<div class="lhead">'
+      +'<div class="lname" data-s="name">\\u540D\\u79F0</div>'
+      +'<div class="lsize" data-s="size">\\u5927\\u5C0F</div>'
+      +'<div class="lmod" data-s="time">\\u4FEE\\u6539\\u65F6\\u95F4</div>'
+      +'</div>'
+      +listHtml(folders,list);
+    if(!list.length&&!folders.length){html=statusHtml('\\uFF08\\u7A7A\\u76EE\\u5F55\\uFF09',false);}
   }
-  for (const o of files) {
-    const thumb = o.type === 'img' ? '<img class="cimg" loading="lazy" data-src="' + urlOf(o.key) + '" decoding="async">' : '<div class="cicon">' + iconOf(o.name) + '</div>';
-    const meta = fmt(o.size) + (o.mtime ? ' &#xB7; ' + esc(fmtT(o.mtime)) : '');
-    html += '<div class="card" data-act="sel" data-key="' + escAttr(o.key) + '"><button class="dl" data-dl="' + escAttr(o.key) + '">&#x2913;</button>' + thumb + '<div class="cbody"><div class="cname">' + esc(o.name) + '</div><div class="cmeta">' + meta + '</div></div></div>';
+  box.innerHTML=html;
+  lazyBind(box);
+  bindList(box);
+  renderCrumbs();
+  renderPager();
+}
+function renderLocal(){
+  var src=(page==='recent')?recents:favs;
+  var list=sortList(applyFilter(src.slice())).slice((localPage-1)*perPage,localPage*perPage);
+  activeItems=list;
+  imgs=list.filter(function(o){return o.type==='img';});
+  var box=$('filelist');
+  var label=(page==='recent')?'\\u6682\\u65E0\\u6700\\u8FD1\\u6D4F\\u89C8\\u8BB0\\u5F55':'\\u6682\\u65E0\\u6536\\u85CF\\u6587\\u4EF6';
+  var ic=(page==='recent')?'&#x23F3;':'&#x2B50;';
+  if(!list.length){
+    box.innerHTML='<div class="status"><span style="font-size:34px">'+ic+'</span>'+label+'</div>';
+  }else if(view==='grid'){
+    box.innerHTML=gridHtml([],list);
+  }else{
+    box.innerHTML='<div class="lhead">'
+      +'<div class="lname">\\u540D\\u79F0</div>'
+      +'<div class="lsize">\\u5927\\u5C0F</div>'
+      +'<div class="lmod">\\u4FEE\\u6539\\u65F6\\u95F4</div>'
+      +'</div>'
+      +listHtml([],list);
   }
-  if (folders.length === 0 && files.length === 0 && !(allData && allData.raw)) {
-    html = '<div id="status">&#xFF08;&#x7A7A;&#x76EE;&#x5F55;&#xFF09;</div>';
+  lazyBind(box);
+  bindList(box);
+  renderCrumbs();
+  renderPager();
+}
+function gridHtml(folders,list){
+  var h='';
+  for(var i=0;i<folders.length;i++){
+    var f=folders[i];
+    var nm=f.slice(0,-1).split('/').pop();
+    h+='<div class="item" data-act="open" data-key="'+esc(f)+'">'
+      +'<div class="it-ic">'+SVGICONS.folder+'</div>'
+      +'<div class="it-name" title="'+esc(nm)+'">'+esc(nm)+'</div></div>';
   }
-  if (truncated) html += '<button id="loadmore">&#x52A0;&#x8F7D;&#x66F4;&#x591A;</button>';
-  box.innerHTML = html;
-  lazyBind();
-
-  const parts = prefix.split('/').filter(Boolean);
-  let cr = '<span class="crumb" data-cr="">&#x6839;&#x76EE;&#x5F55;</span>';
-  let acc = '';
-  parts.forEach((p) => { acc += p + '/'; cr += ' / <span class="crumb" data-cr="' + escAttr(acc) + '">' + esc(p) + '</span>'; });
-  crumb.innerHTML = cr;
-
-  box.onclick = (e) => {
-    const dl = e.target.closest('[data-dl]');
-    if (dl) { e.stopPropagation(); window.location.href = urlOf(dl.getAttribute('data-dl')); return; }
-    const card = e.target.closest('.card');
-    if (!card) return;
-    const act = card.dataset.act;
-    const key = card.dataset.key || '';
-    if (act === 'open') open(key);
-    else if (act === 'sel') selectRow(key);
+  for(var j=0;j<list.length;j++){
+    var o=list[j];
+    var ic=(o.type==='img')
+      ?'<img class="it-img" loading="lazy" data-src="'+urlOf(o.key)+'" decoding="async" alt="">'
+      :icOf(o);
+    h+='<div class="item" data-act="file" data-key="'+esc(o.key)+'">'
+      +'<button class="it-more" data-more="'+esc(o.key)+'" title="\\u66F4\\u591A">&#x22EF;</button>'
+      +'<div class="it-ic">'+ic+'</div>'
+      +'<div class="it-name" title="'+esc(o.name)+'">'+esc(o.name)+'</div></div>';
+  }
+  return h;
+}
+function listHtml(folders,list){
+  var h='';
+  for(var i=0;i<folders.length;i++){
+    var f=folders[i];
+    var nm=f.slice(0,-1).split('/').pop();
+    h+='<div class="lrow" data-act="open" data-key="'+esc(f)+'">'
+      +'<div class="lname"><span class="lic">'+SVGICONS.folder+'</span><span class="lnm">'+esc(nm)+'</span></div>'
+      +'<div class="lsize">-</div><div class="lmod">-</div></div>';
+  }
+  for(var j=0;j<list.length;j++){
+    var o=list[j];
+    h+='<div class="lrow" data-act="file" data-key="'+esc(o.key)+'">'
+      +'<div class="lname"><span class="lic">'+icOf(o)+'</span><span class="lnm">'+esc(o.name)+'</span></div>'
+      +'<div class="lsize">'+fmt(o.size)+'</div><div class="lmod">'+esc(fmtT(o.mtime))+'</div></div>';
+  }
+  return h;
+}
+function bindList(box){
+  box.onclick=function(e){
+    var th=e.target.closest('[data-s]');
+    if(th){sortKey(th.getAttribute('data-s'));return;}
+    var m=e.target.closest('[data-more]');
+    if(m){e.stopPropagation();var mk=m.getAttribute('data-more');var mo=findItem(mk);if(mo){openDetail(mo);}return;}
+    var it=e.target.closest('.item,.lrow');
+    if(!it){return;}
+    var key=it.getAttribute('data-key')||'';
+    if(it.getAttribute('data-act')==='open'){open(key);return;}
+    var o=findItem(key);
+    if(!o){return;}
+    if(o.type==='img'){showLightbox(key);}else{openDetail(o);}
   };
-  const lm = $('loadmore');
-  if (lm) lm.onclick = () => load(false);
-  crumb.onclick = (e) => { const c = e.target.closest('.crumb'); if (c) go(c.dataset.cr || ''); };
-
-  $('grid').style.display = view === 'grid' ? '' : 'none';
-  $('tableWrap').style.display = view === 'table' ? '' : 'none';
-  if (view === 'table') renderTable();
 }
-function clearSel() {
-  selKey = '';
-  $('side').classList.remove('show');
-  $('side').innerHTML = '';
-  document.querySelectorAll('#table tr.sel').forEach(r => r.classList.remove('sel'));
-}
-function go(p) { clearSel(); prefix = p; load(true); window.scrollTo(0, 0); }
-function up() { clearSel(); const parts = prefix.split('/').filter(Boolean); parts.pop(); prefix = parts.length ? parts.join('/') + '/' : ''; load(true); window.scrollTo(0, 0); }
-function open(p) { clearSel(); prefix = p; load(true); window.scrollTo(0, 0); }
-
-function showLightbox(key) {
-  if (imgs.length === 0) return;
-  const idx = imgs.findIndex(o => o.key === key);
-  imgIdx = idx >= 0 ? idx : 0;
-  const img = $('lbImg');
-  const cap = $('lbcap');
-  const show = () => {
-    const o = imgs[imgIdx];
-    img.src = urlOf(o.key);
-    cap.textContent = (imgIdx + 1) + '/' + imgs.length + '  ' + o.name;
-  };
-  $('lightbox').classList.add('show');
-  show();
-  $('lightbox').onclick = (e) => {
-    if (e.target.closest('.lb-close')) closeLb();
-    else if (e.target.closest('.lb-prev')) { imgIdx = (imgIdx - 1 + imgs.length) % imgs.length; show(); }
-    else if (e.target.closest('.lb-next')) { imgIdx = (imgIdx + 1) % imgs.length; show(); }
-  };
-}
-function closeLb() { $('lightbox').classList.remove('show'); $('lbImg').src = ''; }
-
-function preview(key) {
-  const name = key.split('/').pop();
-  const e = ext(name);
-  const box = $('modalBody');
-  $('modalTitle').textContent = name;
-  if (VID.includes(e)) {
-    box.innerHTML = '<video controls autoplay src="' + urlOf(key) + '"></video>';
-  } else if (AUD.includes(e)) {
-    box.innerHTML = '<audio controls src="' + urlOf(key) + '"></audio>';
-  } else if (e === 'pdf') {
-    box.innerHTML = '<iframe src="' + urlOf(key) + '#toolbar=0"></iframe>';
-  } else if (['txt','md','csv','json','log'].includes(e)) {
-    box.innerHTML = '<div id="status">&#x52A0;&#x8F7D;&#x4E2D;&#x2026;</div>';
-    $('modal').classList.add('show');
-    fetch(urlOf(key)).then(r => { if (!r.ok) throw new Error('HTTP ' + r.status); return r.text(); }).then(t => { box.innerHTML = '<pre>' + esc(t.slice(0, 200000)) + '</pre>'; }).catch(() => { box.innerHTML = '<pre>&#x52A0;&#x8F7D;&#x5931;&#x8D25;</pre>'; });
-    return;
-  } else {
-    window.location.href = urlOf(key);
-    return;
-  }
-  $('modal').classList.add('show');
-}
-function closeModal() { $('modal').classList.remove('show'); $('modalBody').innerHTML = ''; }
-
-$('upBtn').onclick = up;
-$('modeBtn').onclick = () => {
-  document.body.classList.toggle('dark');
-  try { localStorage.setItem('browseDark', document.body.classList.contains('dark') ? '1' : '0'); } catch (e) {}
-  $('modeBtn').innerHTML = document.body.classList.contains('dark') ? '&#x2600;&#xFE0F;' : '&#x1F319;';
-};
-$('search').addEventListener('input', (e) => { keyword = e.target.value; render(); });
-$('sort').addEventListener('change', (e) => { sortVal = e.target.value; render(); });
-$('chips').addEventListener('click', (e) => {
-  const c = e.target.closest('.chip');
-  if (!c) return;
-  filter = c.dataset.f;
-  document.querySelectorAll('.chip').forEach(x => x.classList.toggle('on', x === c));
+function sortKey(field){
+  if(sortVal===field+'-asc'){sortVal=field+'-desc';}
+  else if(sortVal===field+'-desc'){sortVal=field+'-asc';}
+  else{sortVal=field+'-desc';}
+  $('sort').value=sortVal;
   render();
-});
-$('modalClose').onclick = closeModal;
-$('modal').onclick = (e) => { if (e.target === $('modal')) closeModal(); };
-document.addEventListener('keydown', (e) => {
-  if (e.key === 'Escape') { closeLb(); closeModal(); }
-});
-try { if (localStorage.getItem('browseDark') === '1') { document.body.classList.add('dark'); $('modeBtn').innerHTML = '&#x2600;&#xFE0F;'; } } catch (e) {}
-
-let view = 'grid';
-let selKey = '';
-let io = null;
-const TYPE_LABEL = { img:'&#x56FE;&#x7247;', vid:'&#x89C6;&#x9891;', doc:'&#x6587;&#x6863;', arc:'&#x538B;&#x7F29;&#x5305;', oth:'&#x5176;&#x4ED6;' };
-const typeLabel = o => TYPE_LABEL[o.type] || '';
-
-const MAX_CONCURRENT = 4;
-let thumbQueue = [];
-let thumbActive = 0;
-function thumbPump() {
-  while (thumbActive < MAX_CONCURRENT && thumbQueue.length) {
-    const img = thumbQueue.shift();
-    if (!img || img.dataset.src === undefined) continue;
+}
+function go(p){
+  page='home';
+  prefix=p;
+  localPage=1;
+  closeSidebar();
+  load(true);
+  window.scrollTo(0,0);
+}
+function up(){
+  if(page!=='home'){return;}
+  var parts=prefix.split('/').filter(Boolean);
+  parts.pop();
+  prefix=parts.length?parts.join('/')+'/':'';
+  load(true);
+  window.scrollTo(0,0);
+}
+function open(p){go(p);}
+function renderCrumbs(){
+  var c=$('crumbs');
+  var html='';
+  if(page!=='home'){
+    html='<span class="crumb last">'+(page==='recent'?'\\u6700\\u8FD1':'\\u6536\\u85CF')+'</span>';
+    c.innerHTML=html;
+    c.onclick=null;
+    return;
+  }
+  var parts=prefix.split('/').filter(Boolean);
+  html='<span class="crumb" data-cr=""><span class="cico">'+SVGICONS.folder+'</span>\\u9996\\u9875</span>';
+  var acc='';
+  for(var i=0;i<parts.length;i++){
+    acc+=parts[i]+'/';
+    var cls=(i===parts.length-1)?'crumb last':'crumb';
+    html+='<span class="csep">/</span><span class="'+cls+'" data-cr="'+esc(acc)+'">'+esc(parts[i])+'</span>';
+  }
+  c.innerHTML=html;
+  c.onclick=function(e){
+    var cr=e.target.closest('.crumb');
+    if(!cr||cr.classList.contains('last')){return;}
+    go(cr.getAttribute('data-cr')||'');
+  };
+}
+function perPageSelHtml(){
+  return '<select id="perPageSel" title="\\u6BCF\\u9875\\u6761\\u6570">'
+    +'<option value="30">30 / \\u9875</option>'
+    +'<option value="60">60 / \\u9875</option>'
+    +'<option value="100">100 / \\u9875</option>'
+    +'</select>';
+}
+function bindPerPageSel(){
+  var s=$('perPageSel');
+  if(!s){return;}
+  s.value=String(perPage);
+  s.onchange=function(){
+    perPage=parseInt(this.value,10);
+    if(page==='home'){load(true);}
+    else{localPage=1;renderLocal();}
+  };
+}
+// \\u6587\\u4EF6\\u5217\\u8868\\u5206\\u9875\\u5668\\uFF1ACOS \\u65E0\\u603B\\u6570\\uFF0C\\u6309\\u300C\\u5DF2\\u8BBF\\u95EE\\u9875 + \\u4E0A\\u4E00\\u9875/\\u4E0B\\u4E00\\u9875\\u300D\\u987A\\u5E8F\\u7FFB\\u9875\\uFF08token \\u7F13\\u5B58\\uFF09
+function renderPager(){
+  var p=$('pager');
+  if(page!=='home'){renderLocalPager(p);return;}
+  if(!allData){p.innerHTML='';return;}
+  if(!folders.length&&!files.length){p.innerHTML='';return;}
+  var html='<div class="pagerbar">'
+    +'<div class="pg-left">'+perPageSelHtml()+'</div>'
+    +'<div class="pg-nav">';
+  if(pageNo>1){
+    html+='<button class="pg-btn" data-pg="prev" title="\\u4E0A\\u4E00\\u9875">&#x2039;</button>';
+  }
+  // \\u9875\\u7801\\u6298\\u53E0\\uFF1A\\u53EA\\u663E\\u793A \\u9996\\u98751 / \\u5F53\\u524D\\u9875\\u9644\\u8FD1\\u00B11 / \\u5DF2\\u8BBF\\u95EE\\u6700\\u5927\\u9875\\uFF0C\\u5176\\u4F59\\u7528\\u7701\\u7565\\u53F7\\u3002
+  // \\u6587\\u4EF6\\u4E0A\\u4E07\\u3001\\u9875\\u6570\\u518D\\u591A\\u4E5F\\u4E0D\\u4F1A\\u6E32\\u67D3\\u51FA\\u4E00\\u957F\\u4E32\\u9875\\u7801\\uFF08\\u907F\\u514D\\u7FFB\\u9875\\u5668\\u6EA2\\u51FA\\uFF09\\u3002
+  var shown=[];
+  for(var i=1;i<=maxLoadedPage;i++){
+    if(i===1||i===maxLoadedPage||Math.abs(i-pageNo)<=1){shown.push(i);}
+  }
+  var last=0;
+  for(var j=0;j<shown.length;j++){
+    var pg=shown[j];
+    if(pg-last>1){html+='<span class="pg-dots">&#x2026;</span>';}
+    html+='<button class="pg-btn'+(pg===pageNo?' cur':'')+'" data-pg="'+pg+'">'+pg+'</button>';
+    last=pg;
+  }
+  if(hasMore){
+    html+='<button class="pg-btn" data-pg="next" title="\\u4E0B\\u4E00\\u9875">&#x203A;</button>';
+  }
+  // \\u8DF3\\u9875\\u8F93\\u5165\\u6846\\uFF1ACOS \\u65E0\\u603B\\u9875\\u6570\\uFF0C\\u9650\\u5236\\u5728\\u300C\\u5DF2\\u52A0\\u8F7D\\u9875\\u8303\\u56F4\\u300D\\u5185\\uFF081~maxLoadedPage\\uFF09\\uFF0C
+  // \\u8D85\\u51FA\\u63D0\\u793A\\uFF0C\\u907F\\u514D\\u8F93\\u5165\\u8FDC\\u8DDD\\u79BB\\u9875\\u53F7\\u65F6\\u65E0\\u9650\\u987A\\u5E8F\\u8BF7\\u6C42\\u89E6\\u53D1\\u9650\\u6D41
+  html+='<span class="pg-goto">\\u8DF3\\u81F3<input id="pgInput" type="number" min="1" max="'+maxLoadedPage+'" inputmode="numeric" value="'+pageNo+'" title="\\u5DF2\\u52A0\\u8F7D '+maxLoadedPage+' \\u9875"><button class="pg-btn" id="pgGo" type="button">GO</button></span>';
+  html+='</div></div>';
+  p.innerHTML=html;
+  bindPerPageSel();
+  var gi=$('pgInput'),gb=$('pgGo');
+  if(gi){gi.addEventListener('keydown',function(e){if(e.key==='Enter'){goToFilePage(parseInt(gi.value,10));}});}
+  if(gb){gb.onclick=function(){goToFilePage(parseInt(gi.value,10));};}
+  p.onclick=function(e){
+    var b=e.target.closest('.pg-btn');
+    if(!b){return;}
+    var v=b.getAttribute('data-pg');
+    if(v==='prev'){if(pageNo>1){loadPage(pageNo-1);window.scrollTo(0,0);}}
+    else if(v==='next'){if(hasMore){loadPage(pageNo+1);window.scrollTo(0,0);}}
+    else{var n=parseInt(v,10);if(n>=1&&n<=maxLoadedPage){loadPage(n);window.scrollTo(0,0);}}
+  };
+}
+// \\u6587\\u4EF6\\u5217\\u8868\\u8DF3\\u9875\\uFF1A\\u53EA\\u5141\\u8BB8 1~maxLoadedPage\\uFF08COS \\u65E0\\u603B\\u6570\\uFF0C\\u672A\\u8BBF\\u95EE\\u9875\\u9700\\u987A\\u5E8F\\u7FFB\\uFF0C\\u9632\\u9650\\u6D41\\uFF09
+function goToFilePage(n){
+  if(!Number.isFinite(n)||n<1){toast('\\u8BF7\\u8F93\\u5165\\u6709\\u6548\\u9875\\u7801');return;}
+  n=Math.floor(n);
+  if(n>maxLoadedPage){toast('\\u5DF2\\u52A0\\u8F7D\\u5230\\u7B2C '+maxLoadedPage+' \\u9875\\uFF0C\\u8D85\\u51FA\\u8303\\u56F4');return;}
+  loadPage(n);
+  window.scrollTo(0,0);
+}
+// \\u6700\\u8FD1/\\u6536\\u85CF\\u5206\\u9875\\u5668\\uFF1A\\u672C\\u5730\\u6570\\u636E\\u6709\\u603B\\u6570\\uFF0Calist \\u98CE\\u683C\\u6570\\u5B57\\u5206\\u9875\\uFF081 / \\u5F53\\u524D\\u9644\\u8FD1 / \\u672B\\u9875 + \\u7701\\u7565\\u53F7\\uFF09
+function renderLocalPager(p){
+  var src=(page==='recent')?recents:favs;
+  var full=sortList(applyFilter(src.slice()));
+  var pages=Math.max(1,Math.ceil(full.length/perPage));
+  if(localPage>pages){localPage=pages;}
+  if(full.length<=perPage){p.innerHTML='';return;}
+  var html='<div class="pagerbar">'
+    +'<div class="pg-left">'+perPageSelHtml()+'</div>'
+    +'<div class="pg-nav">';
+  if(localPage>1){html+='<button class="pg-btn" data-pg="prev" title="\\u4E0A\\u4E00\\u9875">&#x2039;</button>';}
+  var shown=[];
+  for(var i=1;i<=pages;i++){
+    if(i===1||i===pages||Math.abs(i-localPage)<=1){shown.push(i);}
+  }
+  var last=0;
+  for(var j=0;j<shown.length;j++){
+    var pg=shown[j];
+    if(pg-last>1){html+='<span class="pg-dots">&#x2026;</span>';}
+    html+='<button class="pg-btn'+(pg===localPage?' cur':'')+'" data-pg="'+pg+'">'+pg+'</button>';
+    last=pg;
+  }
+  if(localPage<pages){html+='<button class="pg-btn" data-pg="next" title="\\u4E0B\\u4E00\\u9875">&#x203A;</button>';}
+  // \\u8DF3\\u9875\\u8F93\\u5165\\u6846\\uFF1A\\u672C\\u5730\\u9875\\u6709\\u603B\\u6570\\uFF0C\\u4EFB\\u610F 1~pages \\u8DF3\\u8F6C\\uFF0C\\u8D85\\u51FA\\u81EA\\u52A8\\u5C01\\u9876
+  html+='<span class="pg-goto">\\u8DF3\\u81F3<input id="pgInput" type="number" min="1" max="'+pages+'" inputmode="numeric" value="'+localPage+'" title="\\u5171 '+pages+' \\u9875"><button class="pg-btn" id="pgGo" type="button">GO</button></span>';
+  html+='</div></div>';
+  p.innerHTML=html;
+  bindPerPageSel();
+  var gi=$('pgInput'),gb=$('pgGo');
+  if(gi){gi.addEventListener('keydown',function(e){if(e.key==='Enter'){goToLocalPage(parseInt(gi.value,10));}});}
+  if(gb){gb.onclick=function(){goToLocalPage(parseInt(gi.value,10));};}
+  p.onclick=function(e){
+    var b=e.target.closest('.pg-btn');
+    if(!b){return;}
+    var v=b.getAttribute('data-pg');
+    if(v==='prev'){if(localPage>1){localPage--;renderLocal();window.scrollTo(0,0);}}
+    else if(v==='next'){if(localPage<pages){localPage++;renderLocal();window.scrollTo(0,0);}}
+    else{var n=parseInt(v,10);if(n>=1&&n<=pages){localPage=n;renderLocal();window.scrollTo(0,0);}}
+  };
+}
+// \\u672C\\u5730\\u9875\\u8DF3\\u9875\\uFF1A1~\\u603B\\u9875\\u6570\\uFF0C\\u8D85\\u51FA\\u81EA\\u52A8\\u5C01\\u9876
+function goToLocalPage(n){
+  var src=(page==='recent')?recents:favs;
+  var total=Math.max(1,Math.ceil(sortList(applyFilter(src.slice())).length/perPage));
+  if(!Number.isFinite(n)){toast('\\u8BF7\\u8F93\\u5165\\u6709\\u6548\\u9875\\u7801');return;}
+  n=Math.floor(n);
+  if(n<1){n=1;}
+  if(n>total){n=total;}
+  localPage=n;
+  renderLocal();
+  window.scrollTo(0,0);
+}
+function showLightbox(key){
+  if(!imgs.length){return;}
+  var idx=-1;
+  for(var i=0;i<imgs.length;i++){if(imgs[i].key===key){idx=i;break;}}
+  imgIdx=idx>=0?idx:0;
+  $('lightbox').classList.add('show');
+  lbShow();
+  recordRecent(imgs[imgIdx]);
+}
+function lbShow(){
+  var o=imgs[imgIdx];
+  if(!o){return;}
+  $('lbImg').src=urlOf(o.key);
+  $('lbCap').textContent=(imgIdx+1)+'/'+imgs.length+'  '+o.name;
+}
+function closeLb(){$('lightbox').classList.remove('show');$('lbImg').src='';}
+function openDetail(o){
+  curItem=o;
+  recordRecent(o);
+  $('shTitle').textContent=o.name;
+  $('shMeta').innerHTML='<b>\\u5927\\u5C0F</b>'+fmt(o.size)+'<br><b>\\u4FEE\\u6539\\u65F6\\u95F4</b>'+esc(fmtT(o.mtime))+'<br><b>\\u7C7B\\u578B</b>'+typeLabel[o.type]+'<br><b>\\u8DEF\\u5F84</b>'+esc(o.key);
+  var pv=$('shPreview');
+  var e=ext(o.name),t=o.type;
+  if(t==='vid'){
+    pv.innerHTML='<video controls autoplay src="'+urlOf(o.key)+'"></video>';
+  }else if(t==='aud'){
+    pv.innerHTML='<audio controls src="'+urlOf(o.key)+'"></audio>';
+  }else if(e==='pdf'){
+    pv.innerHTML='<iframe src="'+urlOf(o.key)+'"></iframe>';
+  }else if(e==='txt'||e==='md'||e==='csv'||e==='log'||e==='json'){
+    pv.innerHTML='<div class="ph"><span class="big">'+SVGICONS.txt+'</span>\\u52A0\\u8F7D\\u4E2D...</div>';
+    fetchText(o.key,pv);
+  }else if(t==='img'){
+    pv.innerHTML='<img src="'+urlOf(o.key)+'" alt="">';
+  }else{
+    pv.innerHTML='<div class="ph"><span class="big">'+icOf(o)+'</span>\\u8BE5\\u7C7B\\u578B\\u6682\\u4E0D\\u652F\\u6301\\u5728\\u7EBF\\u9884\\u89C8\\uFF0C\\u53EF\\u4E0B\\u8F7D\\u67E5\\u770B</div>';
+  }
+  var fav=isFav(o.key);
+  $('shFavBtn').innerHTML=fav?'&#x2B50; \\u5DF2\\u6536\\u85CF':'&#x2606; \\u6536\\u85CF';
+  $('shFavBtn').classList.toggle('primary',fav);
+  $('sheet').classList.add('show');
+}
+function fetchText(key,pv){
+  fetch(urlOf(key)).then(function(r){
+    if(!r.ok){throw new Error('HTTP '+r.status);}
+    return r.text();
+  }).then(function(t){
+    pv.innerHTML='<pre>'+esc(t.slice(0,200000))+'</pre>';
+  }).catch(function(){
+    pv.innerHTML='<div class="ph"><span class="big">'+SVGICONS.txt+'</span>\\u6587\\u672C\\u52A0\\u8F7D\\u5931\\u8D25</div>';
+  });
+}
+function saveFav(){try{localStorage.setItem('browse_fav',JSON.stringify(favs));}catch(e){}}
+function isFav(key){for(var i=0;i<favs.length;i++){if(favs[i].key===key){return true;}}return false;}
+function addFav(o){favs=favs.filter(function(x){return x.key!==o.key;});favs.unshift(o);saveFav();}
+function removeFav(key){favs=favs.filter(function(x){return x.key!==key;});saveFav();}
+function recordRecent(o){
+  recents=recents.filter(function(x){return x.key!==o.key;});
+  recents.unshift(o);
+  if(recents.length>200){recents=recents.slice(0,200);}
+  try{localStorage.setItem('browse_recent',JSON.stringify(recents));}catch(e){}
+}
+var VIEW_ICON={
+  grid:'<svg viewBox="0 0 24 24" fill="currentColor"><path d="M4 11h5V5H4v6zm0 7h5v-6H4v6zm6 0h5v-6h-5v6zm6 0h4v-6h-4v6zm-6-7h5V5h-5v6zm6-6v6h4V5h-4z"/></svg>',
+  list:'<svg viewBox="0 0 24 24" fill="currentColor"><path d="M3 14h4v-4H3v4zm0 5h4v-4H3v4zM3 9h4V5H3v4zm5 5h13v-4H8v4zm0 5h13v-4H8v4zM8 5v4h13V5H8z"/></svg>'
+};
+function updateViewBtn(){
+  $('viewIc').innerHTML=view==='grid'?VIEW_ICON.grid:VIEW_ICON.list;
+}
+var toastTimer=null;
+function toast(msg){
+  var t=$('toast');
+  t.textContent=msg;
+  t.classList.add('show');
+  clearTimeout(toastTimer);
+  toastTimer=setTimeout(function(){t.classList.remove('show');},1800);
+}
+// \\u7F29\\u7565\\u56FE\\u61D2\\u52A0\\u8F7D + \\u5E76\\u53D1\\u9650\\u6D41\\uFF1A\\u6700\\u591A\\u540C\\u65F6 4 \\u4E2A /browse/api/file \\u8BF7\\u6C42\\uFF0C
+// \\u907F\\u514D\\u5927\\u76EE\\u5F55\\u77AC\\u95F4\\u6253\\u6EE1 per-IP \\u9650\\u6D41(120/min)\\u6216\\u6324\\u5360 Worker \\u8D44\\u6E90
+var MAX_CONCURRENT=4;
+var thumbQueue=[];
+var thumbActive=0;
+function thumbPump(){
+  while(thumbActive<MAX_CONCURRENT&&thumbQueue.length){
+    var img=thumbQueue.shift();
+    if(!img||img.dataset.src===undefined){continue;}
     thumbActive++;
-    img.onload = () => { thumbActive--; thumbPump(); };
-    img.onerror = () => { thumbActive--; thumbPump(); };
-    img.src = img.dataset.src;
+    img.onload=function(){thumbActive--;thumbPump();};
+    img.onerror=function(){this.style.display='none';thumbActive--;thumbPump();};
+    img.src=img.dataset.src;
     img.removeAttribute('data-src');
   }
 }
-if ('IntersectionObserver' in window) {
-  io = new IntersectionObserver((entries) => {
-    for (const en of entries) {
-      if (en.isIntersecting) {
-        const img = en.target;
-        if (img.dataset.src) { thumbQueue.push(img); thumbPump(); }
-        io.unobserve(img);
+var io=null;
+if('IntersectionObserver' in window){
+  io=new IntersectionObserver(function(entries){
+    for(var i=0;i<entries.length;i++){
+      var en=entries[i];
+      if(en.isIntersecting){
+        var im=en.target;
+        if(im.dataset.src){thumbQueue.push(im);thumbPump();}
+        io.unobserve(im);
       }
     }
-  }, { rootMargin: '400px' });
+  },{rootMargin:'500px'});
 }
-function lazyBind(root) {
-  const imgs = (root || document).querySelectorAll('img.cimg[data-src], img.tthumb[data-src]');
-  imgs.forEach(img => { if (io) io.observe(img); else { thumbQueue.push(img); thumbPump(); } });
-}
-
-function renderTable() {
-  const folders = allData ? (allData.folders || []) : [];
-  const files = visibleList();
-  const tb = $('tbody');
-  let html = '';
-  for (const f of folders) {
-    const name = f.slice(0, -1).split('/').pop();
-    html += '<tr data-key="' + escAttr(f) + '" data-is="folder"><td class="tname">&#x1F4C1; ' + esc(name) + '</td><td>&#x2014;</td><td>&#x2014;</td><td>&#x6587;&#x4EF6;&#x5939;</td></tr>';
+function lazyBind(root){
+  var imgs=(root||document).querySelectorAll('img[data-src]');
+  for(var i=0;i<imgs.length;i++){
+    if(io){io.observe(imgs[i]);}
+    else{thumbQueue.push(imgs[i]);thumbPump();}
   }
-  for (const o of files) {
-    const thumb = o.type === 'img' ? '<img class="tthumb" loading="lazy" data-src="' + urlOf(o.key) + '" decoding="async">' : '';
-    html += '<tr data-key="' + escAttr(o.key) + '" data-is="file"><td class="tname">' + thumb + iconOf(o.name) + ' ' + esc(o.name) + '</td><td>' + fmt(o.size) + '</td><td>' + esc(fmtT(o.mtime)) + '</td><td>' + typeLabel(o) + '</td></tr>';
-  }
-  tb.innerHTML = html || '<tr><td colspan="4" style="text-align:center;color:var(--muted);padding:30px">&#xFF08;&#x7A7A;&#x76EE;&#x5F55;&#xFF09;</td></tr>';
-  lazyBind(tb);
-  tb.onclick = (e) => {
-    const tr = e.target.closest('tr');
-    if (!tr) return;
-    const key = tr.dataset.key || '';
-    if (tr.dataset.is === 'folder') { open(key); return; }
-    selectRow(key);
-  };
-  if (selKey) document.querySelectorAll('#table tr').forEach(r => r.classList.toggle('sel', r.dataset.key === selKey));
 }
-
-function selectRow(key) {
-  selKey = key;
-  document.querySelectorAll('#table tr').forEach(r => r.classList.toggle('sel', r.dataset.key === key));
-  const item = (allData.files || []).map(f => {
-    const n = f.key.split('/').pop();
-    return { key: f.key, name: n, size: f.size || 0, mtime: f.mtime || '', type: typeOf(n) };
-  }).find(x => x.key === key);
-  if (!item) return;
-  const thumb = item.type === 'img' ? '<img class="side-thumb" src="' + urlOf(item.key) + '">' : '<div class="side-ic">' + iconOf(item.name) + '</div>';
-  $('side').innerHTML = thumb +
-    '<div class="sname">' + esc(item.name) + '</div>' +
-    '<div class="smeta">&#x5927;&#x5C0F;: ' + fmt(item.size) + '<br>&#x4FEE;&#x6539;&#x65F6;&#x95F4;: ' + esc(fmtT(item.mtime)) + '<br>&#x7C7B;&#x578B;: ' + typeLabel(item) + '<br>&#x8DEF;&#x5F84;: ' + esc(item.key) + '</div>' +
-    '<div class="sbtns"><button class="btn" data-a="prev">&#x9884;&#x89C8;</button><button class="btn" data-a="dl">&#x4E0B;&#x8F7D;</button></div>';
-  $('side').classList.add('show');
-  $('side').onclick = (e) => {
-    const b = e.target.closest('.btn');
-    if (!b) return;
-    if (b.dataset.a === 'dl') window.location.href = urlOf(item.key);
-    else if (item.type === 'img') showLightbox(item.key);
-    else preview(item.key);
-  };
+var side=$('sidebar');
+var scrim=$('scrim');
+function closeSidebar(){side.classList.remove('open');scrim.classList.remove('show');}
+$('menuBtn').onclick=function(){side.classList.toggle('open');scrim.classList.toggle('show');};
+scrim.onclick=closeSidebar;
+var navs=document.querySelectorAll('.sb-item');
+for(var ni=0;ni<navs.length;ni++){
+  navs[ni].addEventListener('click',function(){
+    var n=this.getAttribute('data-nav');
+    if(n==='sec'){ updateSecUI(); openModal('secModal'); closeSidebar(); return; }
+    page=n;
+    localPage=1;
+    for(var k=0;k<navs.length;k++){navs[k].classList.toggle('on',navs[k]===this);}
+    closeSidebar();
+    if(n==='home'){load(true);}else{renderLocal();}
+    window.scrollTo(0,0);
+  });
 }
-
-$('viewBtn').onclick = () => {
-  view = view === 'grid' ? 'table' : 'grid';
-  $('viewBtn').innerHTML = view === 'grid' ? '&#x8868;&#x683C;' : '&#x5361;&#x7247;';
-  $('grid').style.display = view === 'grid' ? '' : 'none';
-  $('tableWrap').style.display = view === 'table' ? '' : 'none';
-  if (view === 'table') renderTable();
+$('brand').onclick=function(){
+  page='home';
+  for(var k=0;k<navs.length;k++){navs[k].classList.toggle('on',navs[k].getAttribute('data-nav')==='home');}
+  load(true);
 };
-document.querySelectorAll('#table th[data-s]').forEach(th => {
-  th.onclick = () => {
-    const field = th.dataset.s;
-    sortVal = (sortVal === field + '-asc') ? field + '-desc' : field + '-asc';
-    $('sort').value = sortVal;
+var sb=$('searchbar');
+var si=$('search');
+function showSearch(show){
+  if(show){
+    sb.style.display='';
+    si.focus();
+  }else{
+    sb.style.display='none';
+    si.value='';
+    keyword='';
     render();
-  };
+  }
+}
+$('searchBtn').onclick=function(){showSearch(sb.style.display==='none');};
+si.addEventListener('input',function(){keyword=si.value;render();});
+$('viewBtn').onclick=function(){
+  view=view==='grid'?'list':'grid';
+  try{localStorage.setItem('browseView',view);}catch(e){}
+  updateViewBtn();
+  render();
+};
+$('themeBtn').onclick=function(){
+  document.body.classList.toggle('dark');
+  try{localStorage.setItem('browseDark',document.body.classList.contains('dark')?'1':'0');}catch(e){}
+  $('themeBtn').innerHTML=document.body.classList.contains('dark')?'&#x2600;&#xFE0F;':'&#x1F319;';
+};
+$('mailBtn').onclick=function(){
+  window.location.href='https://mail.duckgame-play.top';
+};
+$('logoutBtn').onclick=function(){
+  // HttpOnly cookie \\u524D\\u7AEF JS \\u5220\\u4E0D\\u6389\\uFF0C\\u8D70\\u670D\\u52A1\\u7AEF /browse/logout\\uFF08Set-Cookie \\u6E05\\u9664\\u540E\\u518D\\u8DF3\\u8F6C\\uFF09
+  window.location.href='/browse/logout';
+};
+$('upBtn').onclick=function(){if(page==='home'){up();}};
+$('sort').addEventListener('change',function(){sortVal=this.value;render();});
+$('chips').addEventListener('click',function(e){
+  var c=e.target.closest('.chip');
+  if(!c){return;}
+  filter=c.getAttribute('data-f');
+  var cs=document.querySelectorAll('.chip');
+  for(var i=0;i<cs.length;i++){cs[i].classList.toggle('on',cs[i]===c);}
+  render();
 });
-
+// \\u5173\\u95ED\\u5F39\\u5C42\\u65F6\\u6682\\u505C/\\u91CA\\u653E\\u5A92\\u4F53\\uFF1A\\u5426\\u5219 video/audio \\u5143\\u7D20\\u53EA\\u662F\\u88AB\\u9690\\u85CF\\uFF0C\\u4ECD\\u4F1A\\u7EE7\\u7EED\\u64AD\\u653E\\u4E0E\\u4E0B\\u8F7D
+function closeSheet(){
+  var pv=$('shPreview');
+  var v=pv.querySelector('video');
+  var a=pv.querySelector('audio');
+  if(v){v.pause();v.removeAttribute('src');v.load();}
+  if(a){a.pause();a.removeAttribute('src');a.load();}
+  $('sheet').classList.remove('show');
+}
+$('shClose').onclick=closeSheet;
+$('sheet').onclick=function(e){if(e.target===$('sheet')){closeSheet();}};
+$('shDlBtn').onclick=function(){if(curItem){recordRecent(curItem);window.location.href=urlOf(curItem.key);}};
+$('shFavBtn').onclick=function(){
+  if(!curItem){return;}
+  if(isFav(curItem.key)){
+    removeFav(curItem.key);
+    $('shFavBtn').innerHTML='&#x2606; \\u6536\\u85CF';
+    $('shFavBtn').classList.remove('primary');
+    toast('\\u5DF2\\u53D6\\u6D88\\u6536\\u85CF');
+  }else{
+    addFav(curItem);
+    $('shFavBtn').innerHTML='&#x2B50; \\u5DF2\\u6536\\u85CF';
+    $('shFavBtn').classList.add('primary');
+    toast('\\u5DF2\\u52A0\\u5165\\u6536\\u85CF');
+  }
+};
+// \\u300C\\u590D\\u5236\\u94FE\\u63A5\\u300D\\u6309\\u94AE\\u5DF2\\u79FB\\u9664\\uFF1A\\u907F\\u514D\\u66B4\\u9732\\u6587\\u4EF6\\u8DEF\\u5F84\\u7ED3\\u6784\\uFF08key \\u76F4\\u63A5\\u51FA\\u73B0\\u5728 URL \\u4E2D\\uFF09\\u3002
+// \\u9700\\u8981\\u7684\\u53EA\\u6709\\u300C\\u4E0B\\u8F7D\\u300D\\u4E0E\\u300C\\u6536\\u85CF\\u300D\\uFF0C\\u5176\\u5B83\\u64CD\\u4F5C\\u5728\\u6587\\u4EF6\\u5217\\u8868\\u5185\\u5373\\u53EF\\u5B8C\\u6210\\u3002
+$('lbPrev').onclick=function(){imgIdx=(imgIdx-1+imgs.length)%imgs.length;lbShow();};
+$('lbNext').onclick=function(){imgIdx=(imgIdx+1)%imgs.length;lbShow();};
+$('lbClose').onclick=closeLb;
+$('lightbox').onclick=function(e){if(e.target===$('lightbox')){closeLb();}};
+var tx=0,ty=0;
+$('lightbox').addEventListener('touchstart',function(e){tx=e.touches[0].clientX;ty=e.touches[0].clientY;});
+$('lightbox').addEventListener('touchend',function(e){
+  var dx=e.changedTouches[0].clientX-tx;
+  var dy=e.changedTouches[0].clientY-ty;
+  if(Math.abs(dx)>50&&Math.abs(dx)>Math.abs(dy)){
+    if(dx<0){imgIdx=(imgIdx+1)%imgs.length;}else{imgIdx=(imgIdx-1+imgs.length)%imgs.length;}
+    lbShow();
+  }
+});
+document.addEventListener('keydown',function(e){
+  if((e.ctrlKey||e.metaKey)&&(e.key==='k'||e.key==='K')){
+    e.preventDefault();
+    showSearch(sb.style.display==='none');
+    return;
+  }
+  if(e.key==='Escape'){
+    if(sb.style.display!=='none'){showSearch(false);render();}
+    closeLb();
+    closeSheet();
+    closeModal('bindModal');
+    closeModal('secModal');
+    return;
+  }
+  if(e.key==='ArrowLeft'&&$('lightbox').classList.contains('show')){imgIdx=(imgIdx-1+imgs.length)%imgs.length;lbShow();}
+  else if(e.key==='ArrowRight'&&$('lightbox').classList.contains('show')){imgIdx=(imgIdx+1)%imgs.length;lbShow();}
+});
+try{
+  if(localStorage.getItem('browseDark')==='1'){document.body.classList.add('dark');$('themeBtn').innerHTML='&#x2600;&#xFE0F;';}
+  view=localStorage.getItem('browseView')||'list';
+}catch(e){}
+// =====================================================================
+// \\u4E24\\u6B65\\u9A8C\\u8BC1\\uFF082FA / TOTP\\uFF09\\u5F39\\u6846\\uFF1A\\u9996\\u6B21\\u767B\\u5F55\\u4E3B\\u52A8\\u63D0\\u793A\\u7ED1\\u5B9A\\uFF1B\\u300C\\u5B89\\u5168\\u300D\\u53EF\\u7BA1\\u7406
+// =====================================================================
+function openModal(id){var m=$(id);if(m){m.classList.add('show');}}
+function closeModal(id){var m=$(id);if(m){m.classList.remove('show');}}
+var bindSecretVal='';
+function openBind(needCurrent){
+  $('bindErr').innerHTML='';
+  $('bindCode').value='';
+  $('bindCurrent').value='';
+  $('bindCurStep').style.display=needCurrent?'':'none';
+  $('bindTitle').textContent=needCurrent?'\\u91CD\\u65B0\\u7ED1\\u5B9A\\u4E24\\u6B65\\u9A8C\\u8BC1\\uFF082FA\\uFF09':'\\u7ED1\\u5B9A\\u4E24\\u6B65\\u9A8C\\u8BC1\\uFF082FA\\uFF09';
+  $('bindSecret').textContent='\\u52A0\\u8F7D\\u4E2D...';
+  $('bindUri').setAttribute('href','#');
+  bindSecretVal='';
+  fetch('/browse/api/2fa/new')
+  .then(function(r){return r.json();})
+  .then(function(j){
+    if(j&&j.secret){
+      bindSecretVal=j.secret;
+      $('bindSecret').textContent=j.secret.replace(/(.{4})/g,'$1 ').trim();
+      $('bindUri').setAttribute('href',j.otpauth);
+      $('bindUri').textContent='\\u70B9\\u51FB\\u6253\\u5F00 otpauth \\u94FE\\u63A5';
+    }else{
+      $('bindErr').innerHTML=(j&&j.error)||'\\u83B7\\u53D6\\u5BC6\\u94A5\\u5931\\u8D25';
+    }
+  })
+  .catch(function(e){$('bindErr').innerHTML='\\u83B7\\u53D6\\u5BC6\\u94A5\\u5931\\u8D25\\uFF1A'+String((e&&e.message)||e);});
+  openModal('bindModal');
+}
+$('bindCopy').onclick=function(){
+  if(!bindSecretVal){return;}
+  var s=bindSecretVal;
+  if(navigator.clipboard&&navigator.clipboard.writeText){
+    navigator.clipboard.writeText(s).then(function(){toast('\\u5BC6\\u94A5\\u5DF2\\u590D\\u5236');},function(){toast('\\u590D\\u5236\\u5931\\u8D25\\uFF0C\\u8BF7\\u624B\\u52A8\\u9009\\u62E9');});
+  }else{
+    var ta=document.createElement('textarea');
+    ta.value=s;
+    document.body.appendChild(ta);
+    ta.select();
+    try{document.execCommand('copy');toast('\\u5BC6\\u94A5\\u5DF2\\u590D\\u5236');}catch(e){toast('\\u590D\\u5236\\u5931\\u8D25\\uFF0C\\u8BF7\\u624B\\u52A8\\u9009\\u62E9');}
+    document.body.removeChild(ta);
+  }
+};
+$('bindClose').onclick=function(){closeModal('bindModal');};
+$('bindLater').onclick=function(){closeModal('bindModal');try{sessionStorage.setItem('skip2fa','1');}catch(e){}};
+$('bindOk').onclick=function(){
+  if(!bindSecretVal){return;}
+  var code=$('bindCode').value.replace(/[^0-9]/g,'');
+  var cur=$('bindCurrent').value.replace(/[^0-9]/g,'');
+  if(code.length!==6){$('bindErr').innerHTML='\\u8BF7\\u8F93\\u5165 App \\u663E\\u793A\\u7684 6 \\u4F4D\\u9A8C\\u8BC1\\u7801';return;}
+  var fd=new FormData();
+  fd.append('secret',bindSecretVal);
+  fd.append('code',code);
+  if(CFG.totpBound){fd.append('current',cur);}
+  $('bindOk').disabled=true;
+  fetch('/browse/api/2fa/bind',{method:'POST',body:fd})
+  .then(function(r){return r.json().then(function(j){return {s:r.status,j:j};});})
+  .then(function(o){
+    $('bindOk').disabled=false;
+    if(o.s===200&&o.j&&o.j.ok){
+      CFG.totpBound=true;
+      CFG.needs2faBind=false;
+      try{sessionStorage.removeItem('skip2fa');}catch(e){}
+      updateSecUI();
+      closeModal('bindModal');
+      toast('\\u4E24\\u6B65\\u9A8C\\u8BC1\\u5DF2\\u5F00\\u542F');
+    }else{
+      $('bindErr').innerHTML=(o.j&&o.j.error)||('\\u7ED1\\u5B9A\\u5931\\u8D25 HTTP '+o.s);
+    }
+  })
+  .catch(function(e){$('bindOk').disabled=false;$('bindErr').innerHTML='\\u7ED1\\u5B9A\\u5931\\u8D25\\uFF1A'+String((e&&e.message)||e);});
+};
+function updateSecUI(){
+  $('secStatus').textContent=CFG.totpBound?'\\u5DF2\\u7ED1\\u5B9A':'\\u672A\\u7ED1\\u5B9A';
+  $('secCodeStep').style.display=CFG.totpBound?'':'none';
+  $('secBind').textContent=CFG.totpBound?'\\u91CD\\u65B0\\u7ED1\\u5B9A':'\\u7ED1\\u5B9A 2FA';
+  $('secDisable').style.display=CFG.totpBound?'':'none';
+}
+$('secClose').onclick=function(){closeModal('secModal');};
+$('secBind').onclick=function(){
+  if(!CFG.kvBound){toast('\\u672A\\u7ED1\\u5B9A BROWSE_KV\\uFF0C\\u65E0\\u6CD5\\u4F7F\\u7528 2FA');return;}
+  $('secErr').innerHTML='';
+  if(CFG.totpBound){
+    var c=$('secCode').value.replace(/[^0-9]/g,'');
+    if(c.length!==6){$('secErr').innerHTML='\\u8BF7\\u5148\\u8F93\\u5165\\u5F53\\u524D 6 \\u4F4D\\u9A8C\\u8BC1\\u7801';return;}
+  }
+  openBind(CFG.totpBound);
+  if(CFG.totpBound){$('bindCurrent').value=$('secCode').value.replace(/[^0-9]/g,'');}
+};
+$('secDisable').onclick=function(){
+  var c=$('secCode').value.replace(/[^0-9]/g,'');
+  if(c.length!==6){$('secErr').innerHTML='\\u8BF7\\u8F93\\u5165\\u5F53\\u524D 6 \\u4F4D\\u9A8C\\u8BC1\\u7801';return;}
+  if(!window.confirm('\\u786E\\u5B9A\\u5173\\u95ED\\u4E24\\u6B65\\u9A8C\\u8BC1\\uFF1F')){return;}
+  var fd=new FormData();
+  fd.append('code',c);
+  fetch('/browse/api/2fa/disable',{method:'POST',body:fd})
+  .then(function(r){return r.json().then(function(j){return {s:r.status,j:j};});})
+  .then(function(o){
+    if(o.s===200&&o.j&&o.j.ok){
+      CFG.totpBound=false;
+      updateSecUI();
+      $('secErr').innerHTML='';
+      toast('\\u4E24\\u6B65\\u9A8C\\u8BC1\\u5DF2\\u5173\\u95ED');
+    }else{
+      $('secErr').innerHTML=(o.j&&o.j.error)||('\\u64CD\\u4F5C\\u5931\\u8D25 HTTP '+o.s);
+    }
+  })
+  .catch(function(e){$('secErr').innerHTML='\\u64CD\\u4F5C\\u5931\\u8D25\\uFF1A'+String((e&&e.message)||e);});
+};
+// \\u9996\\u6B21\\u767B\\u5F55\\uFF08\\u5C1A\\u672A\\u7ED1\\u5B9A 2FA\\uFF09\\u4E3B\\u52A8\\u5F39\\u51FA\\u7ED1\\u5B9A\\u63D0\\u793A\\uFF1B\\u672C\\u6B21\\u4F1A\\u8BDD\\u70B9\\u8FC7\\u300C\\u7A0D\\u540E\\u300D\\u5219\\u4E0D\\u518D\\u6253\\u6270
+if(CFG.needs2faBind){
+  var skip2fa=false;
+  try{skip2fa=sessionStorage.getItem('skip2fa')==='1';}catch(e){}
+  if(!skip2fa){setTimeout(function(){openBind(false);},500);}
+}
+updateSecUI();
+updateViewBtn();
 load(true);
-</script></body></html>`;
+</script>
+</body></html>`;
+}
+// =====================================================================
+// 【临时网盘】/temp —— 独立于只读网盘 /browse 的临时文件存储
+// ---------------------------------------------------------------------
+//   - 独立密码 TEMP_PASS（普通密码登录，不使用 2FA）
+//   - 独立 KV：TEMP_KV（未绑定时回退 BROWSE_KV）
+//   - 文件到期由 KV expirationTtl 自动删除
+//   - 未配置 TEMP_PASS 或未绑定 KV 时显示配置提示页
+// =====================================================================
+function tempDisabledHtml(reason) {
+  return `<!DOCTYPE html>
+<html lang="zh-CN"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>&#x4E34;&#x65F6;&#x7F51;&#x76D8; &#xB7; &#x672A;&#x542F;&#x7528;</title>
+<style>
+  *{box-sizing:border-box}
+  body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;background:#f7f8fa;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif;color:#1f2329;padding:20px}
+  .box{max-width:440px;background:#fff;border-radius:12px;box-shadow:0 10px 30px -5px rgba(0,0,0,.08);padding:36px 30px;text-align:center}
+  .box h1{font-size:18px;margin:0 0 10px}
+  .box p{font-size:13px;color:#7a828e;line-height:1.9;margin:0}
+  .box code{background:#f7f8fa;border:1px solid rgba(0,0,0,.08);border-radius:6px;padding:1px 6px;font-family:ui-monospace,Consolas,monospace}
+</style></head><body>
+<div class="box">
+  <h1>&#x4E34;&#x65F6;&#x7F51;&#x76D8;&#x672A;&#x542F;&#x7528;</h1>
+  <p>${reason}<br>&#x8BF7;&#x5728; Worker &#x73AF;&#x5883;&#x53D8;&#x91CF;&#x4E2D;&#x914D;&#x7F6E; <code>TEMP_PASS</code>&#xFF0C;&#x5E76;&#x7ED1;&#x5B9A; KV &#x547D;&#x540D;&#x7A7A;&#x95F4; <code>TEMP_KV</code>&#xFF08;&#x6216; <code>BROWSE_KV</code>&#xFF09;&#x3002;</p>
+</div>
+</body></html>`;
 }
 
+function tempLoginHtml(env) {
+  return `<!DOCTYPE html>
+<html lang="zh-CN"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#1890ff">
+<title>&#x767B;&#x5F55; &#xB7; &#x4E34;&#x65F6;&#x7F51;&#x76D8;</title>
+<style>
+:root{--primary:#1890ff;--text:#1f2329;--muted:#9aa0a8}
+body.dark{--primary:#4d9fff;--text:#e8eaed;--muted:#6b7280}
+*{box-sizing:border-box}
+body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif;background:#f7f8fa;color:var(--text);display:flex;align-items:center;justify-content:center;min-height:100vh;padding:20px;transition:background .2s,color .2s}
+body.dark{background:#0f1013}
+.card{width:min(92vw,360px);background:#fff;border-radius:12px;padding:36px 30px 26px;box-shadow:0 10px 30px -5px rgba(0,0,0,.08);text-align:center}
+body.dark .card{background:#1b1d21;box-shadow:0 10px 30px -5px rgba(0,0,0,.5)}
+.logo{width:52px;height:52px;margin:0 auto 12px;color:var(--primary)}
+h1{font-size:21px;margin:0 0 6px;font-weight:700}
+.sub{font-size:13px;color:var(--muted);margin:0 0 24px}
+input[type=password]{width:100%;height:45px;border:1px solid #e4e7ec;border-radius:12px;padding:0 15px;font-size:15px;outline:none;background:#f7f8fa;margin-bottom:14px;color:var(--text);transition:border .15s,background .15s}
+input[type=password]:focus{border-color:var(--primary);background:#fff}
+body.dark input[type=password]{background:#232529;border-color:#2a2c30}
+button[type=submit]{width:100%;height:45px;border:0;border-radius:12px;background:var(--primary);color:#fff;font-size:16px;font-weight:bold;cursor:pointer;transition:background .15s,opacity .15s}
+button[type=submit]:hover{background:#147ad6}
+button[type=submit]:disabled{opacity:.5;cursor:not-allowed}
+.err{min-height:20px;margin:10px 0 0;font-size:13px;color:#e5484d;line-height:20px}
+.hint{margin-top:22px;font-size:11px;color:#b9bec6}
+body.dark .hint{color:#626a78}
+.theme-btn{position:fixed;top:14px;right:14px;width:36px;height:36px;border:0;border-radius:10px;background:#fff;color:#1f2329;font-size:16px;cursor:pointer;box-shadow:0 2px 8px rgba(0,0,0,.08)}
+body.dark .theme-btn{background:#1b1d21;color:#e8eaed}
+</style></head><body>
+<button class="theme-btn" id="themeBtn" title="&#x4E3B;&#x9898;">&#x1F319;</button>
+<div class="card">
+  <svg class="logo" viewBox="0 0 24 24" fill="currentColor"><path d="M11.99 2C6.47 2 2 6.48 2 12s4.47 10 9.99 10C17.52 22 22 17.52 22 12S17.52 2 11.99 2zM12 20c-4.42 0-8-3.58-8-8s3.58-8 8-8 8 3.58 8 8-3.58 8-8 8zm.5-13H11v6l5.25 3.15.75-1.23-4.5-2.67z"/></svg>
+  <h1>&#x4E34;&#x65F6;&#x7F51;&#x76D8;</h1>
+  <p class="sub">&#x8F93;&#x5165;&#x8BBF;&#x95EE;&#x5BC6;&#x7801;&#x4EE5;&#x7EE7;&#x7EED;</p>
+  <form method="post" action="/temp/login" id="loginForm">
+    <input type="password" name="p" placeholder="&#x8BBF;&#x95EE;&#x5BC6;&#x7801;" required autofocus>
+    <button type="submit" id="loginBtn">&#x767B;&#x5F55;</button>
+  </form>
+  <div class="err" id="loginErr"></div>
+  <div class="hint">&#x4E34;&#x65F6;&#x6587;&#x4EF6; &middot; KV &#x5B58;&#x50A8; &middot; &#x5230;&#x671F;&#x81EA;&#x52A8;&#x5220;&#x9664;</div>
+</div>
+<script>
+var btn=document.getElementById('loginBtn');
+var form=document.getElementById('loginForm');
+var err=document.getElementById('loginErr');
+var original=btn.textContent;
+function setDark(d){
+  document.body.classList.toggle('dark',d);
+  try{ localStorage.setItem('tempDark',d?'1':'0'); }catch(e){}
+  var b=document.getElementById('themeBtn');
+  if(b){ b.innerHTML=d?'&#x2600;&#xFE0F;':'&#x1F319;'; }
+}
+try{
+  var saved=localStorage.getItem('tempDark');
+  setDark(saved==='1'||(saved===null&&window.matchMedia&&window.matchMedia('(prefers-color-scheme: dark)').matches));
+}catch(e){}
+var tb=document.getElementById('themeBtn');
+if(tb){ tb.onclick=function(){ setDark(!document.body.classList.contains('dark')); }; }
+form.addEventListener('submit',function(ev){
+  ev.preventDefault();
+  if(btn.disabled){ return; }
+  btn.disabled=true;
+  btn.textContent='\\u767B\\u5F55\\u4E2D\\u2026';
+  var fd=new FormData(form);
+  fetch(form.action,{method:'POST',body:fd,credentials:'same-origin'})
+  .then(function(r){
+    if(r.redirected||(r.ok&&r.url.indexOf('/temp')>=0)){ window.location.href='/temp'; return null; }
+    return r.text().then(function(t){ return {status:r.status,text:t}; });
+  })
+  .then(function(o){
+    if(!o){ return; }
+    if(o.status===429){ err.innerHTML='\\u8BF7\\u6C42\\u8FC7\\u4E8E\\u9891\\u7E41\\uFF0C\\u8BF7\\u7A0D\\u540E\\u518D\\u8BD5'; }
+    else if(o.text){ err.innerHTML=o.text; }
+    else { err.innerHTML='\\u767B\\u5F55\\u5931\\u8D25\\uFF0C\\u8BF7\\u91CD\\u8BD5'; }
+    btn.disabled=false;
+    btn.textContent=original;
+  })
+  .catch(function(){
+    err.innerHTML='\\u7F51\\u7EDC\\u9519\\u8BEF\\uFF0C\\u8BF7\\u91CD\\u8BD5';
+    btn.disabled=false;
+    btn.textContent=original;
+  });
+});
+</script>
+</body></html>`;
+}
+
+function tempIndexHtml(cfg) {
+  const cfgJson = JSON.stringify(cfg || {}).replace(/</g, '\\u003c');
+  return `<!DOCTYPE html>
+<html lang="zh-CN"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#1890ff">
+<title>&#x4E34;&#x65F6;&#x7F51;&#x76D8;</title>
+<style>
+:root{--primary:#1890ff;--primary-weak:rgba(24,144,255,.15);--bg:#f7f8fa;--card:#ffffff;--text:#1f2329;--sub:#7a828e;--muted:#9aa0a8;--hover:rgba(132,133,141,0.18);--line:rgba(0,0,0,.08);--shadow:0 10px 30px -5px rgba(0,0,0,.08);--radius:12px}
+body.dark{--primary:#4d9fff;--primary-weak:rgba(77,159,255,.15);--bg:#0f1013;--card:#1b1d21;--text:#e8eaed;--sub:#9aa0aa;--muted:#6b7280;--hover:rgba(255,255,255,.12);--line:rgba(255,255,255,.08);--shadow:0 10px 30px -5px rgba(0,0,0,.5)}
+*{box-sizing:border-box}
+html,body{margin:0;padding:0}
+body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif,"Apple Color Emoji","Segoe UI Emoji","Segoe UI Symbol";background:var(--bg);color:var(--text);-webkit-font-smoothing:antialiased;transition:background .2s,color .2s}
+button{font-family:inherit;color:var(--text);cursor:pointer}
+.topbar{position:sticky;top:0;z-index:60;display:flex;align-items:center;height:60px;padding:0 12px;background:var(--bg);transition:background .2s}
+.brand{display:flex;align-items:center;gap:10px;font-size:16px;font-weight:700;user-select:none;white-space:nowrap}
+.brand .logo{width:30px;height:30px;color:var(--primary)}
+.hright{display:flex;align-items:center;gap:8px;margin-left:auto}
+.pill{display:inline-flex;align-items:center;gap:6px;height:34px;padding:0 12px;border:0;border-radius:8px;background:var(--primary-weak);color:var(--primary);font-size:14px;cursor:pointer;text-decoration:none;transition:background .15s}
+.pill:hover{background:rgba(24,144,255,.25)}
+body.dark .pill:hover{background:rgba(77,159,255,.25)}
+.pill svg{width:16px;height:16px}
+.iconbtn{width:34px;height:34px;border:0;border-radius:8px;background:transparent;color:var(--sub);font-size:16px;display:inline-flex;align-items:center;justify-content:center;text-decoration:none;transition:background .15s,color .15s}
+.iconbtn:hover{background:var(--hover);color:var(--text)}
+.iconbtn:active{transform:scale(.94)}
+.iconbtn svg{width:18px;height:18px}
+.layout{max-width:min(99%,980px);margin:0 auto;min-height:calc(100vh - 60px);padding:0 12px 30px}
+.objcard{background:var(--card);border-radius:var(--radius);padding:10px;box-shadow:var(--shadow);transition:background .2s,box-shadow .2s}
+.tmp-bar{display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding:4px 2px 12px}
+.btn{height:38px;border:1px solid var(--line);border-radius:8px;background:var(--card);color:var(--text);font-size:13px;display:inline-flex;align-items:center;justify-content:center;gap:5px;padding:0 14px;transition:background .15s}
+.btn:hover{background:var(--hover)}
+.btn.primary{background:var(--primary);border-color:var(--primary);color:#fff}
+.btn.primary:hover{filter:brightness(1.06)}
+.btn:disabled{opacity:.5;cursor:not-allowed}
+.tmp-hint{font-size:12px;color:var(--muted);line-height:1.6}
+.lhead{display:flex;align-items:center;gap:8px;padding:8px 12px;color:var(--muted);font-size:14px;font-weight:700;border-bottom:1px solid var(--line)}
+.lname{flex:1;min-width:0;display:flex;align-items:center;gap:10px;overflow:hidden;white-space:nowrap}
+.lname .lic{flex-shrink:0;color:var(--primary);display:inline-flex}
+.lname .lic svg{width:22px;height:22px}
+.lname .lnm{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.lsize{width:28%;text-align:right;flex-shrink:0;color:var(--sub);font-size:14px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.lmod{width:24%;text-align:right;flex-shrink:0;color:var(--muted);font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.lrow{display:flex;align-items:center;gap:8px;padding:10px 12px;border-radius:8px;transition:background .15s;animation:itemIn .2s ease}
+.lrow:hover{background:var(--hover)}
+@keyframes itemIn{from{opacity:0;transform:scale(.98)}to{opacity:1;transform:scale(1)}}
+.tmp-act{width:76px;flex-shrink:0;display:flex;justify-content:flex-end;gap:6px}
+.tmp-act-h{width:76px;flex-shrink:0}
+.tmp-a{width:30px;height:30px;border:1px solid var(--line);border-radius:8px;background:var(--card);color:var(--sub);display:inline-flex;align-items:center;justify-content:center;font-size:13px;text-decoration:none;cursor:pointer}
+.tmp-a:hover{border-color:var(--primary);color:var(--primary)}
+.status{display:flex;flex-direction:column;align-items:center;gap:12px;padding:46px 0;color:var(--muted);font-size:14px}
+.spinner{width:26px;height:26px;border:3px solid var(--line);border-top-color:var(--primary);border-radius:50%;animation:spin .8s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+.footer{text-align:center;font-size:12px;color:var(--muted);padding:20px 0 6px}
+#toast{position:fixed;left:50%;bottom:26px;transform:translateX(-50%) translateY(20px);background:rgba(20,22,26,.92);color:#fff;padding:9px 16px;border-radius:10px;font-size:13px;opacity:0;pointer-events:none;transition:all .25s;z-index:200;max-width:86vw;text-align:center}
+#toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
+@media (max-width:760px){
+  .lmod{display:none}
+  .lsize{width:76px}
+  .tmp-act,.tmp-act-h{width:64px}
+  .tmp-hint{width:100%}
+  .brand .bname{display:none}
+}
+</style></head><body>
+<header class="topbar">
+  <div class="brand">
+    <svg class="logo" viewBox="0 0 24 24" fill="currentColor"><path d="M11.99 2C6.47 2 2 6.48 2 12s4.47 10 9.99 10C17.52 22 22 17.52 22 12S17.52 2 11.99 2zM12 20c-4.42 0-8-3.58-8-8s3.58-8 8-8 8 3.58 8 8-3.58 8-8 8zm.5-13H11v6l5.25 3.15.75-1.23-4.5-2.67z"/></svg>
+    <span class="bname">&#x4E34;&#x65F6;&#x7F51;&#x76D8;</span>
+  </div>
+  <div class="hright">
+    <a class="pill" href="/browse" title="&#x53EA;&#x8BFB;&#x7F51;&#x76D8;">
+      <svg viewBox="0 0 24 24" fill="currentColor"><path d="M10 4H4c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V8c0-1.1-.9-2-2-2h-8l-2-2z"/></svg>
+      <span>&#x53EA;&#x8BFB;&#x7F51;&#x76D8;</span>
+    </a>
+    <a class="iconbtn" href="https://mail.duckgame-play.top" title="&#x8FD4;&#x56DE;&#x90AE;&#x4EF6;">
+      <svg viewBox="0 0 24 24" fill="currentColor"><path d="M20 4H4c-1.1 0-1.99.9-1.99 2L2 18c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V6c0-1.1-.9-2-2-2zm0 4l-8 5-8-5V6l8 5 8-5v2z"/></svg>
+    </a>
+    <button class="iconbtn" id="themeBtn" title="&#x4E3B;&#x9898;">&#x1F319;</button>
+    <a class="iconbtn" href="/temp/logout" title="&#x9000;&#x51FA;">
+      <svg viewBox="0 0 24 24" fill="currentColor"><path d="M10.09 15.59L11.5 17l5-5-5-5-1.41 1.41L12.67 11H3v2h9.67l-2.58 2.59zM19 3H5c-1.11 0-2 .9-2 2v4h2V5h14v14H5v-4H3v4c0 1.1.89 2 2 2h14c1.1 0 2-.9 2-2V5c0-1.1-.9-2-2-2z"/></svg>
+    </a>
+  </div>
+</header>
+<div class="layout">
+  <div class="objcard">
+    <div class="tmp-bar">
+      <button class="btn primary" id="tempUpBtn" type="button">&#x4E0A;&#x4F20;&#x6587;&#x4EF6;</button>
+      <input type="file" id="tempFile" multiple style="display:none">
+      <span class="tmp-hint" id="tmpHint"></span>
+    </div>
+    <div id="filelist"></div>
+  </div>
+  <footer class="footer">&#x4E34;&#x65F6;&#x6587;&#x4EF6; &middot; &#x5230;&#x671F;&#x81EA;&#x52A8;&#x5220;&#x9664; &middot; cos-exchange</footer>
+</div>
+<div id="toast"></div>
+<script>
+var CFG=${cfgJson};
+var $=function(id){return document.getElementById(id);};
+var esc=function(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/'/g,'&#39;').replace(/"/g,'&quot;');};
+var IMG=['png','jpg','jpeg','gif','webp','bmp','svg','ico','heic','avif','jfif'];
+var VID=['mp4','mkv','mov','avi','webm','m4v','wmv','flv','ts','3gp','rmvb'];
+var AUD=['mp3','wav','flac','ogg','m4a','aac','opus','ape','amr'];
+var DOC=['doc','docx','xls','xlsx','ppt','pptx'];
+var ARC=['zip','rar','7z','tar','gz','bz2','xz','7zip','tgz'];
+var CODE=['js','css','ts','py','sh','json','html','htm','xml','yaml','yml','ini','conf','cfg','bat'];
+var TXT=['txt','md','csv','log'];
+var SVGICONS={
+  folder:'<svg viewBox="0 0 24 24" fill="currentColor"><path d="M10 4H4c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V8c0-1.1-.9-2-2-2h-8l-2-2z"/></svg>',
+  img:'<svg viewBox="0 0 24 24" fill="currentColor"><path d="M21 19V5c0-1.1-.9-2-2-2H5c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h14c1.1 0 2-.9 2-2zM8.5 13.5l2.5 3.01L14.5 12l4.5 6H5l3.5-4.5z"/></svg>',
+  vid:'<svg viewBox="0 0 24 24" fill="currentColor"><path d="M18 4l2 4h-3l-2-4h-2l2 4h-3l-2-4H8l2 4H7L5 4H4c-1.1 0-1.99.9-1.99 2L2 18c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V4h-4z"/></svg>',
+  aud:'<svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 3v10.55A4 4 0 1 0 14 17V7h4V3h-6z"/></svg>',
+  pdf:'<svg viewBox="0 0 24 24" fill="currentColor"><path d="M14 2H6c-1.1 0-2 .9-2 2v16c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V8l-6-6zm1 9l-3 3-1.5-1.5L8 15h8l-1-4z"/></svg>',
+  arc:'<svg viewBox="0 0 24 24" fill="currentColor"><path d="M20.54 5.23l-1.39-1.68C18.88 3.21 18.47 3 18 3H6c-.47 0-.88.21-1.16.55L3.46 5.23C3.17 5.57 3 6.02 3 6.5V19c0 1.1.9 2 2 2h14c1.1 0 2-.9 2-2V6.5c0-.48-.17-.93-.46-1.27zM12 17.5L6.5 12H10v-2h4v2h3.5L12 17.5zM5.12 5l.81-1h12l.94 1H5.12z"/></svg>',
+  doc:'<svg viewBox="0 0 24 24" fill="currentColor"><path d="M14 2H6c-1.1 0-2 .9-2 2v16c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V8l-6-6zm2 16H8v-2h8v2zm0-4H8v-2h8v2zm-3-5V3.5L18.5 9H13z"/></svg>',
+  txt:'<svg viewBox="0 0 24 24" fill="currentColor"><path d="M14 2H6c-1.1 0-2 .9-2 2v16c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V8l-6-6zm2 16H8v-2h8v2zm0-4H8v-2h8v2zm-3-5V3.5L18.5 9H13z"/></svg>',
+  code:'<svg viewBox="0 0 24 24" fill="currentColor"><path d="M9.4 16.6L4.8 12l4.6-4.6L8 6l-6 6 6 6 1.4-1.4zm5.2 0l4.6-4.6-4.6-4.6L16 6l6 6-6 6-1.4-1.4z"/></svg>',
+  other:'<svg viewBox="0 0 24 24" fill="currentColor"><path d="M14 2H6c-1.1 0-1.99.9-1.99 2L4 20c0 1.1.89 2 1.99 2H18c1.1 0 2-.9 2-2V8l-6-6zM16 18H8v-2h8v2zm0-4H8v-2h8v2zm-3-5V3.5L18.5 9H13z"/></svg>'
+};
+var ext=function(n){return (n.split('.').pop()||'').toLowerCase();};
+var typeOf=function(n){var e=ext(n);if(IMG.indexOf(e)>=0){return 'img';}if(VID.indexOf(e)>=0){return 'vid';}if(AUD.indexOf(e)>=0){return 'aud';}if(DOC.indexOf(e)>=0){return 'doc';}if(ARC.indexOf(e)>=0){return 'arc';}return 'oth';};
+var icOf=function(o){
+  var e=ext(o.name);
+  if(o.type==='img'){return SVGICONS.img;}
+  if(o.type==='vid'){return SVGICONS.vid;}
+  if(o.type==='aud'){return SVGICONS.aud;}
+  if(o.type==='arc'){return SVGICONS.arc;}
+  if(e==='pdf'){return SVGICONS.pdf;}
+  if(CODE.indexOf(e)>=0){return SVGICONS.code;}
+  if(o.type==='doc'){return SVGICONS.doc;}
+  if(TXT.indexOf(e)>=0){return SVGICONS.txt;}
+  return SVGICONS.other;
+};
+var fmt=function(s){
+  if(!s){return '-';}
+  var n=1024;
+  if(s<n){return s+'B';}
+  if(s<n*n){return (s/n).toFixed(2)+'K';}
+  if(s<n*n*n){return (s/(n*n)).toFixed(2)+'M';}
+  if(s<n*n*n*n){return (s/(n*n*n)).toFixed(2)+'G';}
+  return (s/(n*n*n*n)).toFixed(2)+'T';
+};
+var fmtT=function(t){
+  if(!t){return '-';}
+  var d=new Date(t);
+  if(isNaN(d.getTime())){return '-';}
+  var p=function(x){return String(x).padStart(2,'0');};
+  return d.getFullYear()+'-'+p(d.getMonth()+1)+'-'+p(d.getDate())+' '+p(d.getHours())+':'+p(d.getMinutes())+':'+p(d.getSeconds());
+};
+function statusHtml(msg,spin){
+  return '<div class="status">'+(spin?'<div class="spinner"></div>':'')+esc(msg)+'</div>';
+}
+var tempFiles=[];
+var toastTimer=null;
+function toast(msg){
+  var t=$('toast');
+  t.textContent=msg;
+  t.classList.add('show');
+  clearTimeout(toastTimer);
+  toastTimer=setTimeout(function(){t.classList.remove('show');},1800);
+}
+function ttlText(sec){
+  if(!sec||sec<60){return '\\u5230\\u671F\\u81EA\\u52A8\\u5220\\u9664';}
+  if(sec>=86400){return Math.round(sec/86400)+' \\u5929';}
+  if(sec>=3600){return Math.round(sec/3600)+' \\u5C0F\\u65F6';}
+  return Math.round(sec/60)+' \\u5206\\u949F';
+}
+function render(){
+  var box=$('filelist');
+  var hint='\\u6587\\u4EF6\\u5230\\u671F\\u81EA\\u52A8\\u5220\\u9664\\uFF08\\u4FDD\\u5B58 '+ttlText(CFG.tempTtlSec)+'\\uFF09 \\u00B7 \\u5355\\u6587\\u4EF6\\u4E0A\\u9650 '+CFG.tempMaxMb+' MB \\u00B7 \\u6570\\u91CF\\u4E0A\\u9650 '+CFG.tempMaxFiles+' \\u4E2A \\u00B7 \\u5B58\\u50A8\\uFF1A'+CFG.kvName;
+  $('tmpHint').textContent=hint;
+  if(CFG.tempStorage==='cos'){
+    $('tempUpBtn').disabled=true;
+    box.innerHTML=statusHtml('COS \\u4E34\\u65F6\\u5B58\\u50A8\\u4E3A\\u9884\\u7559\\u4F4D\\uFF0C\\u6682\\u672A\\u542F\\u7528\\uFF1B\\u8BF7\\u4F7F\\u7528 KV \\u5B58\\u50A8',false);
+    return;
+  }
+  box.innerHTML=statusHtml('\\u52A0\\u8F7D\\u4E2D...',true);
+  fetch('/temp/api/list')
+  .then(function(r){return r.json();})
+  .then(function(data){
+    if(data&&data.error){box.innerHTML=statusHtml('\\u52A0\\u8F7D\\u5931\\u8D25: '+data.error,false);return;}
+    tempFiles=(data&&data.files)||[];
+    renderList();
+  })
+  .catch(function(e){box.innerHTML=statusHtml('\\u52A0\\u8F7D\\u5931\\u8D25: '+String((e&&e.message)||e),false);});
+}
+function renderList(){
+  var box=$('filelist');
+  var h='';
+  if(!tempFiles.length){
+    h='<div class="status"><span style="font-size:34px">&#x1F4C1;</span>\\u6682\\u65E0\\u4E34\\u65F6\\u6587\\u4EF6</div>';
+  }else{
+    h='<div class="lhead"><div class="lname">\\u540D\\u79F0</div><div class="lsize">\\u5927\\u5C0F</div><div class="lmod">\\u5230\\u671F\\u65F6\\u95F4</div><div class="tmp-act-h"></div></div>';
+    for(var i=0;i<tempFiles.length;i++){
+      var f=tempFiles[i];
+      h+='<div class="lrow">'
+        +'<div class="lname"><span class="lic">'+icOf({name:f.name,type:typeOf(f.name)})+'</span><span class="lnm" title="'+esc(f.name)+'">'+esc(f.name)+'</span></div>'
+        +'<div class="lsize">'+fmt(f.size)+'</div>'
+        +'<div class="lmod">'+esc(fmtT(f.expireAt))+'</div>'
+        +'<div class="tmp-act">'
+        +'<a class="tmp-a" href="/temp/api/file?key='+encodeURIComponent(f.key)+'&dl=1" title="\\u4E0B\\u8F7D">&#x2B07;</a>'
+        +'<button class="tmp-a" type="button" data-del="'+esc(f.key)+'" title="\\u5220\\u9664">&#x2715;</button>'
+        +'</div></div>';
+    }
+  }
+  box.innerHTML=h;
+  box.onclick=function(e){
+    var d=e.target.closest('[data-del]');
+    if(d){del(d.getAttribute('data-del'));}
+  };
+}
+function upload(files){
+  if(!files||!files.length){return;}
+  var arr=Array.prototype.slice.call(files);
+  var idx=0,okN=0,failN=0;
+  var maxBytes=CFG.tempMaxMb*1024*1024;
+  function next(){
+    if(idx>=arr.length){
+      toast('\\u4E0A\\u4F20\\u5B8C\\u6210\\uFF1A\\u6210\\u529F '+okN+' \\u4E2A'+(failN?('\\uFF0C\\u5931\\u8D25 '+failN+' \\u4E2A'):''));
+      render();
+      return;
+    }
+    var f=arr[idx++];
+    if(f.size>maxBytes){failN++;toast('\\u300C'+f.name+'\\u300D\\u8D85\\u8FC7 '+CFG.tempMaxMb+' MB\\uFF0C\\u5DF2\\u8DF3\\u8FC7');setTimeout(next,200);return;}
+    var fd=new FormData();
+    fd.append('file',f,f.name);
+    toast('\\u4E0A\\u4F20\\u4E2D '+idx+'/'+arr.length+'\\uFF1A'+f.name);
+    fetch('/temp/api/upload',{method:'POST',body:fd})
+    .then(function(r){return r.json().then(function(j){return {s:r.status,j:j};});})
+    .then(function(o){
+      if(o.s===200&&o.j&&o.j.ok){okN++;}
+      else{failN++;toast('\\u4E0A\\u4F20\\u5931\\u8D25\\uFF1A'+((o.j&&o.j.error)||('HTTP '+o.s)));}
+      next();
+    })
+    .catch(function(e){failN++;toast('\\u4E0A\\u4F20\\u5931\\u8D25\\uFF1A'+String((e&&e.message)||e));next();});
+  }
+  next();
+}
+function del(key){
+  if(!key){return;}
+  if(!window.confirm('\\u786E\\u5B9A\\u5220\\u9664\\u8BE5\\u4E34\\u65F6\\u6587\\u4EF6\\uFF1F')){return;}
+  var fd=new FormData();
+  fd.append('key',key);
+  fetch('/temp/api/delete',{method:'POST',body:fd})
+  .then(function(r){return r.json();})
+  .then(function(j){
+    if(j&&j.ok){toast('\\u5DF2\\u5220\\u9664');render();}
+    else{toast('\\u5220\\u9664\\u5931\\u8D25\\uFF1A'+((j&&j.error)||'\\u672A\\u77E5\\u9519\\u8BEF'));}
+  })
+  .catch(function(e){toast('\\u5220\\u9664\\u5931\\u8D25\\uFF1A'+String((e&&e.message)||e));});
+}
+var up=$('tempUpBtn'),fi=$('tempFile');
+if(up&&fi){
+  up.onclick=function(){fi.click();};
+  fi.onchange=function(){upload(fi.files);fi.value='';};
+}
+$('themeBtn').onclick=function(){
+  document.body.classList.toggle('dark');
+  try{localStorage.setItem('tempDark',document.body.classList.contains('dark')?'1':'0');}catch(e){}
+  $('themeBtn').innerHTML=document.body.classList.contains('dark')?'&#x2600;&#xFE0F;':'&#x1F319;';
+};
+try{
+  if(localStorage.getItem('tempDark')==='1'){document.body.classList.add('dark');$('themeBtn').innerHTML='&#x2600;&#xFE0F;';}
+}catch(e){}
+render();
+</script>
+</body></html>`;
+}
