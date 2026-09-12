@@ -76,7 +76,7 @@
 | `BROWSE_ALLOW_COUNTRY` | 可选，如 `CN` | 否 |
 | `TURNSTILE_SITEKEY` / `TURNSTILE_SECRET` | 可选，登录人机验证 | 否 |
 
-> ⚠️ `cos-exchange` **不需要 KV 绑定**（代码无 `env.kv`）。KV 是 mail-worker 用的。
+> ⚠️ `cos-exchange` 需绑定 KV：`/browse` 的 2FA 密钥与登录会话用 `BROWSE_KV`，`/temp` 临时网盘文件用 `TEMP_KV`（只绑一个时两者共用该命名空间，按前缀隔离）。未绑定时 2FA 不可用、`/temp` 显示未启用提示。完整环境变量清单见 `doc/cos-proxy-worker.js` 顶部注释（`TEMP_*` / `TOTP_*` / `SESSION_TTL` / `ATT_SIGN_*`）。
 > 本文档面向公开 fork 仓库：除公网域名（`cos./mail.duckgame-play.top`）外，所有真实配置值
 > （桶地址、SecretId/SecretKey、密码、Turnstile Secret）一律用占位符，真实值只存在于 CF 环境变量。
 > 含完整敏感值的交接文档在仓库外（`web开发\交接文档-CloudMail-COS现状.md`），标注禁止外发、禁止提交 GitHub。
@@ -110,7 +110,7 @@
 
 ## 6. 部署步骤（cos-exchange）
 
-1. 用 `web开发\cos-proxy-worker.js`（**83168 字节附近**，以文件为准）全量替换 Worker `cos-exchange` 的代码。
+1. 用 `web开发\cos-proxy-worker.js`（**171728 字节（约 168 KB）**，以文件为准；仓库内副本 `doc/cos-proxy-worker.js` 与其字节一致）全量替换 Worker `cos-exchange` 的代码。
 2. 确认 §4 环境变量均在（`BROWSE_PASS` 等）。
 3. 部署后验证：
    - `https://cos.duckgame-play.top/browse` → Alist 风格登录页
@@ -167,6 +167,7 @@ Copy-Item cos-proxy-worker.built.js "cloud-mail-fork\doc\cos-proxy-worker.js" -F
 | `8297727` | fix: 退出改服务端 /browse/logout、退出图标缺字形换 SVG |
 | `aa30ea2` | feat: cookie 指纹 FNV-1a → HMAC-SHA256 |
 | `a45b7b3` | feat: 顶栏「返回邮件」按钮 |
+| `49cdf53` | feat: `/browse` 与 `/temp` 页脚版权行「© 2026 DelicateDuck582」（无下划线/非蓝色超链接 → fork 仓库；`target=_blank` + `rel=noopener noreferrer`） |
 
 ---
 
