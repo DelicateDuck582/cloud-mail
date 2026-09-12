@@ -1787,6 +1787,10 @@ button[type=submit]:disabled{opacity:.5;cursor:not-allowed}
 .err{min-height:20px;margin:10px 0 0;font-size:13px;color:#e5484d;line-height:20px}
 .hint{margin-top:22px;font-size:11px;color:#b9bec6}
 body.dark .hint{color:#626a78}
+/* copyright link: keep original footer look (no blue, no underline) */
+.cp{color:inherit;text-decoration:none;cursor:pointer}
+.cp:link,.cp:visited{color:inherit;text-decoration:none}
+.cp:hover,.cp:active{color:inherit;text-decoration:none}
 .theme-btn{position:fixed;top:14px;right:14px;width:36px;height:36px;border:0;border-radius:10px;background:#fff;color:#1f2329;font-size:16px;cursor:pointer;box-shadow:0 2px 8px rgba(0,0,0,.08)}
 body.dark .theme-btn{background:#1b1d21;color:#e8eaed}
 </style></head><body>
@@ -1802,7 +1806,7 @@ body.dark .theme-btn{background:#1b1d21;color:#e8eaed}
     <button type="submit" id="loginBtn"${sitekey ? ' disabled' : ''}>&#x767B;&#x5F55;</button>
   </form>
   <div class="err" id="loginErr"></div>
-  <div class="hint">&#x53EA;&#x8BFB;&#x6D4F;&#x89C8; &middot; cos-exchange</div>
+  <div class="hint">&#x53EA;&#x8BFB;&#x6D4F;&#x89C8; &middot; cos-exchange&nbsp;&nbsp;<a class="cp" href="https://github.com/DelicateDuck582/cloud-mail" target="_blank" rel="noopener noreferrer">&#xA9; 2026 DelicateDuck582</a></div>
 </div>
 ${tsScript}
 ${tsJs}
@@ -1953,6 +1957,10 @@ select{height:32px;border:1px solid var(--line);border-radius:8px;background:var
 .pg-goto input:focus{border-color:var(--primary)}
 .pg-goto .pg-btn{min-width:auto;padding:0 10px}
 .footer{text-align:center;font-size:12px;color:var(--muted);padding:20px 0 6px}
+/* copyright link: keep original footer look (no blue, no underline) */
+.cp{color:inherit;text-decoration:none;cursor:pointer}
+.cp:link,.cp:visited{color:inherit;text-decoration:none}
+.cp:hover,.cp:active{color:inherit;text-decoration:none}
 #lightbox{position:fixed;inset:0;background:rgba(0,0,0,.94);z-index:120;display:none;flex-direction:column}
 #lightbox.show{display:flex}
 .lb-top{position:absolute;top:0;left:0;right:0;display:flex;align-items:center;padding:10px 12px;color:#fff;z-index:2}
@@ -2058,7 +2066,7 @@ select{height:32px;border:1px solid var(--line);border-radius:8px;background:var
     <div class="sb-item" data-nav="recent"><span class="sic">&#x23F3;</span><span>&#x6700;&#x8FD1;</span></div>
     <div class="sb-item" data-nav="fav"><span class="sic">&#x2B50;</span><span>&#x6536;&#x85CF;</span></div>
     <div class="sb-item" data-nav="sec"><span class="sic">&#x1F512;</span><span>&#x5B89;&#x5168;</span></div>
-    <div class="sb-foot">&#x53EA;&#x8BFB;&#x6D4F;&#x89C8; &middot; cos-exchange</div>
+    <div class="sb-foot">&#x53EA;&#x8BFB;&#x6D4F;&#x89C8; &middot; cos-exchange&nbsp;&nbsp;<a class="cp" href="https://github.com/DelicateDuck582/cloud-mail" target="_blank" rel="noopener noreferrer">&#xA9; 2026 DelicateDuck582</a></div>
   </aside>
   <main class="main">
     <nav class="crumbs" id="crumbs"></nav>
@@ -2091,7 +2099,7 @@ select{height:32px;border:1px solid var(--line);border-radius:8px;background:var
       <div id="filelist"></div>
       <div class="pager" id="pager"></div>
     </div>
-    <footer class="footer">&#x53EA;&#x8BFB;&#x6D4F;&#x89C8; &middot; cos-exchange</footer>
+    <footer class="footer">&#x53EA;&#x8BFB;&#x6D4F;&#x89C8; &middot; cos-exchange&nbsp;&nbsp;<a class="cp" href="https://github.com/DelicateDuck582/cloud-mail" target="_blank" rel="noopener noreferrer">&#xA9; 2026 DelicateDuck582</a></footer>
   </main>
 </div>
 <div id="lightbox">
@@ -2991,6 +2999,10 @@ button[type=submit]:disabled{opacity:.5;cursor:not-allowed}
 .err{min-height:20px;margin:10px 0 0;font-size:13px;color:#e5484d;line-height:20px}
 .hint{margin-top:22px;font-size:11px;color:#b9bec6}
 body.dark .hint{color:#626a78}
+/* copyright link: keep original footer look (no blue, no underline) */
+.cp{color:inherit;text-decoration:none;cursor:pointer}
+.cp:link,.cp:visited{color:inherit;text-decoration:none}
+.cp:hover,.cp:active{color:inherit;text-decoration:none}
 .theme-btn{position:fixed;top:14px;right:14px;width:36px;height:36px;border:0;border-radius:10px;background:#fff;color:#1f2329;font-size:16px;cursor:pointer;box-shadow:0 2px 8px rgba(0,0,0,.08)}
 body.dark .theme-btn{background:#1b1d21;color:#e8eaed}
 </style></head><body>
@@ -3004,7 +3016,7 @@ body.dark .theme-btn{background:#1b1d21;color:#e8eaed}
     <button type="submit" id="loginBtn">&#x767B;&#x5F55;</button>
   </form>
   <div class="err" id="loginErr"></div>
-  <div class="hint">&#x4E34;&#x65F6;&#x6587;&#x4EF6; &middot; KV &#x5B58;&#x50A8; &middot; &#x5230;&#x671F;&#x81EA;&#x52A8;&#x5220;&#x9664;</div>
+  <div class="hint">&#x4E34;&#x65F6;&#x6587;&#x4EF6; &middot; KV &#x5B58;&#x50A8; &middot; &#x5230;&#x671F;&#x81EA;&#x52A8;&#x5220;&#x9664;<br><a class="cp" href="https://github.com/DelicateDuck582/cloud-mail" target="_blank" rel="noopener noreferrer">&#xA9; 2026 DelicateDuck582</a></div>
 </div>
 <script>
 var btn=document.getElementById('loginBtn');
@@ -3105,6 +3117,10 @@ body.dark .pill:hover{background:rgba(77,159,255,.25)}
 .spinner{width:26px;height:26px;border:3px solid var(--line);border-top-color:var(--primary);border-radius:50%;animation:spin .8s linear infinite}
 @keyframes spin{to{transform:rotate(360deg)}}
 .footer{text-align:center;font-size:12px;color:var(--muted);padding:20px 0 6px}
+/* copyright link: keep original footer look (no blue, no underline) */
+.cp{color:inherit;text-decoration:none;cursor:pointer}
+.cp:link,.cp:visited{color:inherit;text-decoration:none}
+.cp:hover,.cp:active{color:inherit;text-decoration:none}
 #toast{position:fixed;left:50%;bottom:26px;transform:translateX(-50%) translateY(20px);background:rgba(20,22,26,.92);color:#fff;padding:9px 16px;border-radius:10px;font-size:13px;opacity:0;pointer-events:none;transition:all .25s;z-index:200;max-width:86vw;text-align:center}
 #toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
 @media (max-width:760px){
@@ -3143,7 +3159,7 @@ body.dark .pill:hover{background:rgba(77,159,255,.25)}
     </div>
     <div id="filelist"></div>
   </div>
-  <footer class="footer">&#x4E34;&#x65F6;&#x6587;&#x4EF6; &middot; &#x5230;&#x671F;&#x81EA;&#x52A8;&#x5220;&#x9664; &middot; cos-exchange</footer>
+  <footer class="footer">&#x4E34;&#x65F6;&#x6587;&#x4EF6; &middot; &#x5230;&#x671F;&#x81EA;&#x52A8;&#x5220;&#x9664; &middot; cos-exchange<br><a class="cp" href="https://github.com/DelicateDuck582/cloud-mail" target="_blank" rel="noopener noreferrer">&#xA9; 2026 DelicateDuck582</a></footer>
 </div>
 <div id="toast"></div>
 <script>
