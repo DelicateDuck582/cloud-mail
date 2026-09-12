@@ -6,11 +6,11 @@ const dbInit = {
 	async init(c) {
 
 		// 安全：secret 校验由 /init 接口层完成（POST + 独立 INIT_SECRET，已限流）；
-		// 此处防御性再校验，避免直接调用本函数绕过接口层
+		// 此处防御性再校验，避免直接调用本函数绕过接口层（比较时两端 trim，兼容粘贴带空格）
 		const secret = c.get('initSecret');
 		const initSecret = c.env.INIT_SECRET;
 
-		if (!initSecret || secret !== initSecret) {
+		if (!initSecret || !secret || secret.trim() !== String(initSecret).trim()) {
 			return c.text('❌ INIT_SECRET mismatch');
 		}
 
@@ -40,6 +40,10 @@ const dbInit = {
 		await this.v3_6DB(c);
 		await this.v3_7DB(c);
 		await this.v3_8DB(c);
+		await this.v3_9DB(c);
+		await this.v4_0DB(c);
+		await this.v4_1DB(c);
+		await this.v4_2DB(c);
 		await settingService.refresh(c);
 		return c.text('success');
 	},
@@ -120,6 +124,96 @@ const dbInit = {
 	async v3_1DB(c) {
 		try {
 			await c.env.db.prepare(`ALTER TABLE user ADD COLUMN html_signature TEXT NOT NULL DEFAULT '';`).run();
+		} catch (e) {
+			console.warn(`跳过字段：${e.message}`);
+		}
+	},
+
+	// 上游 v3.1.0：setting 表新增 sync_delete 列（同步删除开关）
+	// 注意默认值用 1（CLOSE）：与实体 syncDelete.default(1) 保持一致，避免迁移后
+	// 默认开启同步删除而绕过 fork 的垃圾桶机制（删除=物理删除）
+	async v3_9DB(c) {
+		try {
+			await c.env.db.prepare(`ALTER TABLE setting ADD COLUMN sync_delete INTEGER NOT NULL DEFAULT 1;`).run();
+		} catch (e) {
+			console.warn(`跳过字段：${e.message}`);
+		}
+	},
+
+	// 性能：高频查询补索引（幂等）
+	//   email(resend_email_id) —— Resend webhook 状态回写（delivered/bounced/opened）按此列查找
+	//   att(email_id)          —— 附件列表/删除/垃圾桶关联
+	//   att(key)               —— 附件引用计数/去重/批量删除
+	//   star(user_id,email_id) —— 收藏列表分页
+	async v4_0DB(c) {
+		try {
+			await c.env.db.batch([
+				c.env.db.prepare(`CREATE INDEX IF NOT EXISTS idx_email_resend_email_id ON email(resend_email_id);`),
+				c.env.db.prepare(`CREATE INDEX IF NOT EXISTS idx_att_email_id ON att(email_id);`),
+				c.env.db.prepare(`CREATE INDEX IF NOT EXISTS idx_att_key ON att(key);`),
+				c.env.db.prepare(`CREATE INDEX IF NOT EXISTS idx_star_user_email ON star(user_id, email_id);`)
+			]);
+		} catch (e) {
+			console.warn(`跳过索引创建：${e.message}`);
+		}
+	},
+
+	// 上游 v3.2.0：OAuth 登录列 + 列表性能索引（幂等）
+	async v4_1DB(c) {
+		try {
+			await c.env.db.batch([
+				c.env.db.prepare(`ALTER TABLE setting ADD COLUMN linuxdo_client_id TEXT NOT NULL DEFAULT '';`),
+				c.env.db.prepare(`ALTER TABLE setting ADD COLUMN linuxdo_client_secret TEXT NOT NULL DEFAULT '';`),
+				c.env.db.prepare(`ALTER TABLE setting ADD COLUMN github_client_id TEXT NOT NULL DEFAULT '';`),
+				c.env.db.prepare(`ALTER TABLE setting ADD COLUMN github_client_secret TEXT NOT NULL DEFAULT '';`),
+				c.env.db.prepare(`ALTER TABLE setting ADD COLUMN google_client_id TEXT NOT NULL DEFAULT '';`),
+				c.env.db.prepare(`ALTER TABLE setting ADD COLUMN google_client_secret TEXT NOT NULL DEFAULT '';`),
+				c.env.db.prepare(`ALTER TABLE setting ADD COLUMN linuxdo_switch INTEGER NOT NULL DEFAULT 1;`),
+				c.env.db.prepare(`ALTER TABLE setting ADD COLUMN github_switch INTEGER NOT NULL DEFAULT 1;`),
+				c.env.db.prepare(`ALTER TABLE setting ADD COLUMN google_switch INTEGER NOT NULL DEFAULT 1;`),
+				c.env.db.prepare(`CREATE INDEX IF NOT EXISTS idx_email_list_user ON email(user_id, type, is_del, email_id)`),
+				c.env.db.prepare(`CREATE INDEX IF NOT EXISTS idx_email_list_account ON email(user_id, account_id, type, is_del, email_id)`),
+				c.env.db.prepare(`CREATE INDEX IF NOT EXISTS idx_star_email_user ON star(email_id, user_id)`)
+			]);
+		} catch (e) {
+			console.warn(`跳过字段：${e.message}`);
+		}
+
+		try {
+			await c.env.db.batch([
+				c.env.db.prepare(`CREATE INDEX IF NOT EXISTS idx_email_name_nocase ON email(name COLLATE NOCASE)`),
+				c.env.db.prepare(`CREATE INDEX IF NOT EXISTS idx_email_subject_nocase ON email(subject COLLATE NOCASE)`),
+				c.env.db.prepare(`CREATE INDEX IF NOT EXISTS idx_user_email_nocase ON user(email COLLATE NOCASE)`),
+				c.env.db.prepare(`CREATE INDEX IF NOT EXISTS idx_email_to_email_nocase ON email(to_email COLLATE NOCASE)`),
+				c.env.db.prepare(`CREATE INDEX IF NOT EXISTS idx_email_send_email_nocase ON email(send_email COLLATE NOCASE)`),
+				c.env.db.prepare(`CREATE INDEX IF NOT EXISTS idx_email_noone_id ON email(email_id) WHERE status = 7`),
+				c.env.db.prepare(`CREATE INDEX IF NOT EXISTS idx_email_type_id ON email(type, email_id)`)
+			]);
+		} catch (e) {
+			console.warn(`跳过索引：${e.message}`);
+		}
+	},
+
+	// 上游 v3.3.0：auto_clean（自动清理过期邮件）+ webhook 列（幂等）
+	// 本地编号 v3_3 已被 fork 用于 attachments trash，故上游 v3.3 迁移并入 v4_2
+	async v4_2DB(c) {
+		try {
+			await c.env.db.batch([
+				c.env.db.prepare(`ALTER TABLE setting ADD COLUMN auto_clean_days INTEGER NOT NULL DEFAULT 0;`),
+				c.env.db.prepare(`ALTER TABLE setting ADD COLUMN auto_clean_exclude TEXT NOT NULL DEFAULT '';`),
+				c.env.db.prepare(`CREATE INDEX IF NOT EXISTS idx_email_create_time ON email(create_time)`)
+			]);
+		} catch (e) {
+			console.warn(`跳过字段：${e.message}`);
+		}
+
+		try {
+			await c.env.db.batch([
+				c.env.db.prepare(`ALTER TABLE setting ADD COLUMN webhook_url TEXT NOT NULL DEFAULT '';`),
+				c.env.db.prepare(`ALTER TABLE setting ADD COLUMN webhook_status INTEGER NOT NULL DEFAULT 1;`),
+				c.env.db.prepare(`ALTER TABLE setting ADD COLUMN webhook_retry INTEGER NOT NULL DEFAULT 0;`),
+				c.env.db.prepare(`ALTER TABLE setting ADD COLUMN webhook_secret TEXT NOT NULL DEFAULT '';`)
+			]);
 		} catch (e) {
 			console.warn(`跳过字段：${e.message}`);
 		}

@@ -1,11 +1,8 @@
 name: 🚀 Deploy cloud-mail to Cloudflare Workers
 
+# 已禁用 push 自动部署：生产 Worker cloud-mail 由 Workers Builds 从 attachment-manager 分支构建，
+# 若此处再自动部署 main 会覆盖生产（丢失 fork 功能）。仅在手动 workflow_dispatch 时运行。
 on:
-  push:
-    branches: [ main ]
-    paths:
-      - "mail-worker/**"
-      - "mail-vue/**"
   workflow_dispatch:
 
 jobs:
@@ -25,13 +22,10 @@ jobs:
       KV_NAMESPACE_ID: ${{ secrets.KV_NAMESPACE_ID || vars.KV_NAMESPACE_ID }}
       R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME || vars.R2_BUCKET_NAME }}
       PROJECT_LINK: ${{ secrets.PROJECT_LINK || vars.PROJECT_LINK }}
-      AI_MODEL: ${{ secrets.AI_MODEL || vars.AI_MODEL || '@cf/meta/llama-3.1-8b-instruct' }}
+      AI_MODEL: ${{ secrets.AI_MODEL || vars.AI_MODEL || '@cf/meta/llama-3.1-8b-instruct-fast' }}
       CLOUDFLARE_EMAIL: ${{ secrets.CF_EMAIL || vars.CF_EMAIL || false }}
       ANALYSIS_CACHE: ${{ secrets.ANALYSIS_CACHE || vars.ANALYSIS_CACHE || false }}
-      LINUXDO_CLIENT_ID: ${{ secrets.LINUXDO_CLIENT_ID || vars.LINUXDO_CLIENT_ID }}
-      LINUXDO_CLIENT_SECRET: ${{ secrets.LINUXDO_CLIENT_SECRET || vars.LINUXDO_CLIENT_SECRET }}
-      LINUXDO_CALLBACK_URL: ${{ secrets.LINUXDO_CALLBACK_URL || vars.LINUXDO_CALLBACK_URL }}
-      LINUXDO_SWITCH: ${{ secrets.LINUXDO_SWITCH || vars.LINUXDO_SWITCH }}
+      INIT_SECRET: ${{ secrets.INIT_SECRET || vars.INIT_SECRET }}
 
 
     outputs:
@@ -45,12 +39,12 @@ jobs:
       - name: ⚙ 设置 pnpm / Set up pnpm
         uses: pnpm/action-setup@v4.1.0
         with:
-          version: 9
+          version: 11
 
       - name: ⚙ 设置 Node.js / Set up Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: "22"
+          node-version: "24"
           cache: "pnpm"
           cache-dependency-path: "./mail-worker/pnpm-lock.yaml"
 
@@ -107,10 +101,6 @@ jobs:
             sed -i '/^project_link = /d' "$CONFIG_FILE"
           fi
           
-          if [ -z "$LINUXDO_CLIENT_ID" ] || [ -z "$LINUXDO_CLIENT_SECRET" ]; then
-            sed -i '/^linuxdo_client_id = /,/^linuxdo_switch = /d' "$CONFIG_FILE"
-          fi
-          
           if [ -z "$CUSTOM_DOMAIN" ]; then
             sed -i '/\[\[routes\]\]/,/^$/d' "$CONFIG_FILE"
           fi
@@ -135,7 +125,6 @@ jobs:
           sed -i "s|\${LINUXDO_CLIENT_ID}|${LINUXDO_CLIENT_ID}|g" "$CONFIG_FILE"
           sed -i "s|\${LINUXDO_CLIENT_SECRET}|${LINUXDO_CLIENT_SECRET}|g" "$CONFIG_FILE"
           sed -i "s|\${LINUXDO_CALLBACK_URL}|${LINUXDO_CALLBACK_URL}|g" "$CONFIG_FILE"
-          sed -i "s|\${LINUXDO_SWITCH}|${LINUXDO_SWITCH}|g" "$CONFIG_FILE"
           
           echo "✅ Environment setup completed."
 
@@ -252,8 +241,13 @@ jobs:
             echo "❌ Preview URL not available. Please set CUSTOM_DOMAIN."
             exit 1
           fi
-          
-          HTTP_CODE=$(curl -sL -w "%{http_code}" -o response.txt "$WORKER_URL/api/init/${JWT_SECRET}")
+
+          if [ -z "$INIT_SECRET" ]; then
+            echo "❌ INIT_SECRET not set. Please set INIT_SECRET secret/variable."
+            exit 1
+          fi
+
+          HTTP_CODE=$(curl -sL -w "%{http_code}" -o response.txt -X POST -H "Content-Type: application/json" -d "{\"secret\":\"$INIT_SECRET\"}" "$WORKER_URL/api/init")
           RESPONSE_BODY=$(cat response.txt)
 
           if [ "$RESPONSE_BODY" = "success" ]; then

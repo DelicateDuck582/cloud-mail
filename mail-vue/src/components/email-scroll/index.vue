@@ -38,16 +38,17 @@
                         :key="keyCount"
         >
           <template #default="{ data: item, index }" >
-            <div :class="'email-row ' + props.type"
+            <div :class="['email-row', props.type, { 'right-checked': item.rightChecked }]"
                  :data-checked="item.checked"
                  @click="jumpDetails(item)"
                  v-if="!item.expand"
                  :key="item.emailId"
                  @contextmenu="handleContextmenu($event, item)"
-                 :style="item.rightChecked ? 'background: #FDF6EC' : ''"
             >
               <el-checkbox :class=" props.type === 'all-email' ? 'all-email-checkbox' : 'checkbox'"
-                           v-model="item.checked" @click.stop></el-checkbox>
+                           v-model="item.checked"
+                           :disabled="!item.checked && isSelectMax"
+                           @click.stop></el-checkbox>
               <div @click.stop="starChange(item)" class="pc-star" v-if="showStar">
                 <Icon v-if="item.isStar" icon="fluent-color:star-16" width="20" height="20"/>
                 <Icon v-else icon="solar:star-line-duotone" width="18" height="18"/>
@@ -89,7 +90,7 @@
                         </slot>
                       </span>
                     </span>
-                    <span class="email-content">{{ item.formatText || '\u200B' }}</span>
+                    <span class="email-content">{{ item.listText || item.text || '\u200B' }}</span>
                   </div>
                   <div class="user-info" v-if="showUserInfo">
                     <div class="user">
@@ -324,7 +325,9 @@ const dropdownRef = ref(null);
 const dropdownCloseLock = ref(false);
 const dropdownShow = ref(false);
 const rightClickEmail = ref({});
+const MAX_SELECT_COUNT = 95;
 const checkedEmailCount = ref(0);
+const isSelectMax = computed(() => checkedEmailCount.value >= MAX_SELECT_COUNT);
 let timer = null
 const position = ref(
     DOMRect.fromRect({
@@ -385,7 +388,7 @@ function onScroll(e) {
 }
 
 const { arrivedState } = useScroll(scrollbarRef, {
-  offset: { bottom: 1200 }
+  offset: { bottom: isMobile.value ? 2200 : 1500 }
 })
 
 
@@ -551,37 +554,6 @@ const accountShow = computed(() => {
   return uiStore.accountShow && settingStore.settings.manyEmail === 0
 })
 
-function htmlToText(email) {
-  if (email.content) {
-
-    // 用 DOMParser 解析（script 不执行、img 不加载），避免 innerHTML 的边缘情况
-    const doc = new DOMParser().parseFromString(email.content, 'text/html');
-
-    // 移除图片/媒体/脚本/样式等不参与文本摘要的元素
-    doc.body.querySelectorAll(
-        'script, style, title, iframe, object, embed, video, audio, source, img, link, form, input, button, select, textarea'
-    ).forEach(el => el.remove());
-
-    let text = doc.body.textContent || doc.body.innerText || '';
-    text = text.replace(/\s+/g, ' ').trim();
-    return cleanSpace(text)
-  }
-
-  if (email.text) {
-    return cleanSpace(email.text)
-  } else {
-    return ''
-  }
-
-}
-
-function cleanSpace(text) {
-  return text
-      .replace(/[\u200B-\u200F\uFEFF\u034F\u200B-\u200F\u00A0\u3000\u00AD]/g, '')// 移除零宽空格
-      .replace(/\s+/g, ' ')                   // 多空白合并成一个空格
-      .trim();
-}
-
 function starChange(email) {
 
   if (!email.isStar) {
@@ -731,7 +703,6 @@ function addItem(email) {
     return false;
   }
 
-  email.formatText = htmlToText(email);
   email.formatCreateTime = fromNow(email.formatCreateTime);
 
   if (props.timeSort) {
@@ -770,7 +741,19 @@ function addItem(email) {
 }
 
 function handleCheckAllChange(val) {
-  emailList.forEach(item => item.checked = val);
+  if (val) {
+    let count = 0;
+    emailList.forEach(item => {
+      if (count < MAX_SELECT_COUNT) {
+        item.checked = true;
+        count++;
+      } else {
+        item.checked = false;
+      }
+    });
+  } else {
+    emailList.forEach(item => item.checked = false);
+  }
   isIndeterminate.value = false;
 }
 
@@ -786,8 +769,9 @@ function getSelectedDraftsIds() {
 function updateCheckStatus() {
   const checkedCount = emailList.filter(item => item.checked).length;
   checkedEmailCount.value = checkedCount;
-  checkAll.value = checkedCount === emailList.length;
-  isIndeterminate.value = checkedCount > 0 && checkedCount < emailList.length;
+  const atMax = checkedCount >= MAX_SELECT_COUNT;
+  checkAll.value = emailList.length > 0 && (checkedCount === emailList.length || atMax);
+  isIndeterminate.value = checkedCount > 0 && !checkAll.value;
 }
 
 function jumpDetails(email) {
@@ -872,7 +856,6 @@ function getEmailList(refresh = false) {
 
 function handleList(list) {
   list.forEach(email => {
-    email.formatText = htmlToText(email)
     email.formatCreateTime = fromNow(email.createTime);
     email.test = t('received')
     const statusIconMap = {
@@ -884,6 +867,7 @@ function handleList(list) {
       4: { icon: 'bi:send-exclamation-fill', color: '#FBBD08', content: t('complained') },
       5: { icon: 'bi:send-arrow-up-fill',  color: '#FBBD08', content: t('delayed') },
       7: { icon: 'ic:round-mark-email-read', color: '#FBBD08', content: t('noRecipient') },
+      9: { icon: 'bi:eye-fill',            color: '#51C76B', content: t('opened') },
     };
 
     if (email.isDel) {
@@ -1235,6 +1219,11 @@ function loadData() {
   &:hover {
     background-color: var(--email-hover-background);
     z-index: 0;
+  }
+
+  &.right-checked,
+  &.right-checked:hover {
+    background-color: var(--email-right-click-background);
   }
 
   /*&[data-checked="true"] {
