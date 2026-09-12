@@ -49,7 +49,7 @@ app.get('/oss/*', async (c) => {
 		throw new BizError(t('unauthorized'), 403);
 	}
 	const expected = await signUtils.hmacHex(secret, `/${key}:${expires}`);
-	if (expected !== sign) {
+	if (!signUtils.timingSafeEqual(expected, sign)) {
 		throw new BizError(t('unauthorized'), 403);
 	}
 
