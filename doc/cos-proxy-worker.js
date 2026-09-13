@@ -233,6 +233,13 @@ export default {
         return cacheResp;
       }
 
+      // HEAD 且回源成功（200）：透传状态与响应头（无 body）。
+      // 注意：不能落入下方「非 200」脱敏分支，否则 HEAD 会被改写成 404
+      // （upstream>=500?502:404），使下载管理器 / 邮件客户端的 HEAD 预检误判文件不存在。
+      if (response.status === 200 && request.method === 'HEAD') {
+        return new Response(null, { status: 200, statusText: response.statusText, headers: newHeaders });
+      }
+
       // 非 200：不缓存
       // - 206/3xx：透传（206 供未来 Range/内嵌媒体场景；3xx 如 COS 临时重定向）
       // - 4xx/5xx：不向客户端透传 COS 原始 XML（其含真实桶名/错误细节），统一脱敏
@@ -1518,9 +1525,11 @@ async function browseList(env, prefix, token, perPage) {
   if (!res.ok) {
     const body = await res.text();
     const cos = body.match(/<StringToSign>([\s\S]*?)<\/StringToSign>/);
-    // 把两边 StringToSign 都返回，方便直接对照（第4行=canonical request 哈希）
+    // 客户端只看到状态码；COS 原始 XML（可能含 <Resource> 桶域名）与两侧
+    // StringToSign 全部留在服务端日志，避免信息泄露给已登录用户
     throw new Error(JSON.stringify({
-      error: `list failed ${res.status} (SignatureDoesNotMatch)` + (cos ? '' : ': ' + body.slice(0, 300)),
+      error: `list failed ${res.status}`,
+      cosBody: cos ? '' : body.slice(0, 300),
       ourSTS: stringToSign,
       cosSTS: cos ? cos[1] : '',
       sentUrl: `https://${host}/?${qs}`,
@@ -1770,7 +1779,10 @@ async function browseLoginHtml(env) {
   const tsWidget = sitekey ? '<div class="cf-turnstile" data-sitekey="' + sitekey + '" data-callback="onTs"></div>' : '';
   const tsJs = sitekey ? '<script>function onTs(){var b=document.getElementById("loginBtn");if(b){b.disabled=false;}}</script>' : '';
   // 已绑定 2FA 时显示动态验证码输入框（服务端渲染，避免前端多一次请求）
-  const bound = env.BROWSE_KV ? !!(await getTotp(env)) : false;
+  // 注意：必须用 authStore(env)（= BROWSE_KV || TEMP_KV）判断，不能只看 env.BROWSE_KV：
+  // 只绑定 TEMP_KV 时 2FA 密钥也存在那里，若此处判为「未绑定」则不渲染验证码输入框，
+  // 而服务端登录仍要求动态码 → 用户被永久锁在登录页。
+  const bound = authStore(env) ? !!(await getTotp(env)) : false;
   const codeField = bound ? '<input type="text" name="code" inputmode="numeric" autocomplete="one-time-code" maxlength="6" placeholder="动态验证码" required>' : '';
   const subText = bound ? '已开启两步验证，请输入访问密码与动态验证码' : '输入访问密码以继续';
   return `<!DOCTYPE html>
