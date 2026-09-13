@@ -185,6 +185,8 @@ Copy-Item cos-proxy-worker.built.js "cloud-mail-fork\doc\cos-proxy-worker.js" -F
 | `a45b7b3` | feat: 顶栏「返回邮件」按钮 |
 | `49cdf53` | feat: `/browse` 与 `/temp` 页脚版权行「© 2026 DelicateDuck582」（无下划线/非蓝色超链接 → fork 仓库；`target=_blank` + `rel=noopener noreferrer`） |
 | `de8f581` | feat: `/temp` **上传任务面板（仿 Alist）**——悬浮按钮+角标、进度条/速度/状态、上传日志、失败重试/取消/清除；修复「上传后列表不刷新」（KV `list()` 最终一致 → 乐观插入 + `localStorage` 持久化 + 2.5/7/16/32s 校准）；429 尊重 `Retry-After`；服务器端新增 `tempSafeType()` 清洗 Content-Type（防 CRLF 注入/500 与 KV metadata 超限） |
+| `1f701b6` | **审计修复**（详见 `doc/审计报告-COS-Worker-安全性能密钥-2026-09-13.md`）：① 附件 **HEAD 预检 404**（成功 HEAD 落入"非 200"分支被映射为 404）→ 新增 HEAD 200 透传；② 列表错误回包**不再泄露 COS 原始 XML/桶域名**（只回 `list failed <status>`，细节仅进服务端日志）；③ 登录页 **2FA 输入框门控改 `authStore(env)`**（只绑 `TEMP_KV` 时不再把用户锁死） |
+| `1e8ced9` | docs: 新增审计报告（安全/性能/密钥），说明文档同步 |
 
 ---
 
