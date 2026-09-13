@@ -14,6 +14,8 @@
 
 设计规格对照本地 alist-web 源码（`E:\数据迁移\开发\alist-web`，SolidJS + HopeUI）。
 
+该 Worker 同时承载 **`/temp` 临时网盘**（独立密码 + KV 存储 + 上传任务面板），见 §2.1。
+
 ---
 
 ## 1. 改动清单（相对 attachment-manager）
@@ -48,6 +50,19 @@
 - **视频**：`Range` 流式透传（秒开、可拖动 seek，按段下载）；关闭弹层时自动暂停并释放媒体。
 - **缩略图**：IntersectionObserver 懒加载 + **并发限流（最多同时 4 个请求）**，避免打满限流。
 - **其它**：429 自动重试；深色模式记忆本地偏好；默认搜索/排序/筛选状态本地持久化。
+
+### 2.1 `/temp` 临时网盘（独立入口）
+
+| 项 | 说明 |
+|---|---|
+| 鉴权 | 独立密码 `TEMP_PASS`（普通密码登录，无 2FA）+ `SameSite=Lax` HttpOnly cookie；未配置密码或未绑 KV 时显示「未启用」配置提示页 |
+| 存储 | KV（`TEMP_KV`，未绑定时回退 `BROWSE_KV`）：键 `tmp/<id>`，metadata `{name,type,size,at}`，到期由 `expirationTtl` 自动删除 |
+| 接口 | `GET /temp`、`POST /temp/login`、`GET /temp/logout`、`GET /temp/api/list`、`POST /temp/api/upload`（multipart 字段 `file`）、`GET /temp/api/file?key=&dl=1`、`POST /temp/api/delete`（字段 `key`） |
+| 限制 | 单文件 `TEMP_MAX_MB`（默认 20，上限 24）、数量 `TEMP_MAX_FILES`（默认 100）、TTL `TEMP_TTL`（默认 7 天）、并发上传串行 |
+| 上传体验 | **右下角悬浮「上传任务」小按钮（仿 Alist）**：角标显示进行中任务数；面板含每个文件的进度条/百分比/实时速度/状态与**上传日志**（时间戳，上限 200 行）；失败可重试、上传中可取消、一键清除已完成。上传用 `XMLHttpRequest` 取真实进度 |
+| 列表一致性 | KV `list()` 最终一致（数秒内查不到新 key）→ 上传成功即**乐观并入本地列表**并落 `localStorage`（上限 50 条 / 120s），刷新后仍可见；批次结束在 2.5/7/16/32s 自动校准，服务端确认后清理本地 pending；删除用 tombstone 防「回魂」 |
+| 限流 | `Retry-After` 优先的退避重试（上限 90s），面板显示「等待重试 Ns」倒计时 |
+| 类型安全 | 上传的 `Content-Type` 经 `tempSafeType()` 清洗（剥控制字符 + 限长 + 形态校验，非法回退 `application/octet-stream`），写入、列表回显、下载头三处一致；`image/svg+xml` 仍强制 `attachment` 防存储型 XSS |
 
 ---
 
@@ -110,7 +125,7 @@
 
 ## 6. 部署步骤（cos-exchange）
 
-1. 用 `web开发\cos-proxy-worker.js`（**171728 字节（约 168 KB）**，以文件为准；仓库内副本 `doc/cos-proxy-worker.js` 与其字节一致）全量替换 Worker `cos-exchange` 的代码。
+1. 用 `web开发\cos-proxy-worker.js`（**191173 字节（约 187 KB）**，以文件为准；仓库内副本 `doc/cos-proxy-worker.js` 与其字节一致）全量替换 Worker `cos-exchange` 的代码。
 2. 确认 §4 环境变量均在（`BROWSE_PASS` 等）。
 3. 部署后验证：
    - `https://cos.duckgame-play.top/browse` → Alist 风格登录页
@@ -168,6 +183,7 @@ Copy-Item cos-proxy-worker.built.js "cloud-mail-fork\doc\cos-proxy-worker.js" -F
 | `aa30ea2` | feat: cookie 指纹 FNV-1a → HMAC-SHA256 |
 | `a45b7b3` | feat: 顶栏「返回邮件」按钮 |
 | `49cdf53` | feat: `/browse` 与 `/temp` 页脚版权行「© 2026 DelicateDuck582」（无下划线/非蓝色超链接 → fork 仓库；`target=_blank` + `rel=noopener noreferrer`） |
+| `de8f581` | feat: `/temp` **上传任务面板（仿 Alist）**——悬浮按钮+角标、进度条/速度/状态、上传日志、失败重试/取消/清除；修复「上传后列表不刷新」（KV `list()` 最终一致 → 乐观插入 + `localStorage` 持久化 + 2.5/7/16/32s 校准）；429 尊重 `Retry-After`；服务器端新增 `tempSafeType()` 清洗 Content-Type（防 CRLF 注入/500 与 KV metadata 超限） |
 
 ---
 
