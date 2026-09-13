@@ -645,6 +645,19 @@ function tempSafeName(name) {
   return n;
 }
 
+// 文件类型（Content-Type）由客户端提供，可被构造成任意字符串：
+//  - 含 CR/LF 会让 Headers.set('Content-Type', ...) 抛错（下载 500）、也属响应头注入面
+//  - 超长值会撑爆 KV metadata（1KiB 上限）导致上传写入失败
+// 故：剥离控制字符 → 限长 → 校验 type/subtype[;参数] 形态，非法一律回退 octet-stream。
+// 写入（metadata）与读取（列表/下载回显）两侧都过一遍，兼容历史脏数据。
+function tempSafeType(type) {
+  let t = String(type || '').replace(/[\u0000-\u001f\u007f]/g, '').trim();
+  if (t.length > 120) t = t.slice(0, 120);
+  const re = /^[A-Za-z0-9][A-Za-z0-9.+-]*\/[A-Za-z0-9][A-Za-z0-9.+-]*(\s*;[\x20-\x7e]*)?$/;
+  if (!re.test(t)) return 'application/octet-stream';
+  return t;
+}
+
 function tempAsciiName(name) {
   const n = String(name || 'file').replace(/[^\x20-\x7e]/g, '_').replace(/["\\]/g, '_');
   return n || 'file';
@@ -672,7 +685,7 @@ async function tempList(env) {
       out.push({
         key: k.name,
         name: m.name || k.name.split('/').pop(),
-        type: m.type || '',
+        type: tempSafeType(m.type || ''),
         size: Number(m.size) || 0,
         at: Number(m.at) || 0,
         expireAt: k.expiration ? k.expiration * 1000 : 0,
@@ -687,6 +700,7 @@ async function tempList(env) {
 
 async function tempPut(env, name, type, buf) {
   const cfg = tempConfig(env);
+  type = tempSafeType(type);
   if (cfg.storage === 'cos') return tempCosPut(env, name, type, buf); // 预留
   const store = tempStore(env);
   if (!store) throw new Error('未绑定 KV（TEMP_KV / BROWSE_KV）');
@@ -924,7 +938,7 @@ async function handleTemp(request, env, ctx) {
         return jsonResp({ error: '文件超过单文件上限 ' + tcfg.maxMb + ' MB' }, 413);
       }
       const name = tempSafeName(f.name);
-      const type = f.type || 'application/octet-stream';
+      const type = tempSafeType(f.type);
       const item = await tempPut(env, name, type, buf);
       return jsonResp({ ok: true, file: item });
     } catch (e) {
@@ -947,7 +961,7 @@ async function handleTemp(request, env, ctx) {
     }
     if (!obj) return new Response('Not Found', { status: 404 });
     const meta = obj.meta || {};
-    const type = meta.type || 'application/octet-stream';
+    const type = tempSafeType(meta.type || 'application/octet-stream');
     const name = tempSafeName(meta.name);
     const dl = url.searchParams.get('dl') === '1' || !tempInlineOk(type);
     const headers = new Headers();
@@ -2952,6 +2966,8 @@ load(true);
 //   - 独立 KV：TEMP_KV（未绑定时回退 BROWSE_KV）
 //   - 文件到期由 KV expirationTtl 自动删除
 //   - 未配置 TEMP_PASS 或未绑定 KV 时显示配置提示页
+//   - 上传：右下角任务面板（仿 Alist）显示进度条/速度/日志，支持重试与取消；
+//     上传成功后本地乐观并入列表（KV list 最终一致，避免数秒内看不到新文件）
 // =====================================================================
 function tempDisabledHtml(reason) {
   return `<!DOCTYPE html>
@@ -3123,12 +3139,47 @@ body.dark .pill:hover{background:rgba(77,159,255,.25)}
 .cp:hover,.cp:active{color:inherit;text-decoration:none}
 #toast{position:fixed;left:50%;bottom:26px;transform:translateX(-50%) translateY(20px);background:rgba(20,22,26,.92);color:#fff;padding:9px 16px;border-radius:10px;font-size:13px;opacity:0;pointer-events:none;transition:all .25s;z-index:200;max-width:86vw;text-align:center}
 #toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
+/* &#x4E0A;&#x4F20;&#x4EFB;&#x52A1;&#x9762;&#x677F;&#xFF08;&#x4EFF; Alist&#xFF1A;&#x53F3;&#x4E0B;&#x89D2;&#x5C0F;&#x6309;&#x94AE; + &#x8FDB;&#x5EA6;&#x6761;/&#x65E5;&#x5FD7;&#x9762;&#x677F;&#xFF09; */
+.task-btn{position:fixed;right:18px;bottom:18px;width:46px;height:46px;border:0;border-radius:50%;background:var(--primary);color:#fff;display:flex;align-items:center;justify-content:center;box-shadow:0 6px 18px rgba(24,144,255,.35);cursor:pointer;z-index:95;transition:transform .15s,filter .15s}
+.task-btn:hover{filter:brightness(1.06)}
+.task-btn:active{transform:scale(.94)}
+.task-btn svg{width:22px;height:22px}
+.task-badge{position:absolute;top:-3px;right:-3px;min-width:18px;height:18px;border-radius:9px;background:#e5484d;color:#fff;font-size:11px;line-height:18px;text-align:center;padding:0 4px;box-sizing:border-box}
+.task-panel{position:fixed;right:18px;bottom:74px;width:min(92vw,380px);max-height:min(72vh,540px);background:var(--card);border-radius:12px;box-shadow:0 12px 40px rgba(0,0,0,.18);z-index:94;display:none;flex-direction:column;overflow:hidden}
+.task-panel.show{display:flex}
+.tp-head{display:flex;align-items:center;gap:8px;padding:10px 12px;border-bottom:1px solid var(--line);flex-shrink:0}
+.tp-title{flex:1;font-size:14px;font-weight:700}
+.tp-mini{height:28px;padding:0 10px;border:1px solid var(--line);border-radius:8px;background:var(--card);color:var(--sub);font-size:12px;cursor:pointer}
+.tp-mini:hover{border-color:var(--primary);color:var(--primary)}
+.tp-tasks{overflow:auto;padding:6px 12px 8px;max-height:min(40vh,320px)}
+.tp-empty{color:var(--muted);font-size:13px;text-align:center;padding:18px 0}
+.tk{padding:8px 0;border-bottom:1px dashed var(--line)}
+.tk:last-child{border-bottom:0}
+.tk-top{display:flex;align-items:center;gap:8px;font-size:13px}
+.tk-name{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.tk-pct{color:var(--sub);font-size:12px;flex-shrink:0}
+.tk-bar{height:6px;border-radius:3px;background:var(--hover);margin:6px 0 5px;overflow:hidden}
+.tk-fill{height:100%;width:0;border-radius:3px;background:var(--primary);transition:width .15s}
+.tk.done .tk-fill{background:#2ecc71}
+.tk.err .tk-fill{background:#e5484d}
+.tk-sub{display:flex;align-items:center;gap:8px;font-size:11px;color:var(--muted)}
+.tk-state{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.tk-size,.tk-speed{flex-shrink:0}
+.tk-act{display:flex;gap:6px;flex-shrink:0}
+.tk-abtn{height:24px;padding:0 8px;border:1px solid var(--line);border-radius:6px;background:var(--card);color:var(--sub);font-size:11px;cursor:pointer}
+.tk-abtn:hover{border-color:var(--primary);color:var(--primary)}
+.tp-log{flex-shrink:0;border-top:1px solid var(--line);padding:6px 12px 10px;max-height:130px;overflow:auto;font-size:11.5px;line-height:1.8;color:var(--sub);font-family:ui-monospace,Consolas,'Courier New',monospace}
+.tp-log .lg{word-break:break-all}
+.tp-log .lg .lg-t{color:var(--muted);margin-right:6px}
+.tp-log .lg.err{color:#e5484d}
 @media (max-width:760px){
   .lmod{display:none}
   .lsize{width:76px}
   .tmp-act,.tmp-act-h{width:64px}
   .tmp-hint{width:100%}
   .brand .bname{display:none}
+  .task-btn{right:12px;bottom:12px}
+  .task-panel{right:10px;bottom:66px;width:min(94vw,380px)}
 }
 </style></head><body>
 <header class="topbar">
@@ -3160,6 +3211,19 @@ body.dark .pill:hover{background:rgba(77,159,255,.25)}
     <div id="filelist"></div>
   </div>
   <footer class="footer">&#x4E34;&#x65F6;&#x6587;&#x4EF6; &middot; &#x5230;&#x671F;&#x81EA;&#x52A8;&#x5220;&#x9664; &middot; cos-exchange<br><a class="cp" href="https://github.com/DelicateDuck582/cloud-mail" target="_blank" rel="noopener noreferrer">&#xA9; 2026 DelicateDuck582</a></footer>
+</div>
+<button class="task-btn" id="taskBtn" type="button" title="&#x4E0A;&#x4F20;&#x4EFB;&#x52A1;&#x4E0E;&#x65E5;&#x5FD7;">
+  <svg viewBox="0 0 24 24" fill="currentColor"><path d="M5 20h14v-2H5v2zM19 9h-4V3H9v6H5l7 7 7-7z"/></svg>
+  <span class="task-badge" id="taskBadge" style="display:none">0</span>
+</button>
+<div class="task-panel" id="taskPanel">
+  <div class="tp-head">
+    <span class="tp-title">&#x4E0A;&#x4F20;&#x4EFB;&#x52A1;</span>
+    <button class="tp-mini" id="taskClear" type="button">&#x6E05;&#x9664;&#x5DF2;&#x5B8C;&#x6210;</button>
+    <button class="iconbtn" id="taskClose" type="button">&#x2715;</button>
+  </div>
+  <div class="tp-tasks" id="taskList"></div>
+  <div class="tp-log" id="taskLog"></div>
 </div>
 <div id="toast"></div>
 <script>
@@ -3219,7 +3283,36 @@ function statusHtml(msg,spin){
   return '<div class="status">'+(spin?'<div class="spinner"></div>':'')+esc(msg)+'</div>';
 }
 var tempFiles=[];
+var pendingFiles={};
+var deletedKeys={};
+var PENDING_MS=120000;
+var PENDING_KEY='tempPending';
+var MAX_PENDING=50;
 var toastTimer=null;
+// KV \\u7684 list() \\u662F\\u6700\\u7EC8\\u4E00\\u81F4\\u7684\\uFF08\\u5199\\u5165\\u540E\\u6570\\u79D2\\u5185\\u5217\\u8868\\u53EF\\u80FD\\u4ECD\\u770B\\u4E0D\\u5230\\u65B0\\u6587\\u4EF6\\uFF09\\u3002
+// pendingFiles \\u8D1F\\u8D23\\u300C\\u4E0A\\u4F20\\u6210\\u529F\\u7ACB\\u5373\\u663E\\u793A\\u300D\\uFF0C\\u518D\\u843D\\u4E00\\u4EFD\\u5230 localStorage\\uFF1A
+// \\u5237\\u65B0\\uFF08F5\\uFF09\\u540E\\u5185\\u5B58\\u4F1A\\u4E22\\uFF0C\\u9760\\u8FD9\\u4EFD\\u6301\\u4E45\\u5316\\u4FDD\\u8BC1\\u5237\\u65B0\\u540E\\u4E5F\\u80FD\\u7ACB\\u523B\\u770B\\u5230\\u3002
+function loadPending(){
+  try{
+    var raw=localStorage.getItem(PENDING_KEY);
+    if(!raw){return;}
+    var obj=JSON.parse(raw);
+    var now=Date.now(),n=0;
+    for(var k in obj){
+      var p=obj[k];
+      if(p&&p.item&&p.until>now&&n<MAX_PENDING){pendingFiles[k]=p;n++;}
+    }
+  }catch(e){}
+}
+function savePending(){
+  try{
+    var ids=Object.keys(pendingFiles);
+    ids.sort(function(a,b){return (pendingFiles[b].item.at||0)-(pendingFiles[a].item.at||0);});
+    var out={};
+    for(var i=0;i<ids.length&&i<MAX_PENDING;i++){out[ids[i]]=pendingFiles[ids[i]];}
+    localStorage.setItem(PENDING_KEY,JSON.stringify(out));
+  }catch(e){}
+}
 function toast(msg){
   var t=$('toast');
   t.textContent=msg;
@@ -3233,34 +3326,38 @@ function ttlText(sec){
   if(sec>=3600){return Math.round(sec/3600)+' \\u5C0F\\u65F6';}
   return Math.round(sec/60)+' \\u5206\\u949F';
 }
-function render(){
-  var box=$('filelist');
-  var hint='\\u6587\\u4EF6\\u5230\\u671F\\u81EA\\u52A8\\u5220\\u9664\\uFF08\\u4FDD\\u5B58 '+ttlText(CFG.tempTtlSec)+'\\uFF09 \\u00B7 \\u5355\\u6587\\u4EF6\\u4E0A\\u9650 '+CFG.tempMaxMb+' MB \\u00B7 \\u6570\\u91CF\\u4E0A\\u9650 '+CFG.tempMaxFiles+' \\u4E2A \\u00B7 \\u5B58\\u50A8\\uFF1A'+CFG.kvName;
-  $('tmpHint').textContent=hint;
-  if(CFG.tempStorage==='cos'){
-    $('tempUpBtn').disabled=true;
-    box.innerHTML=statusHtml('COS \\u4E34\\u65F6\\u5B58\\u50A8\\u4E3A\\u9884\\u7559\\u4F4D\\uFF0C\\u6682\\u672A\\u542F\\u7528\\uFF1B\\u8BF7\\u4F7F\\u7528 KV \\u5B58\\u50A8',false);
-    return;
+// KV \\u7684 list() \\u662F\\u6700\\u7EC8\\u4E00\\u81F4\\u7684\\uFF08\\u5199\\u5165\\u540E\\u6570\\u79D2\\u5185\\u5217\\u8868\\u53EF\\u80FD\\u8FD8\\u770B\\u4E0D\\u5230\\u65B0\\u6587\\u4EF6\\uFF09\\u3002
+// \\u4E0A\\u4F20\\u6210\\u529F\\u540E\\u5148\\u628A\\u63A5\\u53E3\\u8FD4\\u56DE\\u7684\\u6587\\u4EF6\\u9879\\u672C\\u5730\\u5E76\\u5165\\u5217\\u8868\\uFF08pendingFiles\\uFF09\\uFF0C
+// \\u540E\\u53F0\\u518D\\u591A\\u6B21\\u62C9\\u53D6\\u670D\\u52A1\\u7AEF\\u5217\\u8868\\u6821\\u51C6\\uFF0C\\u907F\\u514D\\u300C\\u4E0A\\u4F20\\u6210\\u529F\\u5374\\u770B\\u4E0D\\u5230\\u300D\\u3002
+function mergeFiles(){
+  var out=[],seen={},now=Date.now(),i,k;
+  for(k in deletedKeys){if(deletedKeys[k]<now){delete deletedKeys[k];}}
+  for(i=0;i<tempFiles.length;i++){
+    var f=tempFiles[i];
+    if(deletedKeys[f.key]&&deletedKeys[f.key]>now){continue;}
+    seen[f.key]=1;
+    out.push(f);
   }
-  box.innerHTML=statusHtml('\\u52A0\\u8F7D\\u4E2D...',true);
-  fetch('/temp/api/list')
-  .then(function(r){return r.json();})
-  .then(function(data){
-    if(data&&data.error){box.innerHTML=statusHtml('\\u52A0\\u8F7D\\u5931\\u8D25: '+data.error,false);return;}
-    tempFiles=(data&&data.files)||[];
-    renderList();
-  })
-  .catch(function(e){box.innerHTML=statusHtml('\\u52A0\\u8F7D\\u5931\\u8D25: '+String((e&&e.message)||e),false);});
+  for(k in pendingFiles){
+    var p=pendingFiles[k];
+    if(!p||p.until<now){delete pendingFiles[k];continue;}
+    if(seen[k]||(deletedKeys[k]&&deletedKeys[k]>now)){continue;}
+    seen[k]=1;
+    out.push(p.item);
+  }
+  out.sort(function(a,b){return (b.at||0)-(a.at||0);});
+  return out;
 }
 function renderList(){
+  var list=mergeFiles();
   var box=$('filelist');
   var h='';
-  if(!tempFiles.length){
+  if(!list.length){
     h='<div class="status"><span style="font-size:34px">&#x1F4C1;</span>\\u6682\\u65E0\\u4E34\\u65F6\\u6587\\u4EF6</div>';
   }else{
     h='<div class="lhead"><div class="lname">\\u540D\\u79F0</div><div class="lsize">\\u5927\\u5C0F</div><div class="lmod">\\u5230\\u671F\\u65F6\\u95F4</div><div class="tmp-act-h"></div></div>';
-    for(var i=0;i<tempFiles.length;i++){
-      var f=tempFiles[i];
+    for(var i=0;i<list.length;i++){
+      var f=list[i];
       h+='<div class="lrow">'
         +'<div class="lname"><span class="lic">'+icOf({name:f.name,type:typeOf(f.name)})+'</span><span class="lnm" title="'+esc(f.name)+'">'+esc(f.name)+'</span></div>'
         +'<div class="lsize">'+fmt(f.size)+'</div>'
@@ -3277,32 +3374,318 @@ function renderList(){
     if(d){del(d.getAttribute('data-del'));}
   };
 }
+function refreshList(showErr){
+  fetch('/temp/api/list',{cache:'no-store'})
+  .then(function(r){return r.json();})
+  .then(function(data){
+    if(data&&data.error){
+      if(showErr){$('filelist').innerHTML=statusHtml('\\u52A0\\u8F7D\\u5931\\u8D25: '+data.error,false);}
+      return;
+    }
+    tempFiles=(data&&data.files)||[];
+    // \\u670D\\u52A1\\u7AEF\\u5217\\u8868\\u5DF2\\u5305\\u542B\\u7684\\u9879\\u8BF4\\u660E KV \\u5DF2\\u4E00\\u81F4\\uFF1A\\u6E05\\u6389\\u5BF9\\u5E94 pending\\uFF08\\u907F\\u514D\\u957F\\u671F\\u9A7B\\u7559\\uFF09
+    var pruned=false;
+    for(var i=0;i<tempFiles.length;i++){
+      var pk=tempFiles[i].key;
+      if(pendingFiles[pk]){delete pendingFiles[pk];pruned=true;}
+    }
+    if(pruned){savePending();}
+    renderList();
+  })
+  .catch(function(e){
+    if(showErr){$('filelist').innerHTML=statusHtml('\\u52A0\\u8F7D\\u5931\\u8D25: '+String((e&&e.message)||e),false);}
+  });
+}
+function render(){
+  var hint='\\u6587\\u4EF6\\u5230\\u671F\\u81EA\\u52A8\\u5220\\u9664\\uFF08\\u4FDD\\u5B58 '+ttlText(CFG.tempTtlSec)+'\\uFF09 \\u00B7 \\u5355\\u6587\\u4EF6\\u4E0A\\u9650 '+CFG.tempMaxMb+' MB \\u00B7 \\u6570\\u91CF\\u4E0A\\u9650 '+CFG.tempMaxFiles+' \\u4E2A \\u00B7 \\u5B58\\u50A8\\uFF1A'+CFG.kvName;
+  $('tmpHint').textContent=hint;
+  if(CFG.tempStorage==='cos'){
+    $('tempUpBtn').disabled=true;
+    $('filelist').innerHTML=statusHtml('COS \\u4E34\\u65F6\\u5B58\\u50A8\\u4E3A\\u9884\\u7559\\u4F4D\\uFF0C\\u6682\\u672A\\u542F\\u7528\\uFF1B\\u8BF7\\u4F7F\\u7528 KV \\u5B58\\u50A8',false);
+    return;
+  }
+  $('filelist').innerHTML=statusHtml('\\u52A0\\u8F7D\\u4E2D...',true);
+  refreshList(true);
+}
+// =====================================================================
+// \\u4E0A\\u4F20\\u4EFB\\u52A1\\u9762\\u677F\\uFF08\\u4EFF Alist\\uFF09\\uFF1A\\u53F3\\u4E0B\\u89D2\\u5C0F\\u6309\\u94AE \\u2192 \\u4EFB\\u52A1\\u8FDB\\u5EA6\\u6761 + \\u4E0A\\u4F20\\u65E5\\u5FD7
+// \\u961F\\u5217\\u4E32\\u884C\\u4E0A\\u4F20\\uFF08\\u907F\\u514D\\u77AC\\u65F6\\u6253\\u6EE1 Worker \\u9650\\u6D41\\uFF09\\uFF0C429 \\u81EA\\u52A8\\u9000\\u907F\\u91CD\\u8BD5\\uFF0C\\u5931\\u8D25\\u53EF\\u624B\\u52A8\\u91CD\\u8BD5
+// =====================================================================
+var tasks=[];
+var taskSeq=0;
+var taskRunning=false;
+var pumpTimer=null;
+var taskRenderTimer=null;
+var batchOk=0;
+var batchFail=0;
+var RETRY_DELAYS=[4000,12000,30000];
+var MAX_LOG=200;
+var reconcileTimer=null;
+function taskLog(msg,isErr){
+  var box=$('taskLog');
+  if(!box){return;}
+  var d=new Date();
+  var p=function(x){return String(x).padStart(2,'0');};
+  var row=document.createElement('div');
+  row.className='lg'+(isErr?' err':'');
+  row.innerHTML='<span class="lg-t">'+p(d.getHours())+':'+p(d.getMinutes())+':'+p(d.getSeconds())+'</span>'+esc(msg);
+  box.appendChild(row);
+  while(box.childNodes.length>MAX_LOG){box.removeChild(box.firstChild);}
+  box.scrollTop=box.scrollHeight;
+}
+function openPanel(){$('taskPanel').classList.add('show');}
+function closePanel(){$('taskPanel').classList.remove('show');}
+function activeCount(){
+  var n=0;
+  for(var i=0;i<tasks.length;i++){
+    var s=tasks[i].status;
+    if(s==='wait'||s==='up'||s==='proc'){n++;}
+  }
+  return n;
+}
+function updateBadge(){
+  var b=$('taskBadge');
+  if(!b){return;}
+  var n=activeCount();
+  if(n>0){b.textContent=String(n);b.style.display='';}
+  else{b.style.display='none';}
+}
+function taskStatusText(t){
+  if(t.status==='wait'){return '\\u7B49\\u5F85\\u4E2D';}
+  if(t.status==='up'){return '\\u4E0A\\u4F20\\u4E2D';}
+  if(t.status==='proc'){return '\\u5904\\u7406\\u4E2D\\u2026';}
+  if(t.status==='done'){return '\\u5DF2\\u5B8C\\u6210';}
+  if(t.status==='fail'){return '\\u5931\\u8D25';}
+  if(t.status==='cancel'){return '\\u5DF2\\u53D6\\u6D88';}
+  return '';
+}
+function fmtSpeed(bps){
+  if(!bps||bps<1){return '';}
+  var n=1024;
+  if(bps<n){return Math.round(bps)+' B/s';}
+  if(bps<n*n){return (bps/n).toFixed(1)+' KB/s';}
+  return (bps/(n*n)).toFixed(1)+' MB/s';
+}
+function renderTasks(){
+  taskRenderTimer=null;
+  var box=$('taskList');
+  if(!box){return;}
+  if(!tasks.length){box.innerHTML='<div class="tp-empty">\\u6682\\u65E0\\u4E0A\\u4F20\\u4EFB\\u52A1</div>';updateBadge();return;}
+  var h='';
+  var waiting=false;
+  for(var i=0;i<tasks.length;i++){
+    var t=tasks[i];
+    var pct=0;
+    if(t.status==='done'){pct=100;}
+    else if(t.size>0){pct=Math.min(99,Math.floor(t.loaded*100/t.size));}
+    var cls=t.status==='done'?' done':(t.status==='fail'?' err':'');
+    var sub='<span class="tk-size">'+fmt(t.size)+'</span>';
+    if(t.status==='up'&&t.speed){sub+='<span class="tk-speed">'+fmtSpeed(t.speed)+'</span>';}
+    var stateText=taskStatusText(t);
+    if(t.status==='wait'&&t.nextAt>Date.now()){
+      stateText='\\u7B49\\u5F85\\u91CD\\u8BD5 '+Math.ceil((t.nextAt-Date.now())/1000)+'s';
+      waiting=true;
+    }
+    sub+='<span class="tk-state">'+esc(stateText)+(t.status==='fail'&&t.error?'\\uFF1A'+esc(t.error):'')+'</span>';
+    var act='';
+    if(t.status==='fail'||t.status==='cancel'){act='<button class="tk-abtn" type="button" data-retry="'+t.id+'">\\u91CD\\u8BD5</button>';}
+    else if(t.status==='wait'||t.status==='up'){act='<button class="tk-abtn" type="button" data-cancel="'+t.id+'">\\u53D6\\u6D88</button>';}
+    h+='<div class="tk'+cls+'">'
+      +'<div class="tk-top"><span class="tk-name" title="'+esc(t.name)+'">'+esc(t.name)+'</span><span class="tk-pct">'+pct+'%</span></div>'
+      +'<div class="tk-bar"><div class="tk-fill" style="width:'+pct+'%"></div></div>'
+      +'<div class="tk-sub">'+sub+'<span class="tk-act">'+act+'</span></div>'
+      +'</div>';
+  }
+  box.innerHTML=h;
+  updateBadge();
+  // \\u6709\\u4EFB\\u52A1\\u5728\\u7B49\\u5F85\\u91CD\\u8BD5\\u65F6\\uFF0C\\u6BCF\\u79D2\\u91CD\\u6E32\\u67D3\\u4E00\\u6B21\\u4EE5\\u5237\\u65B0\\u5012\\u8BA1\\u65F6
+  if(waiting&&!taskRenderTimer){taskRenderTimer=setTimeout(renderTasks,1000);}
+}
+function scheduleTaskRender(){
+  if(taskRenderTimer){return;}
+  taskRenderTimer=setTimeout(renderTasks,120);
+}
+function findTask(id){
+  for(var i=0;i<tasks.length;i++){if(tasks[i].id===id){return tasks[i];}}
+  return null;
+}
+// \\u4EFB\\u52A1\\u5217\\u8868\\u4E0A\\u9650\\u4FDD\\u62A4\\uFF1A\\u8D85\\u9650\\u65F6\\u4E22\\u5F03\\u300C\\u6700\\u65E9\\u7684\\u5DF2\\u7ED3\\u675F\\u4EFB\\u52A1\\u300D\\u5E76\\u91CA\\u653E\\u5176 File \\u5F15\\u7528\\uFF08\\u957F\\u4F1A\\u8BDD\\u5185\\u5B58\\u4E0D\\u589E\\u957F\\uFF09
+function trimTasks(){
+  var MAX_TASKS=200;
+  if(tasks.length<=MAX_TASKS){return;}
+  var over=tasks.length-MAX_TASKS;
+  var out=[],i;
+  for(i=0;i<tasks.length;i++){
+    var s=tasks[i].status;
+    var active=(s==='wait'||s==='up'||s==='proc');
+    if(!active&&over>0){over--;tasks[i].file=null;continue;}
+    out.push(tasks[i]);
+  }
+  tasks=out;
+}
+function pumpTasks(){
+  if(taskRunning){return;}
+  var next=null,soonest=0,now=Date.now();
+  for(var i=0;i<tasks.length;i++){
+    var t=tasks[i];
+    if(t.status!=='wait'){continue;}
+    if(t.nextAt&&t.nextAt>now){if(!soonest||t.nextAt<soonest){soonest=t.nextAt;}continue;}
+    next=t;
+    break;
+  }
+  if(!next){
+    if(soonest){
+      if(pumpTimer){clearTimeout(pumpTimer);}
+      pumpTimer=setTimeout(function(){pumpTimer=null;pumpTasks();},Math.max(500,soonest-Date.now()));
+    }
+    return;
+  }
+  taskRunning=true;
+  doUpload(next);
+}
+function doUpload(t){
+  t.status='up';
+  t.loaded=0;
+  t.error='';
+  t.speed=0;
+  t.lastAt=Date.now();
+  t.lastLoaded=0;
+  taskLog('\\u5F00\\u59CB\\u4E0A\\u4F20\\uFF1A'+t.name);
+  scheduleTaskRender();
+  var xhr=new XMLHttpRequest();
+  t.xhr=xhr;
+  var fd=new FormData();
+  fd.append('file',t.file,t.name);
+  xhr.open('POST','/temp/api/upload');
+  xhr.timeout=600000;
+  if(xhr.upload){
+    xhr.upload.onprogress=function(e){
+      if(!e.lengthComputable){return;}
+      t.loaded=e.loaded;
+      var now=Date.now();
+      var dt=(now-t.lastAt)/1000;
+      if(dt>=0.4){
+        t.speed=Math.max(0,(e.loaded-t.lastLoaded)/dt);
+        t.lastAt=now;
+        t.lastLoaded=e.loaded;
+      }
+      if(e.total>0&&e.loaded>=e.total&&t.status==='up'){t.status='proc';}
+      scheduleTaskRender();
+    };
+  }
+  xhr.onload=function(){
+    var j=null;
+    try{j=JSON.parse(xhr.responseText||'{}');}catch(e){}
+    if(xhr.status===200&&j&&j.ok){
+      t.status='done';
+      t.loaded=t.size;
+      batchOk++;
+      if(j.file&&j.file.key){
+        // \\u5148\\u628A\\u63A5\\u53E3\\u8FD4\\u56DE\\u7684\\u6587\\u4EF6\\u9879\\u5E76\\u5165\\u672C\\u5730\\u5217\\u8868\\uFF08KV list() \\u6709\\u6570\\u79D2\\u5EF6\\u8FDF\\uFF09\\uFF0C\\u5E76\\u6301\\u4E45\\u5316\\u4EE5\\u6297\\u5237\\u65B0
+        pendingFiles[j.file.key]={item:j.file,until:Date.now()+PENDING_MS};
+        delete deletedKeys[j.file.key];
+        savePending();
+      }
+      taskLog('\\u4E0A\\u4F20\\u6210\\u529F\\uFF1A'+t.name);
+      renderList();
+      finishTask();
+    }else if(xhr.status===429&&t.attempts<RETRY_DELAYS.length){
+      var wait=RETRY_DELAYS[t.attempts];
+      // \\u670D\\u52A1\\u7AEF 429 \\u4F1A\\u5E26 Retry-After\\uFF08\\u5982 60 \\u79D2\\uFF09\\uFF1A\\u5C0A\\u91CD\\u5B83\\uFF0C\\u907F\\u514D\\u7ACB\\u5373\\u91CD\\u8BD5\\u7EE7\\u7EED\\u649E\\u9650\\u6D41
+      var ra=parseInt(xhr.getResponseHeader('Retry-After')||'0',10);
+      if(isFinite(ra)&&ra>0){wait=Math.min(Math.max(ra*1000,wait),90000);}
+      t.attempts++;
+      t.status='wait';
+      t.nextAt=Date.now()+wait;
+      taskLog('\\u8BF7\\u6C42\\u8FC7\\u4E8E\\u9891\\u7E41\\uFF0C'+Math.round(wait/1000)+' \\u79D2\\u540E\\u81EA\\u52A8\\u91CD\\u8BD5\\uFF1A'+t.name,true);
+      finishTask();
+    }else{
+      t.status='fail';
+      t.error=(j&&j.error)||('HTTP '+xhr.status);
+      batchFail++;
+      taskLog('\\u4E0A\\u4F20\\u5931\\u8D25\\uFF1A'+t.name+'\\uFF08'+t.error+'\\uFF09',true);
+      finishTask();
+    }
+    scheduleTaskRender();
+  };
+  xhr.onerror=function(){
+    t.status='fail';t.error='\\u7F51\\u7EDC\\u9519\\u8BEF';batchFail++;
+    taskLog('\\u4E0A\\u4F20\\u5931\\u8D25\\uFF1A'+t.name+'\\uFF08\\u7F51\\u7EDC\\u9519\\u8BEF\\uFF09',true);
+    finishTask();scheduleTaskRender();
+  };
+  xhr.ontimeout=function(){
+    t.status='fail';t.error='\\u4E0A\\u4F20\\u8D85\\u65F6';batchFail++;
+    taskLog('\\u4E0A\\u4F20\\u5931\\u8D25\\uFF1A'+t.name+'\\uFF08\\u8D85\\u65F6\\uFF09',true);
+    finishTask();scheduleTaskRender();
+  };
+  xhr.onabort=function(){
+    if(t.status==='cancel'){taskLog('\\u5DF2\\u53D6\\u6D88\\uFF1A'+t.name);}
+    finishTask();scheduleTaskRender();
+  };
+  xhr.send(fd);
+}
+function finishTask(){
+  taskRunning=false;
+  pumpTasks();
+  if(activeCount()===0){
+    if(batchOk+batchFail>0){
+      toast('\\u4E0A\\u4F20\\u5B8C\\u6210\\uFF1A\\u6210\\u529F '+batchOk+' \\u4E2A'+(batchFail?('\\uFF0C\\u5931\\u8D25 '+batchFail+' \\u4E2A'):''));
+      batchOk=0;batchFail=0;
+    }
+    reconcileSoon();
+  }
+}
+function reconcileSoon(){
+  if(reconcileTimer){clearTimeout(reconcileTimer);}
+  var delays=[2500,7000,16000,32000];
+  var i=0;
+  function step(){
+    refreshList(false);
+    i++;
+    if(i<delays.length){reconcileTimer=setTimeout(step,delays[i]-delays[i-1]);}
+  }
+  reconcileTimer=setTimeout(step,delays[0]);
+}
 function upload(files){
   if(!files||!files.length){return;}
   var arr=Array.prototype.slice.call(files);
-  var idx=0,okN=0,failN=0;
   var maxBytes=CFG.tempMaxMb*1024*1024;
-  function next(){
-    if(idx>=arr.length){
-      toast('\\u4E0A\\u4F20\\u5B8C\\u6210\\uFF1A\\u6210\\u529F '+okN+' \\u4E2A'+(failN?('\\uFF0C\\u5931\\u8D25 '+failN+' \\u4E2A'):''));
-      render();
-      return;
+  var queued=0;
+  for(var i=0;i<arr.length;i++){
+    var f=arr[i];
+    taskSeq++;
+    if(f.size>maxBytes){
+      tasks.push({id:taskSeq,file:f,name:f.name,size:f.size,status:'fail',loaded:0,error:'\\u8D85\\u8FC7 '+CFG.tempMaxMb+' MB',attempts:RETRY_DELAYS.length,nextAt:0,speed:0});
+      batchFail++;
+      taskLog('\\u8DF3\\u8FC7\\u300C'+f.name+'\\u300D\\uFF1A\\u8D85\\u8FC7\\u5355\\u6587\\u4EF6\\u4E0A\\u9650 '+CFG.tempMaxMb+' MB',true);
+      continue;
     }
-    var f=arr[idx++];
-    if(f.size>maxBytes){failN++;toast('\\u300C'+f.name+'\\u300D\\u8D85\\u8FC7 '+CFG.tempMaxMb+' MB\\uFF0C\\u5DF2\\u8DF3\\u8FC7');setTimeout(next,200);return;}
-    var fd=new FormData();
-    fd.append('file',f,f.name);
-    toast('\\u4E0A\\u4F20\\u4E2D '+idx+'/'+arr.length+'\\uFF1A'+f.name);
-    fetch('/temp/api/upload',{method:'POST',body:fd})
-    .then(function(r){return r.json().then(function(j){return {s:r.status,j:j};});})
-    .then(function(o){
-      if(o.s===200&&o.j&&o.j.ok){okN++;}
-      else{failN++;toast('\\u4E0A\\u4F20\\u5931\\u8D25\\uFF1A'+((o.j&&o.j.error)||('HTTP '+o.s)));}
-      next();
-    })
-    .catch(function(e){failN++;toast('\\u4E0A\\u4F20\\u5931\\u8D25\\uFF1A'+String((e&&e.message)||e));next();});
+    tasks.push({id:taskSeq,file:f,name:f.name,size:f.size,status:'wait',loaded:0,error:'',attempts:0,nextAt:0,speed:0});
+    queued++;
   }
-  next();
+  trimTasks();
+  renderTasks();
+  if(queued>0){
+    openPanel();
+    pumpTasks();
+  }else if(batchOk+batchFail>0){
+    toast('\\u4E0A\\u4F20\\u5B8C\\u6210\\uFF1A\\u6210\\u529F '+batchOk+' \\u4E2A'+(batchFail?('\\uFF0C\\u5931\\u8D25 '+batchFail+' \\u4E2A'):''));
+    batchOk=0;batchFail=0;
+  }
+}
+function retryTask(id){
+  var t=findTask(id);
+  if(!t){return;}
+  t.status='wait';t.loaded=0;t.error='';t.nextAt=0;t.attempts=0;t.speed=0;
+  renderTasks();
+  pumpTasks();
+}
+function cancelTask(id){
+  var t=findTask(id);
+  if(!t){return;}
+  if(t.status==='up'&&t.xhr){t.status='cancel';try{t.xhr.abort();}catch(e){}}
+  else if(t.status==='wait'){t.status='cancel';renderTasks();}
+  updateBadge();
 }
 function del(key){
   if(!key){return;}
@@ -3312,8 +3695,15 @@ function del(key){
   fetch('/temp/api/delete',{method:'POST',body:fd})
   .then(function(r){return r.json();})
   .then(function(j){
-    if(j&&j.ok){toast('\\u5DF2\\u5220\\u9664');render();}
-    else{toast('\\u5220\\u9664\\u5931\\u8D25\\uFF1A'+((j&&j.error)||'\\u672A\\u77E5\\u9519\\u8BEF'));}
+    if(j&&j.ok){
+      deletedKeys[key]=Date.now()+PENDING_MS;
+      delete pendingFiles[key];
+      savePending();
+      tempFiles=tempFiles.filter(function(x){return x.key!==key;});
+      renderList();
+      toast('\\u5DF2\\u5220\\u9664');
+      setTimeout(function(){refreshList(false);},4000);
+    }else{toast('\\u5220\\u9664\\u5931\\u8D25\\uFF1A'+((j&&j.error)||'\\u672A\\u77E5\\u9519\\u8BEF'));}
   })
   .catch(function(e){toast('\\u5220\\u9664\\u5931\\u8D25\\uFF1A'+String((e&&e.message)||e));});
 }
@@ -3322,6 +3712,30 @@ if(up&&fi){
   up.onclick=function(){fi.click();};
   fi.onchange=function(){upload(fi.files);fi.value='';};
 }
+// \\u4E0A\\u4F20\\u4EFB\\u52A1\\u9762\\u677F\\u4EA4\\u4E92\\uFF1A\\u5C0F\\u6309\\u94AE\\u5F00\\u5173 / \\u5173\\u95ED / \\u6E05\\u9664\\u5DF2\\u5B8C\\u6210 / \\u5931\\u8D25\\u91CD\\u8BD5 / \\u4E0A\\u4F20\\u4E2D\\u53D6\\u6D88
+var taskBtnEl=$('taskBtn');
+if(taskBtnEl){taskBtnEl.onclick=function(){if($('taskPanel').classList.contains('show')){closePanel();}else{openPanel();}};}
+var taskCloseEl=$('taskClose');
+if(taskCloseEl){taskCloseEl.onclick=closePanel;}
+var taskClearEl=$('taskClear');
+if(taskClearEl){taskClearEl.onclick=function(){
+  var kept=[];
+  for(var i=0;i<tasks.length;i++){
+    var s=tasks[i].status;
+    if(s==='wait'||s==='up'||s==='proc'){kept.push(tasks[i]);}
+  }
+  if(kept.length===tasks.length){toast('\\u6682\\u65E0\\u53EF\\u6E05\\u9664\\u7684\\u4EFB\\u52A1');return;}
+  tasks=kept;
+  renderTasks();
+};}
+var taskListEl=$('taskList');
+if(taskListEl){taskListEl.onclick=function(e){
+  var rb=e.target.closest('[data-retry]');
+  if(rb){retryTask(parseInt(rb.getAttribute('data-retry'),10));return;}
+  var cb=e.target.closest('[data-cancel]');
+  if(cb){cancelTask(parseInt(cb.getAttribute('data-cancel'),10));}
+};}
+renderTasks();
 $('themeBtn').onclick=function(){
   document.body.classList.toggle('dark');
   try{localStorage.setItem('tempDark',document.body.classList.contains('dark')?'1':'0');}catch(e){}
@@ -3330,6 +3744,7 @@ $('themeBtn').onclick=function(){
 try{
   if(localStorage.getItem('tempDark')==='1'){document.body.classList.add('dark');$('themeBtn').innerHTML='&#x2600;&#xFE0F;';}
 }catch(e){}
+loadPending();
 render();
 </script>
 </body></html>`;
