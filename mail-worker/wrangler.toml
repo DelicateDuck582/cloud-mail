@@ -6,14 +6,20 @@ keep_vars = true
 [observability]
 enabled = true
 
-#[[d1_databases]]
-#binding = "db"			#d1数据库绑定名默认不可修改
-#database_name = ""		#d1数据库名字
-#database_id = ""		#d1数据库id
+# =====================================================================
+# 生产绑定（写进配置 = 每次部署由 Cloudflare 自动绑定，无需在面板手工添加）
+#   D1: email（database_id 950828e9-…）  KV: email（id 2fe4f308…）
+#   绑定 ID 只是资源标识、不是密钥；密钥/密码仍只放环境变量与 Secrets。
+#   ⚠️ 若删掉这里的绑定，从配置部署（含 Workers Builds）时该绑定可能不再生效。
+# =====================================================================
+[[d1_databases]]
+binding = "db"						#d1数据库绑定名默认不可修改
+database_name = "email"				#d1数据库名字
+database_id = "950828e9-c02c-4b30-80fd-10f442ce853b"	#d1数据库id
 
-#[[kv_namespaces]]
-#binding = "kv"			#kv绑定名默认不可修改
-#id = ""					#kv数据库id
+[[kv_namespaces]]
+binding = "kv"						#kv绑定名默认不可修改
+id = "2fe4f308183e4c44b162469e787178b5"	#kv数据库id
 
 #[[r2_buckets]]
 #binding = "r2"			#r2对象存储绑定名默认不可修改
