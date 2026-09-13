@@ -24,6 +24,7 @@
 |---|---|
 | `doc/cos-proxy-worker.js` | **唯一改动的部署文件**（仓库内副本；部署用文件在仓库外 `web开发\cos-proxy-worker.js`，两者始终同步） |
 | `doc/browse-alist-网盘改造说明.md` | 本说明文档 |
+| `doc/审计报告-COS-Worker-安全性能密钥-2026-09-13.md` | 可执行审计报告（61 项攻击矩阵 + 性能实测 + 密钥 canary 扫描） |
 
 > `mail-worker/`、`mail-vue/`、`main`、`attachment-manager` **均未改动**。
 
@@ -125,7 +126,7 @@
 
 ## 6. 部署步骤（cos-exchange）
 
-1. 用 `web开发\cos-proxy-worker.js`（**191173 字节（约 187 KB）**，以文件为准；仓库内副本 `doc/cos-proxy-worker.js` 与其字节一致）全量替换 Worker `cos-exchange` 的代码。
+1. 用 `web开发\cos-proxy-worker.js`（**192031 字节（约 188 KB）**，以文件为准；仓库内副本 `doc/cos-proxy-worker.js` 与其字节一致）全量替换 Worker `cos-exchange` 的代码。
 2. 确认 §4 环境变量均在（`BROWSE_PASS` 等）。
 3. 部署后验证：
    - `https://cos.duckgame-play.top/browse` → Alist 风格登录页
