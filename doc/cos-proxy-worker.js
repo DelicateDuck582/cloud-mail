@@ -730,6 +730,56 @@ async function tempGet(env, key) {
   return { buf: obj.value, meta: obj.metadata || {} };
 }
 
+// KV 单键最长保留（秒）：与 TEMP_TTL 的内部上限一致（30 天），
+// 续期不会把"临时"文件变成永久文件。
+const TEMP_KEEP_MAX = 2592000;
+
+// 续期：KV 没有 touch / 延期接口，只能「读回原值 → 用新的 expirationTtl 重写」
+// （metadata 原样带回，name/type/size/at 不变）。
+// 语义：从"当前到期时间"再延长一个保存期限（默认 7 天）；总保留上限 TEMP_KEEP_MAX。
+// 返回 null 表示文件不存在 / 已过期。
+async function tempRenew(env, key) {
+  const cfg = tempConfig(env);
+  if (cfg.storage === 'cos') throw tempCosNotReady(); // 预留位
+  const store = tempStore(env);
+  if (!store) throw new Error('未绑定 KV（TEMP_KV / BROWSE_KV）');
+  if (!TEMP_KEY_RE.test(key || '')) throw new Error('bad key');
+
+  const now = Date.now();
+  const obj = await store.getWithMetadata(key, { type: 'arrayBuffer' });
+  if (!obj || !obj.value) return null;
+
+  // 当前到期时间：list({ prefix: key }) 会带上该键的 expiration（秒）。
+  // 取不到（KV list 最终一致 / 旧数据）时按"从现在起"计算，等价于重置为一个完整期限。
+  let baseMs = now;
+  try {
+    const page = await store.list({ prefix: key });
+    const hit = (page.keys || []).find(x => x.name === key);
+    if (hit && hit.expiration) baseMs = Math.max(now, hit.expiration * 1000);
+  } catch (e) {}
+
+  let remainSec = Math.ceil((baseMs + cfg.ttl * 1000 - now) / 1000);
+  if (!Number.isFinite(remainSec) || remainSec < 60) remainSec = cfg.ttl;
+  let capped = false;
+  if (remainSec > TEMP_KEEP_MAX) { remainSec = TEMP_KEEP_MAX; capped = true; }
+
+  await store.put(key, obj.value, { expirationTtl: remainSec, metadata: obj.metadata || {} });
+
+  const meta = obj.metadata || {};
+  return {
+    added: Math.max(0, Math.floor((now + remainSec * 1000 - baseMs) / 1000)),
+    capped,
+    file: {
+      key,
+      name: tempSafeName(meta.name),
+      type: tempSafeType(meta.type || ''),
+      size: Number(meta.size) || (obj.value.byteLength || 0),
+      at: Number(meta.at) || 0,
+      expireAt: now + remainSec * 1000,
+    },
+  };
+}
+
 async function tempDelete(env, key) {
   const cfg = tempConfig(env);
   if (cfg.storage === 'cos') return tempCosDelete(env, key); // 预留
@@ -852,9 +902,10 @@ async function handleTemp(request, env, ctx) {
     });
   }
 
-  // POST 白名单：上传 / 删除（其余一律 405）
+  // POST 白名单：上传 / 删除 / 续期（其余一律 405）
   const isPostRoute = request.method === 'POST' && (
-    url.pathname === '/temp/api/upload' || url.pathname === '/temp/api/delete'
+    url.pathname === '/temp/api/upload' || url.pathname === '/temp/api/delete' ||
+    url.pathname === '/temp/api/renew'
   );
   if (request.method !== 'GET' && request.method !== 'HEAD' && !isPostRoute) {
     return new Response('Method Not Allowed', { status: 405 });
@@ -978,6 +1029,23 @@ async function handleTemp(request, env, ctx) {
     headers.set('X-Content-Type-Options', 'nosniff');
     headers.set('Cache-Control', 'private, max-age=300');
     return new Response(obj.buf, { status: 200, headers });
+  }
+
+  // 续期（字段 key）：每次 +一个保存期限（默认 7 天），总保留上限 30 天（TEMP_KEEP_MAX）
+  if (url.pathname === '/temp/api/renew' && request.method === 'POST') {
+    if (rateLimited('trenew:' + clientIP(request), 30, 60000)) {
+      return new Response('Too Many Requests', { status: 429, headers: { 'Retry-After': '60' } });
+    }
+    const form = await request.formData();
+    const key = String(form.get('key') || '');
+    try {
+      const r = await tempRenew(env, key);
+      if (!r) return jsonResp({ error: '文件不存在或已过期' }, 404);
+      return jsonResp({ ok: true, added: r.added, capped: r.capped, file: r.file });
+    } catch (e) {
+      console.error('temp renew error:', e);
+      return jsonResp({ error: (e && e.message) || '续期失败' }, e && e.status === 501 ? 501 : 400);
+    }
   }
 
   // 删除（字段 key）
@@ -3137,10 +3205,11 @@ body.dark .pill:hover{background:rgba(77,159,255,.25)}
 .lrow{display:flex;align-items:center;gap:8px;padding:10px 12px;border-radius:8px;transition:background .15s;animation:itemIn .2s ease}
 .lrow:hover{background:var(--hover)}
 @keyframes itemIn{from{opacity:0;transform:scale(.98)}to{opacity:1;transform:scale(1)}}
-.tmp-act{width:76px;flex-shrink:0;display:flex;justify-content:flex-end;gap:6px}
-.tmp-act-h{width:76px;flex-shrink:0}
+.tmp-act{width:106px;flex-shrink:0;display:flex;justify-content:flex-end;gap:6px}
+.tmp-act-h{width:106px;flex-shrink:0}
 .tmp-a{width:30px;height:30px;border:1px solid var(--line);border-radius:8px;background:var(--card);color:var(--sub);display:inline-flex;align-items:center;justify-content:center;font-size:13px;text-decoration:none;cursor:pointer}
 .tmp-a:hover{border-color:var(--primary);color:var(--primary)}
+.tmp-a:disabled{opacity:.5;cursor:not-allowed}
 .status{display:flex;flex-direction:column;align-items:center;gap:12px;padding:46px 0;color:var(--muted);font-size:14px}
 .spinner{width:26px;height:26px;border:3px solid var(--line);border-top-color:var(--primary);border-radius:50%;animation:spin .8s linear infinite}
 @keyframes spin{to{transform:rotate(360deg)}}
@@ -3187,7 +3256,7 @@ body.dark .pill:hover{background:rgba(77,159,255,.25)}
 @media (max-width:760px){
   .lmod{display:none}
   .lsize{width:76px}
-  .tmp-act,.tmp-act-h{width:64px}
+  .tmp-act,.tmp-act-h{width:96px}
   .tmp-hint{width:100%}
   .brand .bname{display:none}
   .task-btn{right:12px;bottom:12px}
@@ -3338,6 +3407,10 @@ function ttlText(sec){
   if(sec>=3600){return Math.round(sec/3600)+' \\u5C0F\\u65F6';}
   return Math.round(sec/60)+' \\u5206\\u949F';
 }
+// \\u7EED\\u671F\\u4E00\\u6B21\\u7684\\u65F6\\u957F\\uFF08\\u5929\\uFF09\\uFF1A\\u6309 TEMP_TTL \\u8BA1\\u7B97\\uFF0C\\u7528\\u4E8E\\u6309\\u94AE title \\u4E0E\\u63D0\\u793A\\u6587\\u6848
+function ttlDays(){
+  return Math.max(1,Math.round((CFG.tempTtlSec||604800)/86400));
+}
 // KV \\u7684 list() \\u662F\\u6700\\u7EC8\\u4E00\\u81F4\\u7684\\uFF08\\u5199\\u5165\\u540E\\u6570\\u79D2\\u5185\\u5217\\u8868\\u53EF\\u80FD\\u8FD8\\u770B\\u4E0D\\u5230\\u65B0\\u6587\\u4EF6\\uFF09\\u3002
 // \\u4E0A\\u4F20\\u6210\\u529F\\u540E\\u5148\\u628A\\u63A5\\u53E3\\u8FD4\\u56DE\\u7684\\u6587\\u4EF6\\u9879\\u672C\\u5730\\u5E76\\u5165\\u5217\\u8868\\uFF08pendingFiles\\uFF09\\uFF0C
 // \\u540E\\u53F0\\u518D\\u591A\\u6B21\\u62C9\\u53D6\\u670D\\u52A1\\u7AEF\\u5217\\u8868\\u6821\\u51C6\\uFF0C\\u907F\\u514D\\u300C\\u4E0A\\u4F20\\u6210\\u529F\\u5374\\u770B\\u4E0D\\u5230\\u300D\\u3002
@@ -3375,6 +3448,7 @@ function renderList(){
         +'<div class="lsize">'+fmt(f.size)+'</div>'
         +'<div class="lmod">'+esc(fmtT(f.expireAt))+'</div>'
         +'<div class="tmp-act">'
+        +'<button class="tmp-a" type="button" data-renew="'+esc(f.key)+'" title="\\u7EED\\u671F\\uFF08+'+ttlDays()+' \\u5929\\uFF09">&#x21BB;</button>'
         +'<a class="tmp-a" href="/temp/api/file?key='+encodeURIComponent(f.key)+'&dl=1" title="\\u4E0B\\u8F7D">&#x2B07;</a>'
         +'<button class="tmp-a" type="button" data-del="'+esc(f.key)+'" title="\\u5220\\u9664">&#x2715;</button>'
         +'</div></div>';
@@ -3382,6 +3456,8 @@ function renderList(){
   }
   box.innerHTML=h;
   box.onclick=function(e){
+    var rn=e.target.closest('[data-renew]');
+    if(rn){renewFile(rn.getAttribute('data-renew'),rn);return;}
     var d=e.target.closest('[data-del]');
     if(d){del(d.getAttribute('data-del'));}
   };
@@ -3698,6 +3774,42 @@ function cancelTask(id){
   if(t.status==='up'&&t.xhr){t.status='cancel';try{t.xhr.abort();}catch(e){}}
   else if(t.status==='wait'){t.status='cancel';renderTasks();}
   updateBadge();
+}
+// \\u7EED\\u671F\\uFF1APOST /temp/api/renew \\u2014\\u2014 \\u670D\\u52A1\\u7AEF\\u8BFB\\u56DE\\u539F\\u503C\\u518D\\u7528\\u65B0\\u7684 expirationTtl \\u91CD\\u5199
+// \\uFF08KV \\u6CA1\\u6709 touch/\\u5EF6\\u671F\\u63A5\\u53E3\\uFF09\\u3002\\u6210\\u529F\\u540E\\u7528\\u54CD\\u5E94\\u91CC\\u7684\\u65B0\\u5230\\u671F\\u65F6\\u95F4\\u5C31\\u5730\\u66F4\\u65B0\\u672C\\u5730\\u5217\\u8868\\uFF0C
+// \\u4E0D\\u5FC5\\u7B49 KV list \\u7684\\u6700\\u7EC8\\u4E00\\u81F4\\u3002
+var renewing={};
+function renewFile(key,btn){
+  if(!key||renewing[key]){return;}
+  renewing[key]=1;
+  if(btn){btn.disabled=true;}
+  var fd=new FormData();
+  fd.append('key',key);
+  fetch('/temp/api/renew',{method:'POST',body:fd})
+  .then(function(r){return r.json().then(function(j){return {s:r.status,j:j};});})
+  .then(function(o){
+    delete renewing[key];
+    if(o.s===200&&o.j&&o.j.ok){
+      var nf=o.j.file||{};
+      for(var i=0;i<tempFiles.length;i++){
+        if(tempFiles[i].key===key){tempFiles[i].expireAt=nf.expireAt;break;}
+      }
+      if(pendingFiles[key]){pendingFiles[key].item.expireAt=nf.expireAt;savePending();}
+      renderList();
+      var days=Math.round((o.j.added||0)/86400);
+      if(days>0){toast('\\u5DF2\\u7EED\\u671F\\uFF1A+'+days+' \\u5929'+(o.j.capped?'\\uFF08\\u5DF2\\u8FBE\\u4FDD\\u7559\\u4E0A\\u9650\\uFF09':''));}
+      else{toast('\\u5DF2\\u5728\\u4FDD\\u7559\\u4E0A\\u9650\\uFF0830 \\u5929\\uFF09\\u5185\\uFF0C\\u672A\\u518D\\u5EF6\\u957F');}
+    }else{
+      if(btn){btn.disabled=false;}
+      toast('\\u7EED\\u671F\\u5931\\u8D25\\uFF1A'+((o.j&&o.j.error)||('HTTP '+o.s)));
+      if(o.s===404){refreshList(false);}
+    }
+  })
+  .catch(function(e){
+    delete renewing[key];
+    if(btn){btn.disabled=false;}
+    toast('\\u7EED\\u671F\\u5931\\u8D25\\uFF1A'+String((e&&e.message)||e));
+  });
 }
 function del(key){
   if(!key){return;}
