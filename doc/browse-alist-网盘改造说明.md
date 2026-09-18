@@ -202,3 +202,35 @@ Copy-Item cos-proxy-worker.built.js "cloud-mail-fork\doc\cos-proxy-worker.js" -F
 - **单一共享密码**：所有登录者看到同一桶全部文件，无用户级权限体系。
 - **文件路径结构**会出现在 `key=` 参数中（下载/预览必需），已通过移除复制链接降低暴露面。
 - 后续可选项：文件级签名链接（像附件那样）、R2 视频缓存、多用户体系。
+
+---
+
+## CLI 部署（wrangler，2026-09-18 起）
+
+`/browse`、`/temp` 与附件代理同属 **cos-exchange** Worker；除"面板粘贴代码"外，现支持 CLI 部署（可复现、可回滚）：
+
+```powershell
+cd mail-worker
+npx wrangler deploy -c ../doc/cos-exchange.wrangler.toml
+```
+
+配置要点（完整注释见 `doc/cos-exchange.wrangler.toml`，实测记录见审计报告 §9.3）：
+
+| 项 | 值 | 为什么 |
+|---|---|---|
+| `main` | `cos-proxy-worker.js`（同目录） | 部署的就是仓库里这份文件；改完先 `node --check` |
+| `compatibility_date` | `"2026-08-10"` | 与线上现版本一致（读自 `wrangler versions view`），避免运行时语义漂移 |
+| **`keep_vars`** | `true` | **必须**：CLI 部署默认删除所有明文变量（`REGION`/`TEMP_PASS`/`ATT_SIGN_MAX_TTL`/`BROWSE_ALLOW_COUNTRY`）→ 会直接打断 `/browse`（COS 探活失败）与 `/temp`（未配置密码） |
+| `[[kv_namespaces]]` | `BROWSE_KV`、`TEMP_KV` | 必须与线上 ID 一致，否则 2FA 会话与临时网盘全部失效 |
+| `routes` | 不声明 | 已有自定义域保持原样 |
+| `preview_urls` | `false` | CLI 默认会为版本生成**公网**预览 URL（实测可访问），关掉减少暴露面 |
+
+部署后核对：
+
+```powershell
+cd mail-worker
+npx wrangler deployments status --name cos-exchange
+npx wrangler versions view <Version ID> --name cos-exchange   # 期望：7 个 Secret + 2 个 KV + 4 个环境变量
+```
+
+> 若清单里少了 `REGION` / `TEMP_PASS` 等变量，说明 `keep_vars` 未生效：需在面板补回（值不要写进仓库）。

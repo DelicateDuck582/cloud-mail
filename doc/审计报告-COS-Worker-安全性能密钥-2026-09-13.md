@@ -143,10 +143,11 @@ F /static/../attachments/… → 403（仍需签名）｜ %2e%2e 被 URL 规范�
 ## 6. 复现方式
 
 ```powershell
-# 1) 安全审计（61 项攻击矩阵；mock COS/KV/Cache，不触网）
+# 1) 安全审计（当前 90 项攻击矩阵 A–I 九组；mock COS/KV/Cache，不触网）
 cd "E:\DEVE 开发\web开发"
 node _audit-security.mjs "cloud-mail-fork\doc\cos-proxy-worker.js"
-#   → 期望：PASS=61  FAIL=0  INFO=1 ；"ALL SECURITY CHECKS PASSED"
+#   → 期望：PASS=90  FAIL=0 ；"ALL SECURITY CHECKS PASSED"
+#     （历史基线：§0–§7 为 61 项，§8 为 88 项，§9 起为 90 项）
 
 # 2) 性能审计（体积/CPU/回源次数/页面体积/上界）
 node _audit-perf.mjs "cloud-mail-fork\doc\cos-proxy-worker.js"
@@ -235,5 +236,101 @@ mock 的 COS 回源会把每次请求计数并记录 URL，因此"回源次数""
 
 前次的 F1–F10、R1–R6 仍有效；本次复审在**不改动业务逻辑**的前提下把矩阵扩到续期面与 mail 契约，
 结论未变：**未发现可绕过签名读取附件、未发现无鉴权/越权访问 COS 或 KV 其它命名空间、未发现密钥外泄、未发现可放大 COS 回源的新路径**（续期只读写 `tmp/*`，`/temp` 全流程 0 次 COS 回源）。
+
+---
+
+## 9. 修复与上线部署（2026-09-18）
+
+> 触发：维护者要求「修掉 §8.3 的两条信息级发现 + 用 wrangler CLI 上传 CF」。
+> 被测/部署版本：`doc/cos-proxy-worker.js`，**198230 字节**（+670），
+> sha256 `E53CBBDE0976925CFD4268B027785EECA3DA52DFBCB62CA517D1B418D66E969D`（仓库副本与部署文件逐字节一致）。
+> 结论：**矩阵扩为 90 项（A–I 九组）全部通过（FAIL=0）**；两条信息级发现已修复，并在**生产环境用真实密码实测生效**。
+
+### 9.1 代码修复（仅 2 处，未触碰签名/鉴权/COS 回源/mail 契约）
+
+| # | 位置 | 修改 | 效果 |
+|---|---|---|---|
+| I1 | `TEMP_KEY_RE`（worker.js:642） | `/^tmp\/[a-z0-9-]+$/i` → **去掉 `i` 标志** | `TMP/x` 等大小写变体在校验阶段即判非法 → **400**（原先 404）；与 KV 大小写敏感语义严格一致 |
+| I2 | `handleTemp`（worker.js:937–943） | 新增 POST-only 端点方法门控：`/temp/api/upload`、`/temp/api/delete`、`/temp/api/renew` 上非 POST → **405 + `Allow: POST`** | GET/HEAD 不再落到 404；门控放在**密码门控之后**，未登录访问仍先见登录页，不额外暴露接口面 |
+
+### 9.2 复测（本地 mock，90 项）
+
+```powershell
+cd "E:\DEVE 开发\web开发"
+node _audit-security.mjs "cloud-mail-fork\doc\cos-proxy-worker.js"   # PASS=90 FAIL=0 → ALL SECURITY CHECKS PASSED
+node _audit-perf.mjs     "cloud-mail-fork\doc\cos-proxy-worker.js"   # 体积/CPU/回源/页面体积/上界 无回归
+```
+
+| 组 | A–G | H（续期面 + KV 越权） | I（mail 契约） | 合计 |
+|---|---|---|---|---|
+| 断言数 | 61 | 20 | 7 → **9** | **90** |
+
+- H 组：原「`GET /temp/api/renew` 不执行动作（404/405 均可）」这 1 条，替换为 **3 条**明确断言（登录后 `GET /temp/api/{renew,upload,delete}` → 405 且含 `Allow: POST`）；`TMP/x` 的期望值由 404 改为 400。
+- 其余组断言不变，全部通过；G 组密钥 canary（23 响应 × 11 canary）仍为 0 命中。
+
+### 9.3 CLI 部署（wrangler，新增可复现配置）
+
+新增 `doc/cos-exchange.wrangler.toml`（与"面板粘贴代码"等价，但可复现、可回滚）：
+
+```powershell
+cd mail-worker
+npx wrangler deploy -c ../doc/cos-exchange.wrangler.toml
+```
+
+| 配置 | 值 | 为什么 |
+|---|---|---|
+| `compatibility_date` | `"2026-08-10"` | 先用 `wrangler versions view` 读出线上现值，保持一致，避免运行时语义漂移 |
+| **`keep_vars`** | `true` | **必须**：CLI 部署默认会**删除所有明文变量**。线上有 `ATT_SIGN_MAX_TTL="3600"`、`BROWSE_ALLOW_COUNTRY="CN,JP"`、`REGION="ap-osaka"`、`TEMP_PASS` —— 漏掉会直接打断 `/browse`（COS 探活失败→503）与 `/temp`（未配置密码→提示页） |
+| Secrets | 不声明 | Secrets 不会被部署删除：`ATT_SIGN_SECRET`、`AWS_ACCESS_KEY_ID`、`AWS_SECRET_ACCESS_KEY`、`BROWSE_PASS`、`S3_ENDPOINT`、`TURNSTILE_SITEKEY`、`TURNSTILE_SECRET` |
+| `[[kv_namespaces]]` | `BROWSE_KV=086c531c…`、`TEMP_KV=f527c223…` | 必须与线上一致，否则 `/browse` 2FA 会话与 `/temp` 临时网盘失效 |
+| `routes` | 不声明 | 已有自定义域（`cos.<域名>`）保持原样 |
+| **`preview_urls`** | `false` | **CLI 首次部署默认会为版本生成公网预览 URL**（实测 `https://ade8635f-cos-exchange.<账号>.workers.dev/` 可访问）；关闭后新旧预览 URL 均 **404** |
+
+部署输出：`Total Upload: 167.81 KiB / gzip: 44.10 KiB`、`Worker Startup Time: 1–2 ms`；
+版本 `ade8635f-3961-48dc-9c66-6ee624e43506`（首推，带预览 URL）→ **`9c10d23c-58e5-4ec0-9d00-88d173c517c4`（最终，`preview_urls=false`）**。
+
+> 网络：`api.cloudflare.com` **直连可用**（`curl` 实测有响应、`wrangler versions view` 正常），本次部署无需代理；
+> 本地 10808 代理（`-x socks5h://127.0.0.1:10808`）仅用于验证"外网可达性"（workers.dev / 预览 URL）。
+
+### 9.4 部署后核对（关键：变量/密钥/绑定未丢）
+
+`npx wrangler versions view 9c10d23c… --name cos-exchange` 复核：
+
+- `Compatibility Date: 2026-08-10`（未变）
+- **7 个 Secret** 全在；**2 个 KV 绑定** ID 未变；**4 个环境变量**（`ATT_SIGN_MAX_TTL` / `BROWSE_ALLOW_COUNTRY` / `REGION` / `TEMP_PASS`）值与部署前一致
+
+线上烟测（部署前基线与部署后同一 URL 集合对比）：
+
+| 请求 | 部署前 | 部署后 |
+|---|---|---|
+| `GET /` | 302 → `mail.duckgame-play.top` | 302（同） |
+| `GET /browse` | 200 / 6901 B | 200 / 6901 B |
+| `GET /temp` | 200 / 6186 B | 200 / 6186 B |
+| `GET /attachments/test.png`（无签名） | 403 / body 9 B | 403 / body 9 B（哈希一致） |
+| `GET /temp/api/renew`（未登录） | 200（登录页） | 200（登录页，符合设计） |
+| `GET /favicon.ico` | 204 | 204 |
+
+页面体量一致；正文差异**仅为 CF 自身注入的** `window.__CF$cv$params={r:'<ray>',t:'<ts>'}`（每请求变化）⇒ Worker 输出未变、绑定/变量接线等价。
+
+### 9.5 生产环境 E2E（真实密码 + 真实 KV，走自定义域）
+
+| 步骤 | 期望 | 实测 |
+|---|---|---|
+| `POST /temp/login`（正确密码，带同源 `Origin`） | 302 + `Set-Cookie` | ✅ 302 |
+| `POST /temp/api/upload`（`file=`20B 文本） | 200 + `file.key` | ✅ `tmp/mu733i2k-9484dc9c061705dc` |
+| `POST /temp/api/renew`（key=该文件） | 200，`added=604800`、`expireAt` 延后 | ✅ |
+| **`GET /temp/api/renew`（已登录）** | **405 + `Allow: POST`**（I2 修复实证） | ✅ 405 / `Allow: POST` |
+| **`POST /temp/api/renew`，key=`TMP/x`** | **400**（I1 修复实证） | ✅ 400 |
+| `GET /temp/api/file?key=…&dl=1` | 内容逐字节一致 | ✅ 一致（20 B） |
+| `POST /temp/api/delete`（key=该文件） | 200 `{"ok":true}` | ✅ |
+| `GET /temp/api/list` | 已无该 key | ✅（测试文件已清理，生产 KV 未留垃圾） |
+
+### 9.6 遗留建议（与本次修复无关，未改动）
+
+1. **`workers.dev` 路由仍公网可达**（走代理实测 `https://cos-exchange.<账号>.workers.dev/browse` = **200**）。其门控与自定义域相同（附件需签名、`/browse`/`/temp` 需密码、国家白名单 `CN,JP`），但属**多余入口**：可在 CF 面板 Workers → cos-exchange → Settings → Domains & Routes 停用，或在 `wrangler.toml` 加 `workers_dev = false`（会移除该入口，请先确认无依赖）。
+2. **`TEMP_PASS` 是明文变量**（`wrangler versions view` 可读出，也会出现在面板/版本记录里），建议改为 **Secret（加密）** 类型，减少明文暴露面。
+3. 前次审计的 R1–R6 / F4–F10（尤其 R1/F5：CF 边缘 Rate Limiting）仍然适用。
+
+> 归因：本次仅改 2 处（正则标志 + 405 门控），F4–F10、R1–R6 状态不变；矩阵合计 90 项，`FAIL=0`。
 
 

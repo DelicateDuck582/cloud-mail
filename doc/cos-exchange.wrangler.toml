@@ -1,0 +1,40 @@
+# =====================================================================
+# cos-exchange Worker —— wrangler CLI 部署配置
+# ---------------------------------------------------------------------
+# 与「面板粘贴代码」等价，但可复现、可回滚（URL 见文件末）。
+#
+# 关键点：
+# 1) compatibility_date 与线上现版本一致（2026-08-10），避免运行时语义漂移。
+# 2) keep_vars = true：保留面板上已有的**明文变量**，CLI 部署默认会删掉它们！
+#      ATT_SIGN_MAX_TTL / BROWSE_ALLOW_COUNTRY / REGION / TEMP_PASS
+#    Secrets 不由部署删除，无需声明（值只在 CF 侧）：
+#      ATT_SIGN_SECRET / AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY /
+#      BROWSE_PASS / S3_ENDPOINT / TURNSTILE_SITEKEY / TURNSTILE_SECRET
+# 3) 不声明 routes：已有的自定义域（cos.<你的域名>）保持原样。
+# 4) KV 绑定必须与线上一致，否则 /browse 2FA 会话与 /temp 临时网盘会失效。
+# 5) preview_urls = false：CLI 部署默认会为每个版本生成**公网可访问**的
+#    <版本前缀>-cos-exchange.<账号>.workers.dev 预览 URL（本次实测可访问），
+#    关掉可减少暴露面；若还想关掉常驻的 workers.dev 路由，在面板
+#    Workers → cos-exchange → Settings → Domains & Routes 里停用，
+#    或在此文件加 workers_dev = false（注意：会移除该入口，请自行确认无依赖）。
+#
+# 部署（仓库根目录）：
+#   cd mail-worker
+#   npx wrangler deploy -c ../doc/cos-exchange.wrangler.toml
+# 部署后核对（应看到 4 个变量 + 7 个 Secret + 2 个 KV 绑定）：
+#   npx wrangler deployments status --name cos-exchange
+#   npx wrangler versions view <Version ID> --name cos-exchange
+# =====================================================================
+name = "cos-exchange"
+main = "cos-proxy-worker.js"
+compatibility_date = "2026-08-10"
+keep_vars = true
+preview_urls = false
+
+[[kv_namespaces]]
+binding = "BROWSE_KV"
+id = "086c531c2f0d47798212d349a9326b61"
+
+[[kv_namespaces]]
+binding = "TEMP_KV"
+id = "f527c223eb1f4d3e80b05afb0df96c0a"

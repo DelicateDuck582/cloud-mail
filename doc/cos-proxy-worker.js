@@ -637,7 +637,9 @@ function tempConfig(env) {
   };
 }
 
-const TEMP_KEY_RE = /^tmp\/[a-z0-9-]+$/i;
+// 临时文件键：服务端生成的键一律为小写（tmp/ + 36 进制时间戳 + 小写 hex）
+// 故正则不加 i 标志：`TMP/x` 这类大小写变体直接判非法，避免"看似存在的键"歧义
+const TEMP_KEY_RE = /^tmp\/[a-z0-9-]+$/;
 
 function tempNewKey() {
   const b = crypto.getRandomValues(new Uint8Array(8));
@@ -930,6 +932,14 @@ async function handleTemp(request, env, ctx) {
       status: 200,
       headers: { 'Content-Type': 'text/html; charset=utf-8', 'X-Content-Type-Options': 'nosniff', 'X-Frame-Options': 'DENY', 'Cache-Control': 'no-store' },
     });
+  }
+
+  // POST-only 接口：非 POST 一律 405（原先落到 404，HTTP 语义不精确）
+  // 放在密码门控之后：未登录访问仍先看到登录页，不额外暴露接口面
+  if ((url.pathname === '/temp/api/upload' ||
+       url.pathname === '/temp/api/delete' ||
+       url.pathname === '/temp/api/renew') && request.method !== 'POST') {
+    return new Response('Method Not Allowed', { status: 405, headers: { Allow: 'POST' } });
   }
 
   // 首页
