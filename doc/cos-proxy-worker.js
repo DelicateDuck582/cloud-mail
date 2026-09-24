@@ -70,8 +70,11 @@ export default {
 
       // /static/ 无签名（仅 Referer/Sec-Fetch，可被脚本伪造）：加 per-IP 限流，
       // 防攻击者用随机 static/* 路径刷 COS 回源（每个唯一路径都会打一次 COS）
-      if (url.pathname.startsWith('/static/') && rateLimited('static:' + clientIP(request), 120, 60000)) {
-        return new Response('Too Many Requests', { status: 429, headers: { 'Retry-After': '60' } });
+      if (url.pathname.startsWith('/static/')) {
+        const rlStatic = rateLimitCheck('static:' + clientIP(request), 120, 60000);
+        if (rlStatic.limited) {
+          return rateLimitResp(request, rlStatic, '静态资源', '每 IP 每分钟最多 120 次');
+        }
       }
 
       // =====================================================
@@ -446,11 +449,37 @@ function tempStore(env) {
   return env.TEMP_KV || env.BROWSE_KV || null;
 }
 
-function jsonResp(obj, status) {
+function jsonResp(obj, status, extraHeaders) {
+  const headers = {
+    'Content-Type': 'application/json; charset=utf-8',
+    'X-Content-Type-Options': 'nosniff',
+    'Cache-Control': 'no-store',
+  };
+  if (extraHeaders) for (const k of Object.keys(extraHeaders)) headers[k] = extraHeaders[k];
   return new Response(JSON.stringify(obj), {
     status: status || 200,
+    headers,
+  });
+}
+
+// 统一 429（限速）响应 —— 解决「点太快只看到 HTTP 429 / Too Many Requests」的问题：
+//  - API 路径（含 /api/）→ JSON {error, retryAfter}，前端可读文案 + 可编程退避
+//  - 页面/表单路径 → 纯文本中文（浏览器直接显示「请慢一点，等 N 秒」）
+// 两者都带 Retry-After（秒），取自固定窗口的真实剩余时间（不再一律写 60）。
+function rateLimitResp(request, info, what, detail) {
+  const secs = Math.max(1, Math.ceil((info && info.retryAfter) || 60));
+  let path = '';
+  try { path = new URL(request.url).pathname; } catch (e) {}
+  const msg = '操作太快了，请慢一点：' + (what || '请求') + '过于频繁，请在 ' + secs + ' 秒后重试'
+    + (detail ? '（' + detail + '）' : '');
+  if (path.indexOf('/api/') >= 0) {
+    return jsonResp({ error: msg, retryAfter: secs }, 429, { 'Retry-After': String(secs) });
+  }
+  return new Response(msg, {
+    status: 429,
     headers: {
-      'Content-Type': 'application/json; charset=utf-8',
+      'Content-Type': 'text/plain; charset=utf-8',
+      'Retry-After': String(secs),
       'X-Content-Type-Options': 'nosniff',
       'Cache-Control': 'no-store',
     },
@@ -635,6 +664,17 @@ function tempConfig(env) {
   let ttl = Number(env.TEMP_TTL || 604800);
   if (!Number.isFinite(ttl) || ttl < 60) ttl = 604800;
   if (ttl > 2592000) ttl = 2592000;
+  // 调用速率（每 IP 每分钟）：上传默认 20（≈每 3 秒 1 个），/temp/api/* 合计默认 90，页面默认 60。
+  // 前端会按 uploadPerMin 自动算出排队间隔（uploadGapMs），从源头避免撞 429。
+  let upm = Number(env.TEMP_UPLOAD_PER_MIN || 20);
+  if (!Number.isFinite(upm) || upm < 1) upm = 20;
+  if (upm > 600) upm = 600;
+  let apm = Number(env.TEMP_API_PER_MIN || 90);
+  if (!Number.isFinite(apm) || apm < 5) apm = 90;
+  if (apm > 3000) apm = 3000;
+  let ppm = Number(env.TEMP_PAGE_PER_MIN || 60);
+  if (!Number.isFinite(ppm) || ppm < 2) ppm = 60;
+  if (ppm > 600) ppm = 600;
   return {
     storage,
     fileMaxMb: fmb,
@@ -642,6 +682,11 @@ function tempConfig(env) {
     totalMb: tmb,
     totalBytes: Math.floor(tmb * 1024 * 1024),
     ttl: Math.floor(ttl),
+    uploadPerMin: Math.floor(upm),
+    apiPerMin: Math.floor(apm),
+    pagePerMin: Math.floor(ppm),
+    // 排队间隔：略大于 60s/次上限（+10% 余量），避免正好踩在窗口边界又被 429
+    uploadGapMs: Math.ceil((60000 / upm) * 1.1),
   };
 }
 
@@ -998,7 +1043,10 @@ async function tempLogin(request, env) {
   }
   const ip = 'temp:' + clientIP(request);
   if (loginBlocked(ip)) {
-    return new Response('Too Many Login Attempts', { status: 429, headers: { 'Retry-After': '600' } });
+    return new Response('密码错误次数过多，请 10 分钟后再试（临时网盘登录已锁定）', {
+      status: 429,
+      headers: { 'Content-Type': 'text/plain; charset=utf-8', 'Retry-After': '600', 'X-Content-Type-Options': 'nosniff' },
+    });
   }
   const form = await request.formData();
   const p = String(form.get('p') || '');
@@ -1037,6 +1085,24 @@ async function handleTemp(request, env, ctx) {
     const c = (request.headers.get('CF-IPCountry') || '').toUpperCase();
     if (!allowC.toUpperCase().split(',').map(s => s.trim()).includes(c)) {
       return new Response('Forbidden', { status: 403 });
+    }
+  }
+
+  // 全局速率护栏（每 IP，固定窗口 60 秒；放在密码门控之前 → 未登录也受限，防爆破/刷量）：
+  //   /temp 页面 GET/HEAD  pagePerMin（默认 60）
+  //   /temp/api/* 合计     apiPerMin （默认 90）
+  // 命中时返回统一 429：API 走 JSON（含 retryAfter），页面走可读中文 + Retry-After。
+  const tLim = tempConfig(env);
+  if ((url.pathname === '/temp' || url.pathname === '/temp/') && (request.method === 'GET' || request.method === 'HEAD')) {
+    const rlPage = rateLimitCheck('tpage:' + clientIP(request), tLim.pagePerMin, 60000);
+    if (rlPage.limited) {
+      return rateLimitResp(request, rlPage, '页面刷新', '每 IP 每分钟最多 ' + tLim.pagePerMin + ' 次');
+    }
+  }
+  if (url.pathname.indexOf('/temp/api/') === 0) {
+    const rlApi = rateLimitCheck('tapi:' + clientIP(request), tLim.apiPerMin, 60000);
+    if (rlApi.limited) {
+      return rateLimitResp(request, rlApi, '接口调用', '每 IP 每分钟最多 ' + tLim.apiPerMin + ' 次');
     }
   }
 
@@ -1103,6 +1169,8 @@ async function handleTemp(request, env, ctx) {
       tempTotalMb: tcfg.totalMb,
       tempUsedBytes: usage.bytes,
       tempTtlSec: tcfg.ttl,
+      tempUploadPerMin: tcfg.uploadPerMin,
+      tempUploadGapMs: tcfg.uploadGapMs,
       kvName: env.TEMP_KV ? 'TEMP_KV' : 'BROWSE_KV',
     };
     return new Response(tempIndexHtml(cfg), {
@@ -1112,8 +1180,9 @@ async function handleTemp(request, env, ctx) {
 
   // 列表
   if (url.pathname === '/temp/api/list') {
-    if (rateLimited('tlist:' + clientIP(request), 60, 60000)) {
-      return new Response('Too Many Requests', { status: 429, headers: { 'Retry-After': '60' } });
+    const rlList = rateLimitCheck('tlist:' + clientIP(request), 60, 60000);
+    if (rlList.limited) {
+      return rateLimitResp(request, rlList, '列表刷新', '每 IP 每分钟最多 60 次');
     }
     const tcfg = tempConfig(env);
     try {
@@ -1127,6 +1196,7 @@ async function handleTemp(request, env, ctx) {
         files, storage: tcfg.storage, ttl: tcfg.ttl,
         fileMaxMb: tcfg.fileMaxMb, totalMb: tcfg.totalMb,
         used: usage.bytes, total: tcfg.totalBytes, count: files.length,
+        uploadPerMin: tcfg.uploadPerMin, uploadGapMs: tcfg.uploadGapMs,
       });
     } catch (e) {
       console.error('temp list error:', e);
@@ -1136,10 +1206,12 @@ async function handleTemp(request, env, ctx) {
 
   // 上传（multipart 字段 file）
   if (url.pathname === '/temp/api/upload' && request.method === 'POST') {
-    if (rateLimited('tup:' + clientIP(request), 20, 60000)) {
-      return new Response('Too Many Requests', { status: 429, headers: { 'Retry-After': '60' } });
-    }
     const tcfg = tempConfig(env);
+    const rlUp = rateLimitCheck('tup:' + clientIP(request), tcfg.uploadPerMin, 60000);
+    if (rlUp.limited) {
+      // 前端按 uploadPerMin 自动限速排队，正常不会撞到这里；撞到则给出等待秒数
+      return rateLimitResp(request, rlUp, '上传', '每 IP 每分钟最多 ' + tcfg.uploadPerMin + ' 次');
+    }
     if (tcfg.storage === 'cos') return jsonResp({ error: 'COS 临时存储暂未启用（预留位）' }, 501);
 
     // 单文件上限只来自 KV 平台硬限制（单值 25 MiB），不是业务策略
@@ -1218,8 +1290,9 @@ async function handleTemp(request, env, ctx) {
 
   // 下载/预览（?key=&dl=1）
   if (url.pathname === '/temp/api/file') {
-    if (rateLimited('tget:' + clientIP(request), 120, 60000)) {
-      return new Response('Too Many Requests', { status: 429, headers: { 'Retry-After': '60' } });
+    const rlGet = rateLimitCheck('tget:' + clientIP(request), 120, 60000);
+    if (rlGet.limited) {
+      return rateLimitResp(request, rlGet, '下载/预览', '每 IP 每分钟最多 120 次');
     }
     const key = url.searchParams.get('key') || '';
     let obj;
@@ -1244,8 +1317,9 @@ async function handleTemp(request, env, ctx) {
 
   // 续期（字段 key）：每次 +一个保存期限（默认 7 天），总保留上限 30 天（TEMP_KEEP_MAX）
   if (url.pathname === '/temp/api/renew' && request.method === 'POST') {
-    if (rateLimited('trenew:' + clientIP(request), 30, 60000)) {
-      return new Response('Too Many Requests', { status: 429, headers: { 'Retry-After': '60' } });
+    const rlRenew = rateLimitCheck('trenew:' + clientIP(request), 30, 60000);
+    if (rlRenew.limited) {
+      return rateLimitResp(request, rlRenew, '续期', '每 IP 每分钟最多 30 次');
     }
     const form = await request.formData();
     const key = String(form.get('key') || '');
@@ -1261,8 +1335,9 @@ async function handleTemp(request, env, ctx) {
 
   // 删除（字段 key）
   if (url.pathname === '/temp/api/delete' && request.method === 'POST') {
-    if (rateLimited('tdel:' + clientIP(request), 60, 60000)) {
-      return new Response('Too Many Requests', { status: 429, headers: { 'Retry-After': '60' } });
+    const rlDel = rateLimitCheck('tdel:' + clientIP(request), 60, 60000);
+    if (rlDel.limited) {
+      return rateLimitResp(request, rlDel, '删除', '每 IP 每分钟最多 60 次');
     }
     const form = await request.formData();
     const key = String(form.get('key') || '');
@@ -1421,8 +1496,9 @@ async function handleBrowse(request, env, ctx) {
   // =====================================================
   if (url.pathname === '/browse/api/2fa/new') {
     if (!authStore(env)) return jsonResp({ error: '未绑定 KV（BROWSE_KV / TEMP_KV），无法使用 2FA' }, 501);
-    if (rateLimited('2fa:' + clientIP(request), 20, 60000)) {
-      return new Response('Too Many Requests', { status: 429, headers: { 'Retry-After': '60' } });
+    const rl2fa = rateLimitCheck('2fa:' + clientIP(request), 20, 60000);
+    if (rl2fa.limited) {
+      return rateLimitResp(request, rl2fa, '2FA 校验', '每 IP 每分钟最多 20 次');
     }
     const secret = randomBase32(20);
     return jsonResp({ secret, otpauth: otpauthUri(env, secret), bound: !!(await getTotp(env)) });
@@ -1431,8 +1507,9 @@ async function handleBrowse(request, env, ctx) {
   if (url.pathname === '/browse/api/2fa/bind' && request.method === 'POST') {
     if (!sameSitePostOk(request)) return new Response('Forbidden', { status: 403 });
     if (!authStore(env)) return jsonResp({ error: '未绑定 KV（BROWSE_KV / TEMP_KV），无法使用 2FA' }, 501);
-    if (rateLimited('2fabind:' + clientIP(request), 10, 60000)) {
-      return new Response('Too Many Requests', { status: 429, headers: { 'Retry-After': '60' } });
+    const rlBind = rateLimitCheck('2fabind:' + clientIP(request), 10, 60000);
+    if (rlBind.limited) {
+      return rateLimitResp(request, rlBind, '2FA 绑定', '每 IP 每分钟最多 10 次');
     }
     const form = await request.formData();
     const secret = String(form.get('secret') || '').toUpperCase().replace(/[^A-Z2-7]/g, '');
@@ -1460,8 +1537,9 @@ async function handleBrowse(request, env, ctx) {
   if (url.pathname === '/browse/api/2fa/disable' && request.method === 'POST') {
     if (!sameSitePostOk(request)) return new Response('Forbidden', { status: 403 });
     if (!authStore(env)) return jsonResp({ error: '未绑定 KV' }, 501);
-    if (rateLimited('2fadisable:' + clientIP(request), 10, 60000)) {
-      return new Response('Too Many Requests', { status: 429, headers: { 'Retry-After': '60' } });
+    const rlDis = rateLimitCheck('2fadisable:' + clientIP(request), 10, 60000);
+    if (rlDis.limited) {
+      return rateLimitResp(request, rlDis, '2FA 关闭', '每 IP 每分钟最多 10 次');
     }
     const form = await request.formData();
     const code = String(form.get('code') || '');
@@ -1481,8 +1559,9 @@ async function handleBrowse(request, env, ctx) {
 
   // 列目录
   if (url.pathname === '/browse/api/list') {
-    if (rateLimited('list:' + clientIP(request), 40, 60000)) {
-      return new Response('Too Many Requests', { status: 429, headers: { 'Retry-After': '60' } });
+    const rlBList = rateLimitCheck('list:' + clientIP(request), 40, 60000);
+    if (rlBList.limited) {
+      return rateLimitResp(request, rlBList, '目录列表', '每 IP 每分钟最多 40 次');
     }
     try {
       // prefix/token 限制长度：防超长参数滥用（COS 对超长 prefix 会 400，限流兜底）
@@ -1519,8 +1598,9 @@ async function handleBrowse(request, env, ctx) {
 
   // 下载/预览（经本 Worker 回源，不直连 COS）
   if (url.pathname === '/browse/api/file') {
-    if (rateLimited('file:' + clientIP(request), 120, 60000)) {
-      return new Response('Too Many Requests', { status: 429, headers: { 'Retry-After': '60' } });
+    const rlBFile = rateLimitCheck('file:' + clientIP(request), 120, 60000);
+    if (rlBFile.limited) {
+      return rateLimitResp(request, rlBFile, '文件读取', '每 IP 每分钟最多 120 次');
     }
     const key = url.searchParams.get('key') || '';
     // 路径穿越拦截：绝对路径(/开头) / 反斜杠 / ../
@@ -1559,7 +1639,10 @@ async function browseLogin(request, env) {
   }
   const ip = clientIP(request);
   if (loginBlocked(ip)) {
-    return new Response('Too Many Login Attempts', { status: 429, headers: { 'Retry-After': '600' } });
+    return new Response('密码错误次数过多，请 10 分钟后再试（网盘登录已锁定）', {
+      status: 429,
+      headers: { 'Content-Type': 'text/plain; charset=utf-8', 'Retry-After': '600', 'X-Content-Type-Options': 'nosniff' },
+    });
   }
   const form = await request.formData();
   // Turnstile 人机验证（可选，配置 TURNSTILE_SECRET 后生效）
@@ -1674,18 +1757,26 @@ async function browseFingerprint(pass) {
   return fpCacheVal;
 }
 
-// ---- per-IP 速率限制（内存实现；配合 CF Access 更稳）----
+// ---- per-IP 速率限制（内存实现；配合 CF 边缘 Rate Limiting 更稳）----
+// 固定窗口：窗口自「该 key 的首次请求」起算；返回剩余等待秒数供 Retry-After 使用
+// （旧实现一律回 60 秒，可能比实际剩余时间更长，导致客户端白等）。
 const rateMap = new Map();
-function rateLimited(key, max, windowMs) {
+function rateLimitCheck(key, max, windowMs) {
   if (rateMap.size > 5000) rateMap.clear();
   const now = Date.now();
   const rec = rateMap.get(key);
   if (!rec || now - rec.t > windowMs) {
     rateMap.set(key, { c: 1, t: now });
-    return false;
+    return { limited: false, retryAfter: 0, remaining: Math.max(0, max - 1) };
   }
   rec.c++;
-  return rec.c > max;
+  if (rec.c > max) {
+    return { limited: true, retryAfter: Math.max(1, Math.ceil((rec.t + windowMs - now) / 1000)), remaining: 0 };
+  }
+  return { limited: false, retryAfter: 0, remaining: Math.max(0, max - rec.c) };
+}
+function rateLimited(key, max, windowMs) {
+  return rateLimitCheck(key, max, windowMs).limited;
 }
 const loginFailMap = new Map();
 // 定期清理过期的失败记录，防止攻击者用海量不同 IP 把 Map 撑爆
@@ -3705,12 +3796,18 @@ var usageUsed=Number(CFG.tempUsedBytes)||0;
 var usageTotal=(Number(CFG.tempTotalMb)||800)*1024*1024;
 function fmtUse(s){return (s>0?fmt(s):'0 B');}
 function freeSpace(){return Math.max(0,usageTotal-usageUsed);}
+// ---- \\u670D\\u52A1\\u7AEF\\u9650\\u901F\\uFF08\\u6BCF IP \\u6BCF\\u5206\\u949F\\uFF09\\uFF1A\\u4E0A\\u4F20\\u9ED8\\u8BA4 20 \\u6B21 \\u2192 \\u524D\\u7AEF\\u6309 uploadGapMs \\u6392\\u961F\\u653E\\u884C\\uFF0C
+//      \\u4ECE\\u6E90\\u5934\\u907F\\u514D\\u300C\\u70B9\\u592A\\u5FEB\\u300D\\u649E 429\\uFF1B\\u670D\\u52A1\\u7AEF\\u4ECD\\u4F1A\\u515C\\u5E95\\uFF0C\\u5E76\\u4EE5 JSON \\u56DE {error, retryAfter}\\u3002
+var UPLOAD_PER_MIN=Math.max(1,Number(CFG.tempUploadPerMin)||20);
+var UPLOAD_GAP_MS=Math.max(1000,Number(CFG.tempUploadGapMs)||Math.ceil(60000/UPLOAD_PER_MIN*1.1));
+var lastSendAt=0;
+var gapLogged=false;
 function renderHint(){
   var h=$('tmpHint');
   if(!h){return;}
   h.textContent='\\u6587\\u4EF6\\u5230\\u671F\\u81EA\\u52A8\\u5220\\u9664\\uFF08\\u4FDD\\u5B58 '+ttlText(CFG.tempTtlSec)+'\\uFF09 \\u00B7 \\u5355\\u6587\\u4EF6\\u4E0A\\u9650 '
     +CFG.tempFileMaxMb+' MB\\uFF08KV \\u5E73\\u53F0\\u786C\\u4E0A\\u9650\\uFF09 \\u00B7 \\u5DF2\\u7528 '+fmtUse(usageUsed)+' / '+fmtUse(usageTotal)
-    +'\\uFF08\\u4F59 '+fmtUse(freeSpace())+'\\uFF09 \\u00B7 \\u5B58\\u50A8\\uFF1A'+CFG.kvName;
+    +'\\uFF08\\u4F59 '+fmtUse(freeSpace())+'\\uFF09 \\u00B7 \\u4E0A\\u4F20\\u9650\\u901F '+UPLOAD_PER_MIN+' \\u6B21/\\u5206 \\u00B7 \\u5B58\\u50A8\\uFF1A'+CFG.kvName;
 }
 function render(){
   renderHint();
@@ -3797,7 +3894,10 @@ function renderTasks(){
     var sub='<span class="tk-size">'+fmt(t.size)+'</span>';
     if(t.status==='up'&&t.speed){sub+='<span class="tk-speed">'+fmtSpeed(t.speed)+'</span>';}
     var stateText=taskStatusText(t);
-    if(t.status==='wait'&&t.nextAt>Date.now()){
+    if(t.status==='wait'&&t.limitWait&&t.gapUntil>Date.now()){
+      stateText='\\u9650\\u901F\\u7B49\\u5F85 '+Math.ceil((t.gapUntil-Date.now())/1000)+'s';
+      waiting=true;
+    }else if(t.status==='wait'&&t.nextAt>Date.now()){
       stateText='\\u7B49\\u5F85\\u91CD\\u8BD5 '+Math.ceil((t.nextAt-Date.now())/1000)+'s';
       waiting=true;
     }
@@ -3848,15 +3948,35 @@ function pumpTasks(){
     next=t;
     break;
   }
-  if(!next){
-    if(soonest){
+  if(next){
+    // \\u4E0A\\u4F20\\u8282\\u6D41\\uFF08\\u672C\\u8F6E\\u65B0\\u589E\\uFF09\\uFF1A\\u670D\\u52A1\\u7AEF\\u9650\\u5236\\u300C\\u6BCF IP \\u6BCF\\u5206\\u949F N \\u6B21\\u4E0A\\u4F20\\u300D\\uFF0C\\u961F\\u5217\\u6309\\u540C\\u4E00\\u8282\\u594F\\u653E\\u884C
+    // \\uFF08\\u76F8\\u90BB\\u4E24\\u6B21\\u300C\\u5F00\\u59CB\\u4E0A\\u4F20\\u300D\\u81F3\\u5C11\\u95F4\\u9694 UPLOAD_GAP_MS\\uFF09\\uFF0C\\u907F\\u514D\\u8FDE\\u70B9/\\u6279\\u91CF\\u5C0F\\u6587\\u4EF6\\u649E 429
+    // \\u2014\\u2014\\u649E\\u4E86\\u8981\\u7B49\\u6EE1\\u4E00\\u6574\\u5206\\u949F\\uFF0C\\u53CD\\u800C\\u66F4\\u6162\\u3002
+    var gap=UPLOAD_GAP_MS-(now-lastSendAt);
+    if(lastSendAt>0&&gap>0){
+      next.limitWait=true;
+      next.gapUntil=now+gap;
+      if(!gapLogged){
+        gapLogged=true;
+        taskLog('\\u4E0A\\u4F20\\u9650\\u901F\\uFF1A\\u6BCF '+Math.round(UPLOAD_GAP_MS/1000)+' \\u79D2 1 \\u4E2A\\uFF08\\u670D\\u52A1\\u7AEF\\u9650 '+UPLOAD_PER_MIN+' \\u6B21/\\u5206\\uFF09');
+      }
+      scheduleTaskRender();
       if(pumpTimer){clearTimeout(pumpTimer);}
-      pumpTimer=setTimeout(function(){pumpTimer=null;pumpTasks();},Math.max(500,soonest-Date.now()));
+      pumpTimer=setTimeout(function(){pumpTimer=null;pumpTasks();},Math.max(200,gap));
+      updateBadge();
+      return;
     }
+    next.limitWait=false;
+    next.gapUntil=0;
+    lastSendAt=now;
+    taskRunning=true;
+    doUpload(next);
     return;
   }
-  taskRunning=true;
-  doUpload(next);
+  if(soonest){
+    if(pumpTimer){clearTimeout(pumpTimer);}
+    pumpTimer=setTimeout(function(){pumpTimer=null;pumpTasks();},Math.max(500,soonest-Date.now()));
+  }
 }
 function doUpload(t){
   if(!reserveSpace(t)){
@@ -3914,9 +4034,12 @@ function doUpload(t){
       finishTask();
     }else if(xhr.status===429&&t.attempts<RETRY_DELAYS.length){
       var wait=RETRY_DELAYS[t.attempts];
-      // \\u670D\\u52A1\\u7AEF 429 \\u4F1A\\u5E26 Retry-After\\uFF08\\u5982 60 \\u79D2\\uFF09\\uFF1A\\u5C0A\\u91CD\\u5B83\\uFF0C\\u907F\\u514D\\u7ACB\\u5373\\u91CD\\u8BD5\\u7EE7\\u7EED\\u649E\\u9650\\u6D41
+      // \\u670D\\u52A1\\u7AEF 429 \\u5E26 Retry-After\\uFF08\\u7A97\\u53E3\\u771F\\u5B9E\\u5269\\u4F59\\u79D2\\u6570\\uFF09+ JSON \\u91CC\\u7684 retryAfter\\uFF1A
+      // \\u5C0A\\u91CD\\u5B83\\uFF0C\\u907F\\u514D\\u7ACB\\u5373\\u91CD\\u8BD5\\u7EE7\\u7EED\\u649E\\u9650\\u6D41\\uFF08\\u7A97\\u53E3\\u901A\\u5E38 60 \\u79D2\\uFF09
       var ra=parseInt(xhr.getResponseHeader('Retry-After')||'0',10);
-      if(isFinite(ra)&&ra>0){wait=Math.min(Math.max(ra*1000,wait),90000);}
+      if(j&&j.retryAfter){var rj=parseInt(j.retryAfter,10);if(isFinite(rj)&&rj>ra){ra=rj;}}
+      if(isFinite(ra)&&ra>0){wait=Math.min(Math.max(ra*1000,wait),120000);}
+      lastSendAt=Date.now(); // \\u9650\\u901F\\u7A97\\u53E3\\u5DF2\\u91CD\\u65B0\\u5F00\\u59CB\\u8BA1\\u65F6\\uFF1A\\u9000\\u907F\\u7ED3\\u675F\\u540E\\u65E0\\u9700\\u518D\\u53E0\\u52A0 gap
       t.attempts++;
       t.status='wait';
       t.nextAt=Date.now()+wait;
@@ -3994,13 +4117,25 @@ function upload(files){
   for(var i=0;i<arr.length;i++){
     var f=arr[i];
     taskSeq++;
+    // \\u53BB\\u91CD\\uFF08\\u672C\\u8F6E\\u65B0\\u589E\\uFF09\\uFF1A\\u540C\\u540D\\u540C\\u5927\\u5C0F\\u4E14\\u4ECD\\u5728\\u961F\\u5217/\\u4E0A\\u4F20\\u4E2D\\u7684\\u6587\\u4EF6\\u76F4\\u63A5\\u8DF3\\u8FC7\\uFF0C\\u9632\\u8FDE\\u70B9\\u9020\\u6210\\u91CD\\u590D\\u5165\\u961F
+    var sig=f.name+'|'+f.size+'|'+(f.lastModified||0);
+    var dup=false;
+    for(var d=0;d<tasks.length;d++){
+      var q=tasks[d];
+      if(q.sig===sig&&(q.status==='wait'||q.status==='up'||q.status==='proc')){dup=true;break;}
+    }
+    if(dup){
+      batchFail++;
+      taskLog('\\u8DF3\\u8FC7\\u91CD\\u590D\\u6587\\u4EF6\\u300C'+f.name+'\\u300D\\uFF1A\\u5DF2\\u5728\\u961F\\u5217\\u6216\\u4E0A\\u4F20\\u4E2D',true);
+      continue;
+    }
     if(f.size>maxBytes){
       tasks.push({id:taskSeq,file:f,name:f.name,size:f.size,status:'fail',loaded:0,error:'\\u8D85\\u8FC7 '+CFG.tempFileMaxMb+' MB',attempts:RETRY_DELAYS.length,nextAt:0,speed:0});
       batchFail++;
       taskLog('\\u8DF3\\u8FC7\\u300C'+f.name+'\\u300D\\uFF1A\\u8D85\\u8FC7 KV \\u5355\\u6587\\u4EF6\\u786C\\u4E0A\\u9650 '+CFG.tempFileMaxMb+' MB\\uFF08\\u5E73\\u53F0\\u9650\\u5236\\uFF0C\\u975E\\u672C\\u76D8\\u7B56\\u7565\\uFF09',true);
       continue;
     }
-    var t={id:taskSeq,file:f,name:f.name,size:f.size,status:'wait',loaded:0,error:'',attempts:0,nextAt:0,speed:0,reserved:false};
+    var t={id:taskSeq,file:f,name:f.name,size:f.size,status:'wait',loaded:0,error:'',attempts:0,nextAt:0,speed:0,reserved:false,sig:sig};
     if(!reserveSpace(t)){
       t.status='fail';
       t.error='\\u5B58\\u50A8\\u7A7A\\u95F4\\u4E0D\\u8DB3';
