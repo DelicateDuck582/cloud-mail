@@ -6,7 +6,8 @@
 > 审计方式：**可执行审计**——在 Node 内真实执行 Worker 代码（mock COS 回源 / KV / Cache API / IP 头），
 > 而非仅阅读源码；安全断言 + 性能实测 + 密钥 canary 扫描 + 静态上界检查
 > （首轮 61 项；**2026-09-13 晚复审扩展至 88 项**，新增续期面与 mail 契约两组，见 §8；
-> **2026-09-18 修复两条信息级发现 + CLI 部署，见 §9；2026-09-25 容量策略改造，矩阵扩至 124 项，见 §10**）
+> **2026-09-18 修复两条信息级发现 + CLI 部署，见 §9；2026-09-25 容量策略改造，矩阵扩至 124 项，见 §10；
+> 2026-09-25 限速与节流（可读 429 + 客户端排队）扩至 149 项，见 §11**）
 > 审计脚本（仓库外，`web开发\`）：`_audit-security.mjs`、`_audit-perf.mjs`、`_audit.mjs`（既有密钥扫描）
 > 不在本次范围：`mail-worker`（CloudMail 主体）的登录/发信/JWT 逻辑；本 Worker 只负责附件验签与 COS 回源
 
@@ -144,11 +145,11 @@ F /static/../attachments/… → 403（仍需签名）｜ %2e%2e 被 URL 规范�
 ## 6. 复现方式
 
 ```powershell
-# 1) 安全审计（当前 124 项攻击矩阵 A–J 十组；mock COS/KV/Cache，不触网）
+# 1) 安全审计（当前 149 项攻击矩阵 A–K 十一组；mock COS/KV/Cache，不触网）
 cd "E:\DEVE 开发\web开发"
 node _audit-security.mjs "cloud-mail-fork\doc\cos-proxy-worker.js"
-#   → 期望：PASS=124  FAIL=0 ；"ALL SECURITY CHECKS PASSED"
-#     （历史基线：§0–§7 为 61 项，§8 为 88 项，§9 为 90 项，§10 起为 124 项）
+#   → 期望：PASS=149  FAIL=0 ；"ALL SECURITY CHECKS PASSED"
+#     （历史基线：§0–§7 为 61 项，§8 为 88 项，§9 为 90 项，§10 为 124 项，§11 起为 149 项）
 
 # 2) 性能审计（体积/CPU/回源次数/页面体积/上界）
 node _audit-perf.mjs "cloud-mail-fork\doc\cos-proxy-worker.js"
@@ -421,6 +422,78 @@ node _audit-perf.mjs     "cloud-mail-fork\doc\cos-proxy-worker.js"   # 体积/CP
 
 > 归因：本次只改 `/temp` 的容量计量与上传解析路径；附件签名、`/browse`、mail 契约、各限流阈值均未触碰，
 > A–I 组断言保持不变、全部通过，矩阵合计 **124 项 PASS / 0 FAIL**。
+
+---
+
+## 11. 限速与节流改造（2026-09-25）：把「点太快」变成可读提示 + 客户端主动排队
+
+> 触发：维护者反馈「点得太快会被限流」，要求：**解决问题**（限流给出可读原因与等待秒数）、**限制调用速率**、
+> 并让客户端**慢一点**（排队节流）。
+> 被测/部署版本：`doc/cos-proxy-worker.js`，**219818 字节**、gzip 65240，
+> sha256 `7D2BC8BA01DFAD3BDCDAE55017695695CEFB807EC4A411CFB3721BFA247EB112`、blob `55806708…`。
+> 结论：**矩阵扩为 149 项（A–K 十一组）全部通过（FAIL=0）**；性能审计无回归；A–J 组断言未改动。
+
+### 11.1 问题与修法
+
+| 问题 | 原因 | 修法 |
+|---|---|---|
+| 被限流只看到 `Too Many Requests` / 前端显示 `HTTP 429`，不知道要等多久 | 429 是英文纯文本；`Retry-After` 一律写 60（比真实剩余时间更久 → 客户端白等） | 新增统一 `rateLimitResp()`：**API 路径回 JSON** `{error, retryAfter}`，文案为「操作太快了，请慢一点：上传过于频繁，请在 N 秒后重试（每 IP 每分钟最多 X 次）」；**页面/表单路径回同样可读的中文纯文本**；`Retry-After` 改用固定窗口的**真实剩余秒数**（`rateLimitCheck()` 计算） |
+| 小文件连点/批量上传很快撞 429（等满 60 秒反而更慢） | 前端队列「串行但无间隔」，服务端 20 次/分 → 第 21 次就 429 | 服务端把节流参数下发到页面（`tempUploadPerMin` / `tempUploadGapMs`，默认 20 次/分 → 间隔 3.3 秒）；前端 `pumpTasks()` 按间隔放行，任务面板显示「限速等待 Ns」并在日志写明原因；429 时取 `JSON.retryAfter` 与 `Retry-After` 的较大值精确退避（上限 120 秒） |
+| 连点上传按钮导致重复入队 | 同一文件可被重复选入队列 | 前端按 `name|size|lastModified` **去重**（仍在排队/上传中的同名同大小文件跳过并记日志） |
+| 缺少 `/temp` 整体护栏 | 只有单接口限流 | 新增每 IP 护栏：`/temp` 页面 60 次/分、`/temp/api/*` 合计 90 次/分（都在密码门控之前 → 未登录同样受限） |
+
+### 11.2 限速清单（每 IP，固定窗口 60 秒）
+
+| 端点 | 上限 | 可调参数 |
+|---|---|---|
+| `/temp` 页面 GET/HEAD | 60 | `TEMP_PAGE_PER_MIN` |
+| `/temp/api/*` 合计 | 90 | `TEMP_API_PER_MIN` |
+| `/temp/api/upload` | **20**（前端按此自动节流） | `TEMP_UPLOAD_PER_MIN` |
+| `/temp/api/list` / `file` / `renew` / `delete` | 60 / 120 / 30 / 60 | — |
+| `/temp/login`、`/browse/login` | 失败 5 次/10 分钟锁定（429 + `Retry-After: 600`，中文提示） | — |
+| `/browse/api/list` / `file`、2FA 校验/绑定/关闭 | 40 / 120 / 20 / 10 / 10 | — |
+| `/static/*` | 120 | — |
+
+### 11.3 复测（149 项）
+
+```powershell
+node _audit-security.mjs "cloud-mail-fork\doc\cos-proxy-worker.js"   # PASS=149  FAIL=0
+node _audit-perf.mjs     "cloud-mail-fork\doc\cos-proxy-worker.js"   # 无回归（219818 字节 / gzip 65240）
+```
+
+新增 **K 组 15 项**：
+
+| # | 断言 | 实测 |
+|---|---|---|
+| 1 | 上传超限（限 2 次/分，第 3 次）→ 429 | 200,200,**429** |
+| 2 | 429 为 JSON、含「请慢一点」与 `retryAfter(1~60)` | `{"error":"操作太快了，请慢一点：上传过于频繁，请在 60 秒后重试（每 IP 每分钟最多 2 次）","retryAfter":60}` |
+| 3 | `Retry-After` 头与 JSON 的 `retryAfter` 一致 | header=60 |
+| 4 | 被限流请求 **不写任何 KV**（限流在读 body/落盘之前） | 仅 2 个 `tmp/<id>` |
+| 5 | 限流按 IP 生效（其他 IP 不受影响） | 200 |
+| 6 | `/temp` 页面与 `/temp/api` 各自独立限流 | 页面 200 |
+| 7 | `/temp/api/*` 合计限流（限 5，第 6 次） | **429** JSON（含「接口调用」） |
+| 8 | 页面限流（限 2，第 3 次）→ 429 可读中文 | 200,200,**429** |
+| 9 | 页面 429 为纯文本 + 带 `Retry-After` | `text/plain; RA=60` |
+| 10 | 429 不含内部细节（无 `__usage`、无 canary） | ✅ |
+| 11 | 接口下发 `uploadPerMin` / `uploadGapMs`（12 次/分 → 5500 ms） | ✅ |
+| 12 | 页面配置含 `tempUploadPerMin` / `tempUploadGapMs` | ✅ |
+| 13 | 页面含节流实现（`UPLOAD_GAP_MS` + 限速等待 + 重复去重） | ✅ |
+| 14 | 页面 429 退避读取 JSON `retryAfter` | ✅ |
+| 15 | 默认 20 次/分、间隔 ≈3300 ms | ✅ |
+
+性能：219818 字节（+8147）/ gzip 65240（+3094）；`/temp` 主界面约 40 KB；回源次数、Map/循环上界、冷启动无变化。
+
+### 11.4 边界（如实记录）
+
+1. 限流是**单 isolate 内存计数器**（沿用原有实现）：多 isolate/多 PoP 下同一 IP 的实际上限会略宽松；
+   要严格配额应在 CF 面板加 **Rate Limiting 规则**（§7 的 R1/F5 建议依然有效）。
+2. 客户端节流只约束**本站页面**；第三方脚本仍靠服务端 429（现在会收到可读 JSON + 精确等待秒数）。
+3. 想更快的上传：调大 `TEMP_UPLOAD_PER_MIN`（前端间隔自动跟着变小）；注意 KV 免费档写额度
+   （每次上传 2 次写，1000 写/天）与「同键 1 写/秒」。
+4. `Retry-After` 是固定窗口的剩余时间（1~60 秒），客户端退避上限 120 秒；`/temp/login` 锁定时长 10 分钟。
+
+> 归因：本次只动限速响应与前端队列节流，未触碰签名/鉴权/COS 回源/KV 容量语义；A–J 组断言保持不变全部通过。
+
 
 
 
