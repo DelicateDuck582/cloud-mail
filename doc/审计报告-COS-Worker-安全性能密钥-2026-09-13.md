@@ -494,6 +494,41 @@ node _audit-perf.mjs     "cloud-mail-fork\doc\cos-proxy-worker.js"   # 无回归
 
 > 归因：本次只动限速响应与前端队列节流，未触碰签名/鉴权/COS 回源/KV 容量语义；A–J 组断言保持不变全部通过。
 
+### 11.5 部署与生产 E2E（2026-09-25）
+
+**部署（wrangler CLI，经本机代理）**
+
+```powershell
+cd mail-worker
+$env:HTTPS_PROXY='http://127.0.0.1:10808'   # 10808 为混合代理（SOCKS5 + HTTP CONNECT 同端口）
+$env:HTTP_PROXY=$env:HTTPS_PROXY
+npx wrangler deploy -c ../doc/cos-exchange.wrangler.toml
+```
+- 输出：`Total Upload: 184.34 KiB / gzip: 48.67 KiB`、`Worker Startup Time: 3 ms`、`Uploaded cos-exchange (3.77 sec)`
+- 版本：**`a4b96b80-a263-41cc-920a-9ba282d55892`**（上一版 `9c10d23c…`）
+- wrangler 自带提示 `▲ [WARNING] Proxy environment variables detected. We'll use your proxy for fetch requests.` ⇒ CLI 原生支持代理 env，
+  无需额外 `NODE_USE_ENV_PROXY`（注意：Node/undici **不支持** `socks5://` 形式的 env 代理，必须写成 `http://127.0.0.1:10808`）
+- 部署后核对（`wrangler versions view`）：`compatibility_date=2026-08-10` 未变、
+  **7 个 Secret**（`ATT_SIGN_SECRET`/`AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`/`BROWSE_PASS`/`S3_ENDPOINT`/`TURNSTILE_SECRET`/`TURNSTILE_SITEKEY`）、
+  **4 个明文变量**（`ATT_SIGN_MAX_TTL`/`BROWSE_ALLOW_COUNTRY`/`REGION`/`TEMP_PASS`）、
+  **2 个 KV**（`BROWSE_KV=086c531c…`/`TEMP_KV=f527c223…`）全部保留
+- 版本预览 URL 实测 **404**（`preview_urls=false` 生效）；`workers.dev` 常驻路由仍 200（§9.6 建议依旧）
+
+**生产 E2E（`web开发\_prod-e2e-temp.mjs`，真实域名 `cos.duckgame-play.top`）—— 全部 PASS**
+
+| 步骤 | 结果 |
+|---|---|
+| 未登录 `/temp` | 200 / 6186 B（登录页） |
+| 已登录 `/temp` | 200 / **43503 B**，含 `tempUploadPerMin`/`tempUploadGapMs`/`UPLOAD_GAP_MS`/「已用·余量」文案 |
+| 正常上传（带 `Content-Length`） | 200，`used` = 占用 + 2048 |
+| **流式上传（无 Content-Length，chunked）** | **200** ⇒ `tempLimitedBody()` 分支在真实 Workers 运行时可用（受限 body 解析成立） |
+| `/temp/api/list` | `used`/`total=838860800`/`uploadPerMin=20`/`uploadGapMs=3301` |
+| 连续上传触发限速 | 前 20 次 200，**第 21 次 429**：`{"error":"操作太快了，请慢一点：上传过于频繁，请在 32 秒后重试（每 IP 每分钟最多 20 次）","retryAfter":32}`，`Retry-After: 32` 与 JSON 一致（32 秒=固定窗口真实剩余时间，非写死的 60） |
+| 清理 | 本次创建的 21 个键全部删除，`used` 回落 3072 字节（生产账本原有 20 个文件 / ≈50.6 MB 占用，与列表一致） |
+| 其它端点烟测 | `/` 302、`/browse` 200（6901 B）、`/temp` 200（6186 B）、未签名 `/attachments/test.png` 403、favicon 204 —— 与部署前一致 |
+
+> 说明：内存限流计数器在真实环境**确实生效**（同 isolate 内一次突发即触发）；多 isolate 下额度会更宽松（§11.4-1）。
+
 
 
 
