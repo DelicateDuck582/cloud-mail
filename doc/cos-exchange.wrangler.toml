@@ -7,6 +7,9 @@
 # 1) compatibility_date 与线上现版本一致（2026-08-10），避免运行时语义漂移。
 # 2) keep_vars = true：保留面板上已有的**明文变量**，CLI 部署默认会删掉它们！
 #      ATT_SIGN_MAX_TTL / BROWSE_ALLOW_COUNTRY / REGION / TEMP_PASS
+#    （可选）容量类变量不在面板上时无需声明，代码内有默认值：
+#      TEMP_TOTAL_MB（默认 800）/ TEMP_FILE_MAX_MB（默认 24）/ TEMP_TTL（默认 604800）
+#      若在面板上设置了它们，keep_vars=true 会一并保留。
 #    Secrets 不由部署删除，无需声明（值只在 CF 侧）：
 #      ATT_SIGN_SECRET / AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY /
 #      BROWSE_PASS / S3_ENDPOINT / TURNSTILE_SITEKEY / TURNSTILE_SECRET

@@ -406,7 +406,7 @@ async function getS3v4Headers({ method, url, region, accessKeyId, secretAccessKe
 export {
   verifySignature, hmacSha256Hex, timingSafeEqual,
   base32Encode, base32Decode, totpAt, verifyTotp,
-  tempConfig, tempList, tempPut, tempGet, tempDelete,
+  tempConfig, tempList, tempPut, tempGet, tempDelete, tempUsage, tempUsageSet,
   authStore, tempStore,
 };
 
@@ -422,9 +422,10 @@ export {
 // 其他环境变量：
 //   TEMP_PASS        临时网盘 /temp 独立访问密码（必填，普通密码登录，无 2FA）
 //   TEMP_STORAGE     kv（默认）| cos（预留位，暂未启用）
-//   TEMP_MAX_MB      单文件上限（默认 20，最大 24；KV 单值硬上限 25MiB）
+//   TEMP_TOTAL_MB    临时文件「总容量」上限（默认 800，可取 1~900，单位 MiB）
+//                    —— 只限总量：单文件大小、文件数量均不再设业务上限
+//   TEMP_FILE_MAX_MB 单文件上限（默认 24，只能调小；KV 单值硬上限 25 MiB，属平台限制）
 //   TEMP_TTL         临时文件保存秒数（默认 604800=7 天，60~2592000）
-//   TEMP_MAX_FILES   临时文件数量上限（默认 100，最大 1000）
 //   TOTP_ISSUER      验证器显示的发行方（默认 COS-Exchange）
 //   TOTP_ACCOUNT     验证器显示的账户名（默认 cos-exchange）
 //   SESSION_TTL      会话有效期秒数（默认 604800=7 天，3600~2592000）
@@ -433,6 +434,7 @@ export {
 //   auth:totp   → {secret, at}   TOTP 密钥（Base32，仅服务端持有）
 //   sess:<id>   → {at, ip}       只读网盘登录会话（expirationTtl 自动过期）
 //   tmp/<id>    → 临时文件内容（metadata: {name,type,size,at}，到期自动删除）
+//   tmp.__usage → {bytes,n,at}   总占用账本（不在 tmp/ 前缀内：用户接口读不到也删不掉）
 // =====================================================================
 function authStore(env) {
   if (!env) return null;
@@ -616,25 +618,133 @@ async function checkSession(env, sid) {
 }
 
 // ---------- 临时网盘存储（KV 默认；COS 预留位）----------
+// 容量策略（2026-09-25 调整）：单文件大小与文件数量都不再设业务上限，
+// 只校验「命名空间总占用」——免费额度 1 GB，默认只用 800 MiB（TEMP_TOTAL_MB），
+// 余量留给 sess:/auth: 等其它键、键名与 metadata 计费、以及过期/删除清理的滞后。
 function tempConfig(env) {
   let storage = String(env.TEMP_STORAGE || 'kv').trim().toLowerCase();
   if (storage !== 'cos') storage = 'kv';
-  let maxMb = Number(env.TEMP_MAX_MB || 20);
-  if (!Number.isFinite(maxMb) || maxMb < 1) maxMb = 20;
-  if (maxMb > 24) maxMb = 24;
+  // 单文件：无业务上限，只受 KV 单值硬上限 25 MiB 约束（平台限制，无法绕过），默认留 1 MiB 余量
+  let fmb = Number(env.TEMP_FILE_MAX_MB || 24);
+  if (!Number.isFinite(fmb) || fmb < 1) fmb = 24;
+  if (fmb > 24) fmb = 24;
+  // 总容量上限：默认 800 MiB；可调 1~900（>900 会把 1 GB 免费额度顶满，故封顶）
+  let tmb = Number(env.TEMP_TOTAL_MB || 800);
+  if (!Number.isFinite(tmb) || tmb < 1) tmb = 800;
+  if (tmb > 900) tmb = 900;
   let ttl = Number(env.TEMP_TTL || 604800);
   if (!Number.isFinite(ttl) || ttl < 60) ttl = 604800;
   if (ttl > 2592000) ttl = 2592000;
-  let maxFiles = Number(env.TEMP_MAX_FILES || 100);
-  if (!Number.isFinite(maxFiles) || maxFiles < 1) maxFiles = 100;
-  if (maxFiles > 1000) maxFiles = 1000;
   return {
     storage,
-    maxMb,
-    maxBytes: Math.floor(maxMb * 1024 * 1024),
+    fileMaxMb: fmb,
+    fileMaxBytes: Math.floor(fmb * 1024 * 1024),
+    totalMb: tmb,
+    totalBytes: Math.floor(tmb * 1024 * 1024),
     ttl: Math.floor(ttl),
-    maxFiles: Math.floor(maxFiles),
   };
+}
+
+// ---------- 总占用账本（KV 无原子自增 → 「账本 + 全量校准」两层）----------
+// 账本键 tmp.__usage：不是 tmp/ 前缀（list({prefix:'tmp/'}) 看不到），也不匹配
+// TEMP_KEY_RE → 用户接口既读不到也删不掉。
+// 账本允许「偏小」而绝不允许「偏大」（偏大会误拒上传），故：
+//   1) 每次上传/删除都按「绝对值」写账本（避免丢增量后持续偏小）；
+//   2) 预检发现「账本 + 本次 > 上限」时，先用 list() 全量校准再判（不会误拒）；
+//   3) 列表接口用 list() 的结果顺手纠偏（0 额外 KV 操作）；
+//   4) KV 限制「同一键 1 写/秒」，写账本失败只记日志（下次校准兜底）。
+const TEMP_USAGE_KEY = 'tmp.__usage';
+const TEMP_USAGE_TTL = 2592000;      // 账本 30 天不写就过期；读不到时用 list() 重建
+const TEMP_USAGE_CACHE_MS = 5000;    // 单 isolate 内短缓存（按 KV 绑定对象区分）
+const TEMP_USAGE_REPAIR_MS = 60000;  // 列表纠偏的最小写间隔（防列表轮询造成写放大）
+let tempUsageCache = { store: null, at: 0, bytes: 0, n: 0, repairedAt: 0 };
+
+async function tempUsageRead(env) {
+  const store = tempStore(env);
+  if (!store) return null;
+  try {
+    const u = await store.get(TEMP_USAGE_KEY, { type: 'json' });
+    if (u && typeof u === 'object') {
+      return {
+        bytes: Math.max(0, Math.floor(Number(u.bytes) || 0)),
+        n: Math.max(0, Math.floor(Number(u.n) || 0)),
+      };
+    }
+  } catch (e) {}
+  return null;
+}
+
+// 用 list() 汇总真实占用：每页最多 1000 个键且自带 metadata.size，
+// 不读取任何文件内容，也不回源 COS。
+async function tempUsageScan(env) {
+  const store = tempStore(env);
+  if (!store) return { bytes: 0, n: 0 };
+  let bytes = 0, n = 0, cursor;
+  for (let i = 0; i < 20; i++) {
+    const page = await store.list({ prefix: 'tmp/', cursor, limit: 1000 });
+    for (const k of (page.keys || [])) {
+      bytes += Math.max(0, Number((k.metadata || {}).size) || 0);
+      n++;
+    }
+    if (page.list_complete || !page.cursor) break;
+    cursor = page.cursor;
+  }
+  return { bytes, n };
+}
+
+async function tempUsageWrite(env, bytes, n) {
+  const store = tempStore(env);
+  bytes = Math.max(0, Math.floor(bytes));
+  n = Math.max(0, Math.floor(n));
+  tempUsageCache = { store, at: Date.now(), bytes, n, repairedAt: Date.now() };
+  if (!store) return;
+  try {
+    await store.put(TEMP_USAGE_KEY, JSON.stringify({ bytes, n, at: Date.now() }), { expirationTtl: TEMP_USAGE_TTL });
+  } catch (e) {
+    console.warn('temp usage ledger write failed'); // 账本偏小可由校准兜底，不影响本次上传
+  }
+}
+
+// 当前占用：账本优先（5 秒缓存，按 KV 绑定对象区分 isolate/环境）；
+// force=true 或账本不存在 → 用 list() 全量校准并落盘（准确性优先路径）。
+async function tempUsage(env, force) {
+  const cfg = tempConfig(env);
+  const store = tempStore(env);
+  const nowMs = Date.now();
+  if (!store) return { bytes: 0, n: 0, total: cfg.totalBytes };
+  if (!force && tempUsageCache.store === store && nowMs - tempUsageCache.at < TEMP_USAGE_CACHE_MS) {
+    return { bytes: tempUsageCache.bytes, n: tempUsageCache.n, total: cfg.totalBytes };
+  }
+  let u = force ? null : await tempUsageRead(env);
+  if (!u) {
+    u = await tempUsageScan(env);
+    await tempUsageWrite(env, u.bytes, u.n);
+  } else {
+    tempUsageCache = { store, at: nowMs, bytes: u.bytes, n: u.n, repairedAt: tempUsageCache.store === store ? tempUsageCache.repairedAt : 0 };
+  }
+  return { bytes: u.bytes, n: u.n, total: cfg.totalBytes };
+}
+
+// 记账（绝对值）：调用方按「已调整后的用量」传入
+async function tempUsageSet(env, bytes, n) {
+  await tempUsageWrite(env, bytes, n);
+}
+
+// 列表接口顺手纠偏：list() 已拿到全部 metadata，偏差较大时把账本写回真实值。
+// 受 TEMP_USAGE_REPAIR_MS 节流，避免高频刷新触发 KV 写放大（免费额度 1000 写/天）。
+async function tempUsageRepairFromList(env, sumBytes, count) {
+  const store = tempStore(env);
+  if (!store) return;
+  const nowMs = Date.now();
+  if (nowMs - tempUsageCache.repairedAt < TEMP_USAGE_REPAIR_MS) return;
+  tempUsageCache.repairedAt = nowMs;
+  const cfg = tempConfig(env);
+  const known = tempUsageCache.store === store && tempUsageCache.at > 0;
+  const diff = known ? Math.abs(tempUsageCache.bytes - sumBytes) : Infinity;
+  const nearCap = sumBytes >= Math.floor(cfg.totalBytes * 0.9);
+  if (!known || diff > 1024 * 1024 || (nearCap && diff > 65536) || (known && tempUsageCache.n !== count)) {
+    await tempUsageWrite(env, sumBytes, count);
+  }
 }
 
 // 临时文件键：服务端生成的键一律为小写（tmp/ + 36 进制时间戳 + 小写 hex）
@@ -678,6 +788,33 @@ function tempInlineOk(type) {
   if (t === 'image/svg+xml') return false;
   if (t === 'application/pdf' || t === 'text/plain') return true;
   return t.indexOf('image/') === 0 || t.indexOf('video/') === 0 || t.indexOf('audio/') === 0;
+}
+
+// 受限 body 读取：没有 Content-Length（chunked 等）时用它包一层再交给 formData()，
+// 一旦累计超过 maxBytes 立即中断 → 内存占用有界（不会把任意大的 body 读进 isolate）。
+function tempLimitedBody(body, maxBytes, onTruncate) {
+  let total = 0;
+  const reader = body.getReader();
+  return new ReadableStream({
+    async pull(controller) {
+      let r;
+      try {
+        r = await reader.read();
+      } catch (e) {
+        controller.error(e);
+        return;
+      }
+      if (r.done) { controller.close(); return; }
+      total += r.value.byteLength;
+      if (total > maxBytes) {
+        if (onTruncate) onTruncate();
+        try { await reader.cancel(); } catch (e) {}
+        controller.error(new Error('body too large'));
+        return;
+      }
+      controller.enqueue(r.value);
+    },
+  });
 }
 
 async function tempList(env) {
@@ -788,7 +925,21 @@ async function tempDelete(env, key) {
   const store = tempStore(env);
   if (!store) throw new Error('未绑定 KV（TEMP_KV / BROWSE_KV）');
   if (!TEMP_KEY_RE.test(key || '')) throw new Error('bad key');
+  // 释放账本前先取回该键的 metadata.size（list 一次即可，不读文件内容）
+  let size = 0, found = false;
+  try {
+    const page = await store.list({ prefix: key });
+    const hit = (page.keys || []).find(x => x.name === key);
+    if (hit) {
+      found = true;
+      size = Math.max(0, Number((hit.metadata || {}).size) || 0);
+    }
+  } catch (e) {}
   await store.delete(key);
+  const used = await tempUsage(env, false);
+  const next = Math.max(0, used.bytes - size);
+  await tempUsageSet(env, next, Math.max(0, used.n - (found ? 1 : 0)));
+  return { key, size, found, used: next, total: cfg.totalBytes };
 }
 
 // ---- 预留位：腾讯云 COS 临时存储（暂未启用）----
@@ -945,11 +1096,13 @@ async function handleTemp(request, env, ctx) {
   // 首页
   if (url.pathname === '/temp' || url.pathname === '/temp/') {
     const tcfg = tempConfig(env);
+    const usage = await tempUsage(env, false);
     const cfg = {
       tempStorage: tcfg.storage,
-      tempMaxMb: tcfg.maxMb,
+      tempFileMaxMb: tcfg.fileMaxMb,
+      tempTotalMb: tcfg.totalMb,
+      tempUsedBytes: usage.bytes,
       tempTtlSec: tcfg.ttl,
-      tempMaxFiles: tcfg.maxFiles,
       kvName: env.TEMP_KV ? 'TEMP_KV' : 'BROWSE_KV',
     };
     return new Response(tempIndexHtml(cfg), {
@@ -965,7 +1118,16 @@ async function handleTemp(request, env, ctx) {
     const tcfg = tempConfig(env);
     try {
       const files = await tempList(env);
-      return jsonResp({ files, storage: tcfg.storage, maxMb: tcfg.maxMb, ttl: tcfg.ttl, maxFiles: tcfg.maxFiles });
+      // 顺手用 list() 结果纠偏账本（0 额外 KV 操作；到期/已删文件会被扣回）
+      let sum = 0;
+      for (const f of files) sum += Math.max(0, Number(f.size) || 0);
+      await tempUsageRepairFromList(env, sum, files.length);
+      const usage = await tempUsage(env, false);
+      return jsonResp({
+        files, storage: tcfg.storage, ttl: tcfg.ttl,
+        fileMaxMb: tcfg.fileMaxMb, totalMb: tcfg.totalMb,
+        used: usage.bytes, total: tcfg.totalBytes, count: files.length,
+      });
     } catch (e) {
       console.error('temp list error:', e);
       return jsonResp({ error: (e && e.message) || '临时存储读取失败', files: [] }, e && e.status === 501 ? 501 : 500);
@@ -979,36 +1141,75 @@ async function handleTemp(request, env, ctx) {
     }
     const tcfg = tempConfig(env);
     if (tcfg.storage === 'cos') return jsonResp({ error: 'COS 临时存储暂未启用（预留位）' }, 501);
-    const clen = parseInt(request.headers.get('Content-Length') || '0', 10);
-    if (Number.isFinite(clen) && clen > tcfg.maxBytes + 1024 * 1024) {
-      return jsonResp({ error: '文件超过单文件上限 ' + tcfg.maxMb + ' MB' }, 413);
+
+    // 单文件上限只来自 KV 平台硬限制（单值 25 MiB），不是业务策略
+    const overhead = 8192; // multipart 边界/头部/其它字段的安全余量
+    const formMaxBytes = tcfg.fileMaxBytes + overhead;
+    const tooBigFile = () => jsonResp(
+      { error: '单文件受 KV 平台硬上限限制（最大 ' + tcfg.fileMaxMb + ' MB）', fileMaxMb: tcfg.fileMaxMb }, 413);
+    // 1) 能拿到 Content-Length 就按体积先拒（读 body 之前即拒，省流量也更安全）
+    let clen = NaN;
+    const clRaw = request.headers.get('Content-Length');
+    if (clRaw !== null && Number.isFinite(Number(clRaw)) && Number(clRaw) >= 0) clen = Number(clRaw);
+    if (Number.isFinite(clen) && clen > formMaxBytes) return tooBigFile();
+    // 3) 总容量预检（在读取 body 之前先拒，避免白读大 body）。
+    //    用「体积下界」（clen 减去 multipart 边框余量）比较：宁可放行后由精确检查拒绝，
+    //    也不因 multipart 开销把「正好装满剩余容量」的文件误拒。
+    const needLow = Math.max(0, clen - overhead);
+    const tooBigTotal = (used) => jsonResp(
+      { error: '存储空间不足：已用 ' + used + ' / 上限 ' + tcfg.totalBytes + ' 字节（可删除文件或等其到期自动释放）', used, total: tcfg.totalBytes }, 507);
+    let usage = await tempUsage(env, false);
+    if (usage.bytes + needLow > tcfg.totalBytes) {
+      // 账本可能滞后（文件已过期未清理 / 并发丢增量）→ 强制全量校准后再判，避免误拒
+      usage = await tempUsage(env, true);
+      if (usage.bytes + needLow > tcfg.totalBytes) return tooBigTotal(usage.bytes);
     }
     let form;
-    try {
-      form = await request.formData();
-    } catch (e) {
-      return jsonResp({ error: '上传内容解析失败' }, 400);
+    if (Number.isFinite(clen)) {
+      try {
+        form = await request.formData();
+      } catch (e) {
+        return jsonResp({ error: '上传内容解析失败' }, 400);
+      }
+    } else {
+      // 2) 无 Content-Length（chunked/流式客户端）：包一层「受限 body」再解析，
+      //    超过 formMaxBytes 立即中断 → 内存有界；精确体积仍由下面检查兜底。
+      //    （本站页面 XHR 上传始终带 Content-Length，此分支只为兼容其它客户端）
+      if (!request.body) return jsonResp({ error: '缺少 file 字段' }, 400);
+      let truncated = false;
+      try {
+        const bounded = new Request(request.url, {
+          method: 'POST',
+          headers: request.headers,
+          body: tempLimitedBody(request.body, formMaxBytes, () => { truncated = true; }),
+          duplex: 'half',
+        });
+        form = await bounded.formData();
+      } catch (e) {
+        if (truncated) return tooBigFile();
+        return jsonResp({ error: '上传内容解析失败' }, 400);
+      }
     }
     const f = form.get('file');
     if (!f || typeof f === 'string' || typeof f.arrayBuffer !== 'function') {
       return jsonResp({ error: '缺少 file 字段' }, 400);
     }
-    if (f.size > tcfg.maxBytes) {
-      return jsonResp({ error: '文件超过单文件上限 ' + tcfg.maxMb + ' MB' }, 413);
-    }
+    if (f.size > tcfg.fileMaxBytes) return tooBigFile();
     try {
-      const existing = await tempList(env);
-      if (existing.length >= tcfg.maxFiles) {
-        return jsonResp({ error: '临时文件数量已达上限（' + tcfg.maxFiles + '），请先删除部分文件' }, 400);
+      // 4) 拿到精确体积（multipart 头尾不计入）后再判一次总量
+      if (usage.bytes + f.size > tcfg.totalBytes) {
+        usage = await tempUsage(env, true);
+        if (usage.bytes + f.size > tcfg.totalBytes) return tooBigTotal(usage.bytes);
       }
       const buf = await f.arrayBuffer();
-      if (buf.byteLength > tcfg.maxBytes) {
-        return jsonResp({ error: '文件超过单文件上限 ' + tcfg.maxMb + ' MB' }, 413);
-      }
+      if (buf.byteLength > tcfg.fileMaxBytes) return tooBigFile();
       const name = tempSafeName(f.name);
       const type = tempSafeType(f.type);
       const item = await tempPut(env, name, type, buf);
-      return jsonResp({ ok: true, file: item });
+      // 5) 记账：按绝对值写（偏小可由 list() 校准纠正；偏大会误拒上传）
+      const used = usage.bytes + item.size;
+      await tempUsageSet(env, used, usage.n + 1);
+      return jsonResp({ ok: true, file: item, used, total: tcfg.totalBytes });
     } catch (e) {
       console.error('temp upload error:', e);
       return jsonResp({ error: (e && e.message) || '上传失败' }, e && e.status === 501 ? 501 : 500);
@@ -1066,8 +1267,8 @@ async function handleTemp(request, env, ctx) {
     const form = await request.formData();
     const key = String(form.get('key') || '');
     try {
-      await tempDelete(env, key);
-      return jsonResp({ ok: true });
+      const r = await tempDelete(env, key);
+      return jsonResp({ ok: true, used: r.used, total: r.total, size: r.size });
     } catch (e) {
       console.error('temp delete error:', e);
       return jsonResp({ error: (e && e.message) || '删除失败' }, e && e.status === 501 ? 501 : 400);
@@ -3481,6 +3682,10 @@ function refreshList(showErr){
       return;
     }
     tempFiles=(data&&data.files)||[];
+    // \\u670D\\u52A1\\u7AEF\\u8D26\\u672C\\u4E3A\\u51C6\\uFF1A\\u987A\\u624B\\u628A\\u672C\\u5730\\u5BB9\\u91CF\\u4F30\\u7B97\\u6821\\u51C6\\u56DE\\u771F\\u5B9E\\u503C
+    if(data&&typeof data.used==='number'&&data.used>=0){usageUsed=data.used;}
+    if(data&&typeof data.total==='number'&&data.total>0){usageTotal=data.total;}
+    renderHint();
     // \\u670D\\u52A1\\u7AEF\\u5217\\u8868\\u5DF2\\u5305\\u542B\\u7684\\u9879\\u8BF4\\u660E KV \\u5DF2\\u4E00\\u81F4\\uFF1A\\u6E05\\u6389\\u5BF9\\u5E94 pending\\uFF08\\u907F\\u514D\\u957F\\u671F\\u9A7B\\u7559\\uFF09
     var pruned=false;
     for(var i=0;i<tempFiles.length;i++){
@@ -3494,9 +3699,21 @@ function refreshList(showErr){
     if(showErr){$('filelist').innerHTML=statusHtml('\\u52A0\\u8F7D\\u5931\\u8D25: '+String((e&&e.message)||e),false);}
   });
 }
+// ---- \\u5BB9\\u91CF\\u72B6\\u6001\\uFF1A\\u670D\\u52A1\\u7AEF\\u53EA\\u9650\\u300C\\u603B\\u5360\\u7528\\u300D\\uFF08\\u5355\\u6587\\u4EF6\\u5927\\u5C0F\\u4E0E\\u6587\\u4EF6\\u6570\\u91CF\\u90FD\\u4E0D\\u8BBE\\u4E0A\\u9650\\uFF09----
+// usageUsed \\u521D\\u503C\\u6765\\u81EA\\u670D\\u52A1\\u7AEF\\u8D26\\u672C\\uFF08CFG.tempUsedBytes\\uFF09\\uFF0C\\u4E4B\\u540E\\u6BCF\\u6B21\\u5217\\u8868/\\u4E0A\\u4F20/\\u5220\\u9664\\u90FD\\u4F1A\\u6821\\u51C6
+var usageUsed=Number(CFG.tempUsedBytes)||0;
+var usageTotal=(Number(CFG.tempTotalMb)||800)*1024*1024;
+function fmtUse(s){return (s>0?fmt(s):'0 B');}
+function freeSpace(){return Math.max(0,usageTotal-usageUsed);}
+function renderHint(){
+  var h=$('tmpHint');
+  if(!h){return;}
+  h.textContent='\\u6587\\u4EF6\\u5230\\u671F\\u81EA\\u52A8\\u5220\\u9664\\uFF08\\u4FDD\\u5B58 '+ttlText(CFG.tempTtlSec)+'\\uFF09 \\u00B7 \\u5355\\u6587\\u4EF6\\u4E0A\\u9650 '
+    +CFG.tempFileMaxMb+' MB\\uFF08KV \\u5E73\\u53F0\\u786C\\u4E0A\\u9650\\uFF09 \\u00B7 \\u5DF2\\u7528 '+fmtUse(usageUsed)+' / '+fmtUse(usageTotal)
+    +'\\uFF08\\u4F59 '+fmtUse(freeSpace())+'\\uFF09 \\u00B7 \\u5B58\\u50A8\\uFF1A'+CFG.kvName;
+}
 function render(){
-  var hint='\\u6587\\u4EF6\\u5230\\u671F\\u81EA\\u52A8\\u5220\\u9664\\uFF08\\u4FDD\\u5B58 '+ttlText(CFG.tempTtlSec)+'\\uFF09 \\u00B7 \\u5355\\u6587\\u4EF6\\u4E0A\\u9650 '+CFG.tempMaxMb+' MB \\u00B7 \\u6570\\u91CF\\u4E0A\\u9650 '+CFG.tempMaxFiles+' \\u4E2A \\u00B7 \\u5B58\\u50A8\\uFF1A'+CFG.kvName;
-  $('tmpHint').textContent=hint;
+  renderHint();
   if(CFG.tempStorage==='cos'){
     $('tempUpBtn').disabled=true;
     $('filelist').innerHTML=statusHtml('COS \\u4E34\\u65F6\\u5B58\\u50A8\\u4E3A\\u9884\\u7559\\u4F4D\\uFF0C\\u6682\\u672A\\u542F\\u7528\\uFF1B\\u8BF7\\u4F7F\\u7528 KV \\u5B58\\u50A8',false);
@@ -3642,6 +3859,12 @@ function pumpTasks(){
   doUpload(next);
 }
 function doUpload(t){
+  if(!reserveSpace(t)){
+    t.status='fail';t.error='\\u5B58\\u50A8\\u7A7A\\u95F4\\u4E0D\\u8DB3';t.attempts=RETRY_DELAYS.length;batchFail++;
+    taskLog('\\u4E0A\\u4F20\\u5931\\u8D25\\uFF1A'+t.name+'\\uFF08\\u5B58\\u50A8\\u7A7A\\u95F4\\u4E0D\\u8DB3\\uFF0C\\u5269\\u4F59 '+fmtUse(freeSpace())+'\\uFF09',true);
+    finishTask();scheduleTaskRender();
+    return;
+  }
   t.status='up';
   t.loaded=0;
   t.error='';
@@ -3677,6 +3900,8 @@ function doUpload(t){
     if(xhr.status===200&&j&&j.ok){
       t.status='done';
       t.loaded=t.size;
+      t.reserved=false;              // \\u7A7A\\u95F4\\u5DF2\\u5B9E\\u9645\\u5360\\u7528\\uFF0C\\u4E0D\\u518D\\u5F52\\u8FD8
+      if(typeof j.used==='number'&&j.used>=0){usageUsed=j.used;renderHint();}
       batchOk++;
       if(j.file&&j.file.key){
         // \\u5148\\u628A\\u63A5\\u53E3\\u8FD4\\u56DE\\u7684\\u6587\\u4EF6\\u9879\\u5E76\\u5165\\u672C\\u5730\\u5217\\u8868\\uFF08KV list() \\u6709\\u6570\\u79D2\\u5EF6\\u8FDF\\uFF09\\uFF0C\\u5E76\\u6301\\u4E45\\u5316\\u4EE5\\u6297\\u5237\\u65B0
@@ -3700,6 +3925,7 @@ function doUpload(t){
     }else{
       t.status='fail';
       t.error=(j&&j.error)||('HTTP '+xhr.status);
+      releaseSpace(t);
       batchFail++;
       taskLog('\\u4E0A\\u4F20\\u5931\\u8D25\\uFF1A'+t.name+'\\uFF08'+t.error+'\\uFF09',true);
       finishTask();
@@ -3707,20 +3933,36 @@ function doUpload(t){
     scheduleTaskRender();
   };
   xhr.onerror=function(){
-    t.status='fail';t.error='\\u7F51\\u7EDC\\u9519\\u8BEF';batchFail++;
+    t.status='fail';t.error='\\u7F51\\u7EDC\\u9519\\u8BEF';releaseSpace(t);batchFail++;
     taskLog('\\u4E0A\\u4F20\\u5931\\u8D25\\uFF1A'+t.name+'\\uFF08\\u7F51\\u7EDC\\u9519\\u8BEF\\uFF09',true);
     finishTask();scheduleTaskRender();
   };
   xhr.ontimeout=function(){
-    t.status='fail';t.error='\\u4E0A\\u4F20\\u8D85\\u65F6';batchFail++;
+    t.status='fail';t.error='\\u4E0A\\u4F20\\u8D85\\u65F6';releaseSpace(t);batchFail++;
     taskLog('\\u4E0A\\u4F20\\u5931\\u8D25\\uFF1A'+t.name+'\\uFF08\\u8D85\\u65F6\\uFF09',true);
     finishTask();scheduleTaskRender();
   };
   xhr.onabort=function(){
-    if(t.status==='cancel'){taskLog('\\u5DF2\\u53D6\\u6D88\\uFF1A'+t.name);}
+    if(t.status==='cancel'){taskLog('\\u5DF2\\u53D6\\u6D88\\uFF1A'+t.name);releaseSpace(t);}
     finishTask();scheduleTaskRender();
   };
   xhr.send(fd);
+}
+// \\u672C\\u5730\\u7A7A\\u95F4\\u5360\\u7528\\uFF1A\\u961F\\u5217\\u91CC\\u300C\\u5DF2\\u6392\\u961F/\\u4E0A\\u4F20\\u4E2D/\\u5DF2\\u5B8C\\u6210\\u300D\\u90FD\\u7B97\\u5360\\u7528\\uFF08\\u540C\\u6279\\u591A\\u6587\\u4EF6\\u4E0D\\u4F1A\\u91CD\\u590D\\u8D85\\u989D\\uFF09\\uFF0C
+// \\u5931\\u8D25/\\u53D6\\u6D88\\u65F6\\u5F52\\u8FD8\\uFF1B\\u670D\\u52A1\\u7AEF\\u8D26\\u672C\\u624D\\u662F\\u6700\\u7EC8\\u6743\\u5A01\\uFF08\\u5217\\u8868\\u5237\\u65B0\\u4F1A\\u8986\\u76D6\\u672C\\u5730\\u4F30\\u7B97\\uFF09\\u3002
+function reserveSpace(t){
+  if(t.reserved){return true;}
+  if(usageUsed+t.size>usageTotal){return false;}
+  usageUsed+=t.size;
+  t.reserved=true;
+  renderHint();
+  return true;
+}
+function releaseSpace(t){
+  if(!t.reserved){return;}
+  usageUsed=Math.max(0,usageUsed-t.size);
+  t.reserved=false;
+  renderHint();
 }
 function finishTask(){
   taskRunning=false;
@@ -3747,18 +3989,28 @@ function reconcileSoon(){
 function upload(files){
   if(!files||!files.length){return;}
   var arr=Array.prototype.slice.call(files);
-  var maxBytes=CFG.tempMaxMb*1024*1024;
+  var maxBytes=CFG.tempFileMaxMb*1024*1024;
   var queued=0;
   for(var i=0;i<arr.length;i++){
     var f=arr[i];
     taskSeq++;
     if(f.size>maxBytes){
-      tasks.push({id:taskSeq,file:f,name:f.name,size:f.size,status:'fail',loaded:0,error:'\\u8D85\\u8FC7 '+CFG.tempMaxMb+' MB',attempts:RETRY_DELAYS.length,nextAt:0,speed:0});
+      tasks.push({id:taskSeq,file:f,name:f.name,size:f.size,status:'fail',loaded:0,error:'\\u8D85\\u8FC7 '+CFG.tempFileMaxMb+' MB',attempts:RETRY_DELAYS.length,nextAt:0,speed:0});
       batchFail++;
-      taskLog('\\u8DF3\\u8FC7\\u300C'+f.name+'\\u300D\\uFF1A\\u8D85\\u8FC7\\u5355\\u6587\\u4EF6\\u4E0A\\u9650 '+CFG.tempMaxMb+' MB',true);
+      taskLog('\\u8DF3\\u8FC7\\u300C'+f.name+'\\u300D\\uFF1A\\u8D85\\u8FC7 KV \\u5355\\u6587\\u4EF6\\u786C\\u4E0A\\u9650 '+CFG.tempFileMaxMb+' MB\\uFF08\\u5E73\\u53F0\\u9650\\u5236\\uFF0C\\u975E\\u672C\\u76D8\\u7B56\\u7565\\uFF09',true);
       continue;
     }
-    tasks.push({id:taskSeq,file:f,name:f.name,size:f.size,status:'wait',loaded:0,error:'',attempts:0,nextAt:0,speed:0});
+    var t={id:taskSeq,file:f,name:f.name,size:f.size,status:'wait',loaded:0,error:'',attempts:0,nextAt:0,speed:0,reserved:false};
+    if(!reserveSpace(t)){
+      t.status='fail';
+      t.error='\\u5B58\\u50A8\\u7A7A\\u95F4\\u4E0D\\u8DB3';
+      t.attempts=RETRY_DELAYS.length;
+      tasks.push(t);
+      batchFail++;
+      taskLog('\\u8DF3\\u8FC7\\u300C'+f.name+'\\u300D\\uFF1A\\u5B58\\u50A8\\u7A7A\\u95F4\\u4E0D\\u8DB3\\uFF08\\u5269\\u4F59 '+fmtUse(freeSpace())+'\\uFF09',true);
+      continue;
+    }
+    tasks.push(t);
     queued++;
   }
   trimTasks();
@@ -3834,6 +4086,7 @@ function del(key){
       delete pendingFiles[key];
       savePending();
       tempFiles=tempFiles.filter(function(x){return x.key!==key;});
+      if(typeof j.used==='number'&&j.used>=0){usageUsed=j.used;renderHint();}
       renderList();
       toast('\\u5DF2\\u5220\\u9664');
       setTimeout(function(){refreshList(false);},4000);

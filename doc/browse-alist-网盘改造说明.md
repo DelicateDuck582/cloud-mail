@@ -59,12 +59,33 @@
 | 鉴权 | 独立密码 `TEMP_PASS`（普通密码登录，无 2FA）+ `SameSite=Lax` HttpOnly cookie；未配置密码或未绑 KV 时显示「未启用」配置提示页 |
 | 存储 | KV（`TEMP_KV`，未绑定时回退 `BROWSE_KV`）：键 `tmp/<id>`，metadata `{name,type,size,at}`，到期由 `expirationTtl` 自动删除 |
 | 接口 | `GET /temp`、`POST /temp/login`、`GET /temp/logout`、`GET /temp/api/list`、`POST /temp/api/upload`（multipart 字段 `file`）、`GET /temp/api/file?key=&dl=1`、`POST /temp/api/delete`（字段 `key`）、`POST /temp/api/renew`（字段 `key`，**续期**） |
-| 限制 | 单文件 `TEMP_MAX_MB`（默认 20，上限 24）、数量 `TEMP_MAX_FILES`（默认 100）、TTL `TEMP_TTL`（默认 7 天）、并发上传串行 |
+| 容量 | **只限总量**（2026-09-25 起）：`TEMP_TOTAL_MB`（默认 800 MiB，可调 1~900）；单文件大小与文件数量**不再设业务上限**。单文件仅剩 KV 平台硬上限 25 MiB（`TEMP_FILE_MAX_MB` 默认 24，只能调小）；TTL `TEMP_TTL`（默认 7 天）；并发上传串行 |
+| 占用统计 | 服务端账本 `tmp.__usage`（`{bytes,n,at}`，不在 `tmp/` 前缀内 → 用户接口读不到也删不掉）+ `list()` 全量校准：上传/删除按绝对值记账、接近上限时强制扫描、列表接口顺带纠偏（60s 节流）；顶栏提示条显示「已用 X / Y（余 Z）」 |
+| 容量拒绝 | 总容量不足 → **507**（回传 `used`/`total`，前端也会本地预检并跳过，不白传）；单文件超平台上限 → **413**；无 `Content-Length` 的流式上传走「受限 body」（读到上限即截断 → 413），内存有界 |
 | 上传体验 | **右下角悬浮「上传任务」小按钮（仿 Alist）**：角标显示进行中任务数；面板含每个文件的进度条/百分比/实时速度/状态与**上传日志**（时间戳，上限 200 行）；失败可重试、上传中可取消、一键清除已完成。上传用 `XMLHttpRequest` 取真实进度 |
 | 列表一致性 | KV `list()` 最终一致（数秒内查不到新 key）→ 上传成功即**乐观并入本地列表**并落 `localStorage`（上限 50 条 / 120s），刷新后仍可见；批次结束在 2.5/7/16/32s 自动校准，服务端确认后清理本地 pending；删除用 tombstone 防「回魂」 |
 | 限流 | `Retry-After` 优先的退避重试（上限 90s），面板显示「等待重试 Ns」倒计时 |
 | 类型安全 | 上传的 `Content-Type` 经 `tempSafeType()` 清洗（剥控制字符 + 限长 + 形态校验，非法回退 `application/octet-stream`），写入、列表回显、下载头三处一致；`image/svg+xml` 仍强制 `attachment` 防存储型 XSS |
 | 文件续期 | 每行「续期」按钮（↻，与下载/删除同款样式，请求中禁用）：每次从**当前到期时间**再延长一个保存期限（`TEMP_TTL`，默认 7 天）；总保留上限 30 天（`TEMP_KEEP_MAX=2592000`），达上限时提示"未再延长"。实现：KV 无 touch/延期接口 → 服务端 `getWithMetadata` 读回原值 + 以新的 `expirationTtl` 重写（metadata 原样保留），当前到期时间由 `list({prefix:key})` 的 `expiration` 得到；限流 30 次/分 |
+
+**容量策略（2026-09-25 调整，取代「单文件上限 + 数量上限」）**
+
+- 需求：单文件大小与数量不设业务上限，改为限制**命名空间总占用**——CF 免费 KV 额度 1 GB，默认只用 800 MiB
+  （`TEMP_TOTAL_MB`），余量（~224 MiB）留给 `sess:`/`auth:` 等其它键、键名与 metadata 计费、以及过期/删除清理的滞后。
+- 唯一保留的单文件限制是**平台硬上限**：KV 单值最大 25 MiB（`TEMP_FILE_MAX_MB` 默认 24，只能调小）。
+  官方额度（KV limits）：免费 1 GB 存储/账号、单值 25 MiB、键数不限、读 10 万/天、写（不同键）1000/天、
+  **同一键 1 写/秒**、list 1000/天。
+- 账本：KV 无原子自增 → `tmp.__usage`（`{bytes,n,at}`）+ `list({prefix:'tmp/'})` 校准（自带 `metadata.size`，
+  不读文件内容、不回源 COS）。上传/删除按**绝对值**记账（并发丢增量只会偏小，不会偏大 → 不会误拒）；
+  接近上限时强制全量校准；列表接口用同一份 list 结果顺带纠偏（60s 节流防写放大）；账本写失败（同键 1 写/秒等）
+  只记日志，不影响上传成功；账本缺失/过期时按 list 重建。
+- 响应码：总容量不足 **507**（回传 `used`/`total`）、单文件超平台上限 **413**；预检用「体积下界」比较，
+  不会因 multipart 开销把「正好装满」的文件误拒。无 `Content-Length` 的流式客户端走 `tempLimitedBody()`
+  （读到上限即中断 → 413），内存有界。
+- 前端：顶栏提示条显示「已用 / 总量 / 余量」；队列按文件大小**预占**空间（失败/取消归还），
+  空间不足直接跳过不白传；页面配置下发 `tempTotalMb`/`tempFileMaxMb`/`tempUsedBytes`。
+- 实测：`_audit-security.mjs` **J 组 34 项**（默认值与夹取、507/413、删除归还、120 连传、无 CL 流式、
+  账本越权、页面同步、账本不可写容错、重建扫描、0 回源），矩阵合计 **124 项 PASS / 0 FAIL**。
 
 ---
 
@@ -127,7 +148,10 @@
 
 ## 6. 部署步骤（cos-exchange）
 
-1. 用 `web开发\cos-proxy-worker.js`（**197560 字节（约 193 KB）**，以文件为准；仓库内副本 `doc/cos-proxy-worker.js` 与其字节一致）全量替换 Worker `cos-exchange` 的代码。
+1. 部署 `web开发\cos-proxy-worker.js`（**211671 字节 / gzip 62146**，以文件为准；仓库内副本 `doc/cos-proxy-worker.js` 与其逐字节一致）。
+   - **推荐 CLI（可复现、可回滚）**：`cd mail-worker; npx wrangler deploy -c ../doc/cos-exchange.wrangler.toml`
+     （务必确认 `keep_vars = true`，否则会删掉面板上的明文变量，见审计报告 §9.3）
+   - 或面板全量粘贴 `doc/cos-proxy-worker.js`（等价，但会覆盖面板版本记录）
 2. 确认 §4 环境变量均在（`BROWSE_PASS` 等）。
 3. 部署后验证：
    - `https://cos.duckgame-play.top/browse` → Alist 风格登录页
