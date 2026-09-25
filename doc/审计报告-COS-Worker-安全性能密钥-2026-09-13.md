@@ -529,6 +529,88 @@ npx wrangler deploy -c ../doc/cos-exchange.wrangler.toml
 
 > 说明：内存限流计数器在真实环境**确实生效**（同 isolate 内一次突发即触发）；多 isolate 下额度会更宽松（§11.4-1）。
 
+---
+
+## 12. 在线查看（`/temp`）与只读网盘筛选修复（2026-09-25）
+
+> 触发：① `/temp` 增加查看功能（文本/图片；**视频必须用户点击才播放**）；
+> ② 只读网盘筛选器点「视频/音频…」应只显示这类文件，若无则提示「这个目录下没有这类文件，返回「全部」查看」。
+> 被测/部署版本：`doc/cos-proxy-worker.js`，**241947 字节**、gzip 70559，
+> sha256 `554AC0F08CA822FF761CA4420667DA1CFCA48BAB81FE27A2E54E93CC42D09A29`、blob `0b362358…`。
+> 结论：**矩阵扩为 165 项（A–L 十二组）全部通过（FAIL=0）**；性能审计无回归。
+
+### 12.1 `/temp` 在线查看（新增）
+
+| 能力 | 实现 |
+|---|---|
+| 图片 | `<img>` 走 `/temp/api/file`（inline）；`.svg` 因服务端安全策略强制 `attachment` → 提示下载（防存储型 XSS） |
+| 文本 | `fetch(url, { headers: { Range: 'bytes=0-262143' } })` 只取前 **256 KB**，用 `textContent` 注入 `<pre>`（不解析 HTML）；超出提示下载 |
+| 音频/视频 | `<video/audio controls preload="none">`，**不设自动播放属性** → 必须用户点击播放（也不预取字节，省流量）；`playsinline` 适配移动端 |
+| PDF | `<iframe>`（服务端 `application/pdf` 走 inline）+ 新窗口/下载兜底 |
+| 其它类型 | 明确提示「暂不支持在线查看，请下载」 |
+| 关闭 | 关闭按钮 / 点遮罩 / Esc；关闭时 `pause()` + `removeAttribute('src')` + `load()` 释放媒体、`AbortController` 中断文本请求（与只读网盘同款，避免后台继续下载） |
+
+**服务端配套：`/temp/api/file` 增加 Range 支持**（`Accept-Ranges: bytes`）——视频/音频可拖动进度，文本按需只取前 256 KB：
+
+| 请求 | 行为（10 字节样本 `ABCDEFGHIJ`） |
+|---|---|
+| 无 Range | 200 全量 + `Accept-Ranges: bytes` |
+| `bytes=0-3` | **206** + `Content-Range: bytes 0-3/10` + `Content-Length: 4`（只回前 4 字节） |
+| `bytes=5-` | 206，`bytes 5-9/10`（5 字节） |
+| `bytes=-3` | 206（后缀范围），`bytes 7-9/10`（末 3 字节） |
+| `bytes=0-9999` | 206，末端自动截断为 `0-9/10` |
+| `bytes=99-` | **416** + `Content-Range: bytes */10` |
+| 非 bytes 单位 / 非法范围 | 忽略 → 200 全量（不报错） |
+| 未登录 / 非法 key | 仍分别回登录页 / 404（**Range 不改变鉴权与 key 校验**） |
+
+> 只读网盘的详情预览同步改为**点击才播放**（`<video controls autoplay>` → `controls playsinline preload="none"`），
+> 构建产物中已无 `autoplay` 字样（L 组有断言守住）。
+
+### 12.2 只读网盘筛选修复
+
+**问题**：`applyFilter()` 只过滤**当前页**已加载的条目（COS 按 continuation-token 分页、不支持按类型过滤），
+文件多时点「视频」几乎必然空列表，且分不清「本页没有」与「整个目录没有」。
+
+**修法**（`_parts/07_js1.txt` / `08_js2.txt` / `08_js3.txt` / `10_js5.txt`）：
+
+- 新增 **整目录扫描** `scanFilter()`：按 token 顺序翻完该目录**全部页**，命中项累积到 `fscan.items`；
+  每页间隔 600 ms（≤100 次/分，低于服务端上限），遇 429 按 `Retry-After` 退避后继续（不丢结果）。
+- 命中结果用 **本地数字分页**（`renderFilterPager`，与最近/收藏一致，含每页条数与跳页）；排序/每页条数切换即时生效（无需重扫）。
+- 顶部提示条：`筛选「视频」：命中 12 个 · 已扫描 3 页（186 个文件）`；达扫描上限（30 页）追加「结果可能不全」。
+- **无命中**时按需求提示并可一键恢复：
+  `这个目录下没有「视频」文件，返回「全部」查看`（+ 按钮「返回「全部」」，同时清空搜索词）；
+  仅搜索无命中时：`这个目录下没有匹配「xxx」的文件，返回「全部」查看`。
+- 搜索框改为 **350 ms 防抖**（避免每次按键都重扫整目录）；切换目录（`go`/`up`）作废扫描缓存。
+- 服务端配套：`/browse/api/list` 限速 **40 → 120 次/分**（整目录筛选/搜索需顺序翻页；仍是 per-IP 固定窗口）。
+
+### 12.3 复测（165 项）
+
+```powershell
+node _audit-security.mjs "cloud-mail-fork\doc\cos-proxy-worker.js"   # PASS=165  FAIL=0
+node _audit-perf.mjs     "cloud-mail-fork\doc\cos-proxy-worker.js"   # 无回归（241947 字节 / gzip 70559）
+```
+
+新增 **L 组 16 项**：Range 全量/单段/后缀/末端截断/**416 起点越界**/非法范围忽略（6 条，逐字节核对 `Content-Range`/`Content-Length`）、
+Range 不改变鉴权（未登录回登录页）、带 Range 的非法 key 仍 404、
+源码断言：预览实现存在、**产物中无 `autoplay`** 且媒体 `preload='none'`、文本取前 256 KB、关闭释放媒体、
+筛选实现（`scanFilter`/`renderFiltered`/`renderFilterPager`）、无匹配提示文案与「返回「全部」」按钮、列表限速 120。
+
+性能：241947 字节（+22129）/ gzip 70559（+5319）；`/browse` 主界面 70701 字节（+11265）、`/temp` 主界面约 45 KB；
+回源次数（附件 1/0、`/browse` 1、`/temp` 0）、Map/循环上界、冷启动均无变化。
+
+### 12.4 边界（如实记录）
+
+1. **整目录扫描有上限**：最多 30 页（30×`perPage` 条，默认 1800 条），达上限会提示「结果可能不全」；
+   超大目录（数千文件）建议先用搜索词缩小范围。
+2. 扫描期间会占用 `/browse/api/list` 额度（每页 1 次、间隔 600 ms）；服务端限速 120 次/分，遇 429 自动按 `Retry-After` 退避继续。
+3. 筛选/搜索只在**当前目录**内（与「搜索当前目录」的既有语义一致），不递归子目录。
+4. `/temp` 单文件仍受 25 MiB 平台上限；文本预览只显示前 256 KB（大文本请下载）。
+5. Range 会读到整份 KV 值再切片（KV 无部分读接口），因此**不会**降低 KV 读放大，只减少回给浏览器的字节。
+
+<!-- 12.5-续 -->
+
+
+
 
 
 
