@@ -607,7 +607,36 @@ Range 不改变鉴权（未登录回登录页）、带 Range 的非法 key 仍 4
 4. `/temp` 单文件仍受 25 MiB 平台上限；文本预览只显示前 256 KB（大文本请下载）。
 5. Range 会读到整份 KV 值再切片（KV 无部分读接口），因此**不会**降低 KV 读放大，只减少回给浏览器的字节。
 
-<!-- 12.5-续 -->
+5. Range 会读到整份 KV 值再切片（KV 无部分读接口），因此**不会**降低 KV 读放大，只减少回给浏览器的字节。
+6. **CF 边缘会压缩文本类响应**：`text/plain` 的 200 响应被压成 `content-encoding: br`，此时边缘会**省略 `Accept-Ranges` 与 `Content-Length`**
+   （实测；不可压缩类型如 `application/octet-stream` 正常带 `Accept-Ranges: bytes`）。**不影响 Range**：带 `Range` 的请求一律回
+   206 + `Accept-Ranges` + `Content-Range`（实测逐字节正确），浏览器/播放器仍可拖动进度。
+
+### 12.5 部署与生产 E2E（2026-09-25）
+
+**部署**：`npx wrangler deploy -c ../doc/cos-exchange.wrangler.toml`（经 `HTTPS_PROXY=http://127.0.0.1:10808`）
+→ `Total Upload: 205.40 KiB / gzip: 53.57 KiB`、Worker Startup 1 ms、版本 **`23163fe6-b7a6-47c2-843b-b36480a4529f`**；
+核对：`compatibility_date=2026-08-10` 未变、**7 Secret + 4 明文变量 + 2 KV 全保留**
+（注：`versions view` 的 `resources.script.etag` **不是**文件 sha256，故字节一致性以"仓库副本 = 构建产物 = 部署入参文件"三者哈希相等来保证，
+行为一致性由下面的生产 E2E 验证）。
+
+**生产 E2E（`web开发\_prod-e2e-view.mjs`）—— 16/16 全 PASS**
+
+| 检查 | 结果 |
+|---|---|
+| 已登录 `/temp` | 200 / **51513 B**，含 `openPreview`/`pvTypeOf`/`pvRelease` |
+| **无自动播放** | 页面不含 `autoplay`，媒体 `preload='none'` ✔（视频须点击） |
+| 文本预览 | 页面按 `bytes=0-262143` 只取前 256 KB ✔ |
+| `Range: bytes=0-9` | **206** + `Content-Range: bytes 0-9/1024`，仅回 10 字节 ✔ |
+| `Range: bytes=-16` / `bytes=512-` | 206（`1008-1023/1024` / `512-1023/1024`）✔ |
+| `Range: bytes=99999-` | **416** + `Content-Range: bytes */1024` ✔ |
+| 非法范围（`items=0-1`） | 忽略 → 200 全量 ✔ |
+| 未登录带 Range | 回登录页、无内容（鉴权不受影响）✔ |
+| 不可压缩类型 200 | `Accept-Ranges: bytes` + `Content-Length: 1024` ✔ |
+| 清理 | 两个测试文件删除成功，`used` 精确回落 ✔ |
+
+> 只读网盘的筛选修复属前端行为，已在 L 组用源码断言守住（`scanFilter`/`renderFiltered`/`renderFilterPager`、无匹配文案、重置按钮、
+> 列表限速 120），生产页面同源（同一构建产物部署），故无需浏览器自动化即可保证一致性。
 
 
 
