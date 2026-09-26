@@ -835,6 +835,44 @@ function tempInlineOk(type) {
   return t.indexOf('image/') === 0 || t.indexOf('video/') === 0 || t.indexOf('audio/') === 0;
 }
 
+// 扩展名 → MIME 兜底表（2026-09-25）：仅在「存储的 Content-Type 不可用于渲染」时使用。
+// 背景：多数上传端会给正确 MIME，但 curl/脚本/部分客户端会写成 application/octet-stream，
+// 此时浏览器拿到 octet-stream + nosniff 就不会把它当图片渲染 → 表现为“明明是 png 却打不开”。
+// 安全边界：绝不映射到 text/html / image/svg+xml / application/xhtml+xml（防存储型 XSS）；
+// 结果仍经 tempSafeType 清洗，并由 tempInlineOk 决定 inline / attachment。
+const TEMP_EXT_MIME = {
+  png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', jfif: 'image/jpeg', jpe: 'image/jpeg',
+  gif: 'image/gif', webp: 'image/webp', bmp: 'image/bmp', ico: 'image/x-icon', cur: 'image/x-icon',
+  avif: 'image/avif', heic: 'image/heic', heif: 'image/heif', tif: 'image/tiff', tiff: 'image/tiff',
+  mp4: 'video/mp4', m4v: 'video/mp4', webm: 'video/webm', mov: 'video/quicktime', ogv: 'video/ogg',
+  mkv: 'video/x-matroska', avi: 'video/x-msvideo', wmv: 'video/x-ms-wmv', flv: 'video/x-flv', ts: 'video/mp2t',
+  mp3: 'audio/mpeg', m4a: 'audio/mp4', wav: 'audio/wav', ogg: 'audio/ogg', oga: 'audio/ogg',
+  flac: 'audio/flac', aac: 'audio/aac', opus: 'audio/opus', amr: 'audio/amr', ape: 'audio/x-ape',
+  pdf: 'application/pdf',
+  txt: 'text/plain', md: 'text/plain', log: 'text/plain', csv: 'text/csv', tsv: 'text/tab-separated-values',
+  json: 'application/json', xml: 'text/plain', yml: 'text/plain', yaml: 'text/plain',
+  ini: 'text/plain', conf: 'text/plain', cfg: 'text/plain', bat: 'text/plain',
+  js: 'text/plain', mjs: 'text/plain', css: 'text/plain', ts: 'text/plain', py: 'text/plain', sh: 'text/plain',
+  html: 'text/plain', htm: 'text/plain', svg: 'text/plain', // 仅作为“文本”展示，绝不按 HTML/SVG 解析
+};
+function tempExtMime(name) {
+  const n = String(name || '').toLowerCase();
+  const i = n.lastIndexOf('.');
+  if (i < 0 || i === n.length - 1) return '';
+  return TEMP_EXT_MIME[n.slice(i + 1)] || '';
+}
+// 响应最终类型：存储类型可用于渲染就原样用；空缺/过泛（octet-stream）或误标成 text/plain
+// 但扩展名更具体时，按扩展名兜底/纠正。
+function tempDisplayType(storedType, name) {
+  const t = tempSafeType(storedType || '');
+  const vague = !t || t === 'application/octet-stream' || t === 'binary/octet-stream';
+  const ext = tempExtMime(name);
+  if (!ext) return t || 'application/octet-stream';
+  if (vague) return ext;
+  if (t === 'text/plain' && ext !== 'text/plain') return ext;
+  return t;
+}
+
 // 受限 body 读取：没有 Content-Length（chunked 等）时用它包一层再交给 formData()，
 // 一旦累计超过 maxBytes 立即中断 → 内存占用有界（不会把任意大的 body 读进 isolate）。
 function tempLimitedBody(body, maxBytes, onTruncate) {
@@ -873,10 +911,12 @@ async function tempList(env) {
     const page = await store.list({ prefix: 'tmp/', cursor, limit: 1000 });
     for (const k of (page.keys || [])) {
       const m = k.metadata || {};
+      const nm = tempSafeName(m.name || k.name.split('/').pop());
       out.push({
         key: k.name,
-        name: m.name || k.name.split('/').pop(),
-        type: tempSafeType(m.type || ''),
+        name: nm,
+        // 展示类型：与 /temp/api/file 一致（存储类型不可用时按扩展名兜底）
+        type: tempDisplayType(m.type, nm),
         size: Number(m.size) || 0,
         at: Number(m.at) || 0,
         expireAt: k.expiration ? k.expiration * 1000 : 0,
@@ -1303,8 +1343,9 @@ async function handleTemp(request, env, ctx) {
     }
     if (!obj) return new Response('Not Found', { status: 404 });
     const meta = obj.meta || {};
-    const type = tempSafeType(meta.type || 'application/octet-stream');
     const name = tempSafeName(meta.name);
+    // 展示类型：存储类型不可渲染时按扩展名兜底（修「png 打不开」；.svg/.html 仍只作文本看）
+    const type = tempDisplayType(meta.type, name);
     const dl = url.searchParams.get('dl') === '1' || !tempInlineOk(type);
     const headers = new Headers();
     headers.set('Content-Type', type);
@@ -3800,8 +3841,8 @@ body.dark .pill:hover{background:rgba(77,159,255,.25)}
 .pv-box{background:var(--card);color:var(--text);border-radius:12px;width:min(96vw,1100px);max-height:92vh;display:flex;flex-direction:column;overflow:hidden;box-shadow:0 18px 50px rgba(0,0,0,.4)}
 .pv-head{display:flex;align-items:center;gap:6px;padding:8px 10px;border-bottom:1px solid var(--line);flex-shrink:0}
 .pv-name{flex:1;min-width:0;font-size:13.5px;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin-left:4px}
-.pv-body{flex:1;min-height:0;overflow:auto;display:flex;flex-direction:column;align-items:center;justify-content:center;background:var(--bg)}
-.pv-body img{max-width:100%;max-height:86vh;display:block}
+.pv-body{flex:1;min-height:0;overflow:auto;display:flex;flex-direction:column;align-items:center;justify-content:flex-start;background:var(--bg);padding:6px}
+.pv-body img{max-width:100%;max-height:84vh;display:block;margin:auto}
 .pv-body video{width:100%;max-height:86vh;background:#000}
 .pv-body audio{width:min(92%,560px);margin:24px 0}
 .pv-body iframe{width:100%;height:78vh;border:0;background:#fff}
@@ -4507,14 +4548,34 @@ function del(key){
 // =====================================================================
 var pvKey='',pvAc=null;
 function fileUrl(key){return '/temp/api/file?key='+encodeURIComponent(key);}
+// \\u6CE8\\u610F\\uFF082026-09-25 \\u4FEE bug\\uFF09\\uFF1A/temp/api/list \\u8FD4\\u56DE\\u7684 o.type \\u662F **MIME**\\uFF08\\u5982 "image/png"\\uFF09\\uFF0C
+// \\u4E0D\\u662F\\u7B80\\u5199\\u7C7B\\u578B\\uFF08img/vid/aud\\uFF09\\u3002\\u65E7\\u5B9E\\u73B0\\u7528 o.type==='img' \\u5224\\u5B9A\\uFF0C\\u6052\\u4E3A false \\u2192 png/jpg \\u88AB\\u5224\\u6210
+// \\u201C\\u4E0D\\u652F\\u6301\\u67E5\\u770B\\u201D\\u3002\\u73B0\\u6539\\u4E3A\\u300C\\u6269\\u5C55\\u540D\\u4E3A\\u4E3B + MIME \\u515C\\u5E95\\u300D\\u3002
 function pvTypeOf(o){
-  var e=ext(o.name);
-  if(o.type==='img'){return 'img';}
-  if(o.type==='vid'){return 'vid';}
-  if(o.type==='aud'){return 'aud';}
-  if(e==='pdf'){return 'pdf';}
-  if(TXT.indexOf(e)>=0||CODE.indexOf(e)>=0){return 'text';}
+  var e=ext(o.name),mt=String(o.type||'').toLowerCase();
+  if(IMG.indexOf(e)>=0||mt.indexOf('image/')===0){return 'img';}
+  if(VID.indexOf(e)>=0||mt.indexOf('video/')===0){return 'vid';}
+  if(AUD.indexOf(e)>=0||mt.indexOf('audio/')===0){return 'aud';}
+  if(e==='pdf'||mt==='application/pdf'){return 'pdf';}
+  if(TXT.indexOf(e)>=0||CODE.indexOf(e)>=0||mt.indexOf('text/')===0||mt==='application/json'||mt==='text/csv'){return 'text';}
   return 'none';
+}
+// \\u9884\\u89C8\\u5931\\u8D25/\\u4E0D\\u652F\\u6301\\u65F6\\u7684\\u7EDF\\u4E00\\u63D0\\u793A\\uFF1A\\u5E26\\u53EF\\u70B9\\u51FB\\u7684\\u300C\\u5728\\u65B0\\u7A97\\u53E3\\u6253\\u5F00\\u300D\\uFF08\\u65E7\\u5B9E\\u73B0\\u53EA\\u7ED9\\u4E00\\u53E5\\u8BDD\\uFF0C\\u7528\\u6237\\u65E0\\u4ECE\\u4E0B\\u624B\\uFF09
+function pvFail(why,url){
+  var body=$('pvBody');
+  body.innerHTML='';
+  var d=document.createElement('div');
+  d.className='pv-tip';
+  d.appendChild(document.createTextNode(why+'\\uFF1A'));
+  if(url){
+    var a=document.createElement('a');
+    a.href=url;a.target='_blank';a.rel='noopener';a.textContent='\\u5728\\u65B0\\u7A97\\u53E3\\u6253\\u5F00';
+    a.style.color='var(--primary)';
+    d.appendChild(a);
+    d.appendChild(document.createTextNode('\\uFF0C\\u6216'));
+  }
+  d.appendChild(document.createTextNode('\\u70B9\\u53F3\\u4E0A\\u89D2\\u300C\\u2B07\\u300D\\u4E0B\\u8F7D'));
+  body.appendChild(d);
 }
 function pvTip(msg){$('pvBody').innerHTML='<div class="pv-tip">'+esc(msg)+'</div>';}
 function pvRelease(){
@@ -4548,12 +4609,15 @@ function openPreview(o){
   pvKey=o.key;
   var body=$('pvBody');
   if(t==='img'){
-    if(ext(o.name)==='svg'){
-      pvTip('SVG \\u6309\\u5B89\\u5168\\u7B56\\u7565\\u5F3A\\u5236\\u4E0B\\u8F7D\\uFF08\\u9632\\u811A\\u672C\\u6CE8\\u5165\\uFF09\\uFF0C\\u8BF7\\u70B9\\u53F3\\u4E0A\\u89D2\\u300C\\u2B07\\u300D\\u4E0B\\u8F7D\\u67E5\\u770B');
+    var mt=String(o.type||'').toLowerCase();
+    if(ext(o.name)==='svg'||mt.indexOf('svg')>=0){
+      pvFail('SVG \\u6309\\u5B89\\u5168\\u7B56\\u7565\\u5F3A\\u5236\\u4E0B\\u8F7D\\uFF08\\u9632\\u811A\\u672C\\u6CE8\\u5165\\uFF09\\uFF0C\\u8BF7','');
     }else{
       var im=document.createElement('img');
       im.alt=o.name;
-      im.onerror=function(){body.innerHTML='';pvTip('\\u65E0\\u6CD5\\u663E\\u793A\\uFF1A\\u6D4F\\u89C8\\u5668\\u4E0D\\u652F\\u6301\\u8BE5\\u56FE\\u7247\\u683C\\u5F0F\\uFF0C\\u8BF7\\u4E0B\\u8F7D\\u67E5\\u770B');};
+      im.onerror=function(){
+        pvFail('\\u56FE\\u7247\\u65E0\\u6CD5\\u663E\\u793A\\uFF08\\u6D4F\\u89C8\\u5668\\u4E0D\\u652F\\u6301\\u8BE5\\u683C\\u5F0F\\uFF0C\\u6216\\u54CD\\u5E94\\u5F02\\u5E38\\uFF09',url);
+      };
       im.src=url;
       body.appendChild(im);
     }
