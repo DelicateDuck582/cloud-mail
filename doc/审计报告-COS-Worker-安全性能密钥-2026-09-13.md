@@ -638,6 +638,66 @@ Range 不改变鉴权（未登录回登录页）、带 Range 的非法 key 仍 4
 > 只读网盘的筛选修复属前端行为，已在 L 组用源码断言守住（`scanFilter`/`renderFiltered`/`renderFilterPager`、无匹配文案、重置按钮、
 > 列表限速 120），生产页面同源（同一构建产物部署），故无需浏览器自动化即可保证一致性。
 
+---
+
+## 13. 缺陷修复：`/temp` 查看器打不开 PNG（2026-09-25）
+
+> 现象：临时网盘里明明是 `.png`，点「查看」却提示「该类型暂不支持在线查看」。
+> 修复版本：**246504 字节**、gzip 72270，sha256 `B6745496E84750D5FCEFDD4929BE9A202D68897565016EC6BFBA1A2C72CF4815`；
+> 部署版本 **`6a9ffa77-da15-4377-8985-114dec35466d`**。
+> 结论：**矩阵 170 项（A–L）全部通过（FAIL=0）**；性能无回归；生产 E2E 全部通过。
+
+### 13.1 根因
+
+**客户端类型判定用错了字段**：`/temp/api/list` 返回的 `type` 是 **MIME 字符串**（`image/png`），
+而预览函数 `pvTypeOf()` 在比较**简写类型**：
+
+```js
+if(o.type==='img'){return 'img';}   // 实际 o.type === "image/png" → 恒为 false
+```
+
+→ `.png/.jpg` 一路落到 `return 'none'` → 显示「该类型暂不支持在线查看」。
+（列表图标是按**扩展名**算的，所以图标正常、只有查看器坏 —— 这也是最初误判的原因。）
+
+**服务端侧同类问题（顺带修掉）**：客户端若把类型写成 `application/octet-stream`（curl/脚本/部分客户端如此），
+服务端会按「非内联类型」下发 `Content-Disposition: attachment` + `nosniff` → 浏览器同样不会把它当图片渲染
+（已复现：同一 PNG 声明 octet-stream 时返回 `attachment`）。
+
+### 13.2 修法
+
+| 侧 | 修改 |
+|---|---|
+| 客户端 | `pvTypeOf()` 改为 **扩展名为主 + MIME 兜底**：`IMG/VID/AUD` 扩展名命中，或 MIME 以 `image/`/`video/`/`audio/` 开头 → 对应类型；`pdf`、`text/*`、`application/json` 同理；SVG（含 MIME 含 svg）仍只提示下载 |
+| 客户端 | 预览失败改为 `pvFail()`：给出原因 + **可点击的「在新窗口打开」** + 提示下载；图片容器改 `justify-content:flex-start` + `margin:auto`，避免大图被 flex 居中裁掉顶部且无法滚动 |
+| 服务端 | 新增 `TEMP_EXT_MIME` 扩展名白名单 + `tempDisplayType(storedType, name)`：存储类型为空/过泛（`octet-stream`）时按扩展名兜底；被误标成 `text/plain` 但扩展名更具体（如 `.png`）时纠正。**绝不映射到 `text/html` / `image/svg+xml` / `application/xhtml+xml`**；`.html/.svg` 只映射成 `text/plain`（配 `nosniff`，作为文本查看、不可执行） |
+| 服务端 | `/temp/api/file` 与 `/temp/api/list` 统一走 `tempDisplayType`（列表 `type` 与下载响应一致，前端据此判定预览能力） |
+
+### 13.3 复测（170 项）
+
+新增 5 项（L 组）：
+
+| 断言 | 实测 |
+|---|---|
+| `octet-stream` 上传的 png → **image/png + inline** | `ct=image/png cd=inline` ✔ |
+| `.html/.svg` 兜底**只映射为 text/plain** + nosniff（不产生可执行类型） | `ct=text/plain nosniff=nosniff` ✔ |
+| 存储类型为 `text/html` → **强制 attachment** | `cd=attachment` ✔ |
+| 列表 `type` 与下载响应一致 | `image/png` ✔ |
+| 前端判定按扩展名/MIME + `pvFail` 存在 | ✔ |
+
+性能：246504 字节（+4557）/ gzip 72270（+1711）；`/temp` 主界面 52151 字节；回源次数与上界无变化。
+
+### 13.4 部署与生产验证
+
+- `npx wrangler deploy -c ../doc/cos-exchange.wrangler.toml`（经 `HTTPS_PROXY=http://127.0.0.1:10808`）
+  → 版本 **`6a9ffa77-da15-4377-8985-114dec35466d`**；核对 `兼容日期=2026-08-10`、**7 Secret + 4 变量 + 2 KV** 全保留。
+- **`_prod-e2e-png.mjs`（6/6 PASS）**：页面已含扩展名/MIME 判定与 `pvFail`；
+  **现有 3.9 MB PNG 真实取回 = 200 + `image/png` + `inline` + 字节完整（3919817/3919817，PNG 签名 137,80,78,71）**；
+  上传声明 `octet-stream` 的 png → 响应 `image/png` + `inline`（修复前为 `attachment`）；测试文件已清理。
+- **`_prod-e2e-view.mjs`（16/16 PASS）**：预览 / Range / 鉴权全部复测无回归（页面 53093 字节）。
+
+> 经验记录：跨端字段语义必须写清（`type` 是 MIME 还是简写分类）——这次就是「列表给 MIME、前端按简写比较」导致的
+> 「图标正常但查看器坏」。凡是客户端按类型分支的地方，都应以扩展名/MIME 双依据判定。
+
 
 
 
