@@ -22,6 +22,17 @@ import oauthService from "./oauth-service";
 import settingService from './setting-service';
 import starService from './star-service';
 
+// D1 单条语句最多 100 个绑定参数，inArray 统一按 90 分片，留安全余量
+const SQL_BIND_LIMIT = 90;
+
+const chunkArray = (list, size) => {
+	const chunks = [];
+	for (let i = 0; i < list.length; i += size) {
+		chunks.push(list.slice(i, i + size));
+	}
+	return chunks;
+};
+
 const userService = {
 
 	async loginUserInfo(c, userId) {
@@ -115,7 +126,10 @@ const userService = {
 		await starService.removeByUserIds(c, userIds);
 		await accountService.physicsDeleteByUserIds(c, userIds);
 		await oauthService.deleteByUserIds(c, userIds);
-		await orm(c).delete(user).where(inArray(user.userId, userIds)).run();
+		// 入参 userIds 数量不限，按 D1 绑定参数上限分片删除
+		for (const chunk of chunkArray(userIds, SQL_BIND_LIMIT)) {
+			await orm(c).delete(user).where(inArray(user.userId, chunk)).run();
+		}
 	},
 
 	async list(c, params) {
@@ -382,7 +396,10 @@ const userService = {
 		}
 		const roleList = await roleService.selectByIdsAndSendType(c, 'email:send', roleConst.sendType.DAY);
 		const roleIds = roleList.map(action => action.roleId);
-		await orm(c).update(user).set({ sendCount: 0 }).where(inArray(user.type, roleIds)).run();
+		// roleIds 来自查询结果，数量随角色数增长：按 D1 绑定参数上限分片清零
+		for (const chunk of chunkArray(roleIds, SQL_BIND_LIMIT)) {
+			await orm(c).update(user).set({ sendCount: 0 }).where(inArray(user.type, chunk)).run();
+		}
 	},
 
 	async resetSendCount(c, params) {

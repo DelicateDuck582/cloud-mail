@@ -9,6 +9,17 @@ import settingService from "./setting-service";
 import kvConst from '../const/kv-const';
 import {t} from '../i18n/i18n';
 
+// D1 单条语句最多 100 个绑定参数，inArray 统一按 90 分片，留安全余量
+const SQL_BIND_LIMIT = 90;
+
+const chunkArray = (list, size) => {
+	const chunks = [];
+	for (let i = 0; i < list.length; i += size) {
+		chunks.push(list.slice(i, i + size));
+	}
+	return chunks;
+};
+
 // 密码学安全随机绑定令牌（192 bit）
 function genBindToken() {
 	const arr = new Uint8Array(24);
@@ -255,7 +266,10 @@ const oauthService = {
 	},
 
 	async deleteByUserIds(c, userIds) {
-		await orm(c).delete(oauth).where(inArray(oauth.userId, userIds)).run();
+		// 入参 userIds 数量不限，按 D1 绑定参数上限分片删除
+		for (const chunk of chunkArray(userIds, SQL_BIND_LIMIT)) {
+			await orm(c).delete(oauth).where(inArray(oauth.userId, chunk)).run();
+		}
 	},
 
 	//定时任务凌晨清除未绑定邮箱的oauth用户

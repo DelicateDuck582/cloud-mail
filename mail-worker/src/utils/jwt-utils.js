@@ -1,3 +1,5 @@
+import constant from '../const/constant';
+
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
 
@@ -20,12 +22,16 @@ const jwtUtils = {
 		};
 
 		const now = Math.floor(Date.now() / 1000);
-		const exp = expiresInSeconds ? now + expiresInSeconds : undefined;
+
+		// 安全：默认写入 exp（当前时间 + constant.TOKEN_EXPIRE 秒 = 30 天），
+		// 与 KV 会话 TTL 语义对齐，避免令牌永久有效；显式传 expiresInSeconds 时以传入值为准
+		const ttl = Number(expiresInSeconds);
+		const exp = now + (Number.isFinite(ttl) && ttl > 0 ? ttl : constant.TOKEN_EXPIRE);
 
 		const fullPayload = {
 			...payload,
 			iat: now,
-			...(exp ? { exp } : {})
+			exp
 		};
 
 		const headerStr = base64url(encoder.encode(JSON.stringify(header)));

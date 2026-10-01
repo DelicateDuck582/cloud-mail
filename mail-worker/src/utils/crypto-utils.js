@@ -29,11 +29,18 @@ const saltHashUtils = {
 
 	genRandomPwd(length = 8) {
 		const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
-		const arr = new Uint8Array(length);
-		crypto.getRandomValues(arr); // 密码学安全随机，替代 Math.random
+		// 安全：拒绝采样消除取模偏差 —— 只接受 < limit 的随机字节，超出区间的丢弃重取
+		const limit = Math.floor(256 / chars.length) * chars.length;
 		let result = '';
-		for (let i = 0; i < length; i++) {
-			result += chars.charAt(arr[i] % chars.length);
+		while (result.length < length) {
+			// 一次多取一些字节，减少 getRandomValues 调用次数
+			const arr = new Uint8Array(Math.max(length * 2, 8));
+			crypto.getRandomValues(arr);
+			for (let i = 0; i < arr.length && result.length < length; i++) {
+				if (arr[i] < limit) {
+					result += chars.charAt(arr[i] % chars.length);
+				}
+			}
 		}
 		return result;
 	}

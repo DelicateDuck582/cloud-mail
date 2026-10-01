@@ -62,13 +62,15 @@ const resendService = {
 	},
 
 	// Resend 使用 Svix 标准 webhook 签名：校验 svix-id / svix-timestamp / svix-signature
+	// 安全：签名密钥格式为 whsec_<base64>，HMAC key 必须是 base64 解码后的原始字节（不是密钥字符串本身）
 	async verifySvixSignature(c, bodyText) {
-		const secret = c.env.RESEND_SIGNING_SECRET;
+		const secret = (c.env.RESEND_SIGNING_SECRET || '').trim();
 
 		if (!secret) {
-			// 未配置签名密钥：记录警告并放行（⚠️ 强烈建议在 Resend 配置 signing secret 并设置该环境变量，否则 webhook 可被伪造）
-			console.warn('webhook: RESEND_SIGNING_SECRET 未配置，未校验签名');
-			return true;
+			// 安全：未配置签名密钥时 fail-closed（拒绝），避免 webhook 可被任意伪造
+			// ⚠️ 请在 Resend 配置 signing secret 并设置 RESEND_SIGNING_SECRET 环境变量
+			console.warn('webhook: RESEND_SIGNING_SECRET 未配置，拒绝请求（fail-closed）—— 配置前 Resend 状态回写将不可用');
+			return false;
 		}
 
 		const id = c.req.header('svix-id');
@@ -77,14 +79,25 @@ const resendService = {
 
 		if (!id || !ts || !sigHeader) return false;
 
-		// 防重放：时间戳与当前时间差超过 5 分钟直接拒绝
-		if (Math.abs(Date.now() / 1000 - Number(ts)) > 300) return false;
+		// 防重放：时间戳必须是有效数字（非数字直接 401），且与当前时间差不超过 5 分钟
+		const tsNum = Number(ts);
+		if (!Number.isFinite(tsNum)) return false;
+		if (Math.abs(Date.now() / 1000 - tsNum) > 300) return false;
+
+		// HMAC key：剥离 whsec_ 前缀后 base64 解码为原始字节
+		let keyBytes;
+		try {
+			keyBytes = base64Decode(secret.replace(/^whsec_/, ''));
+		} catch (e) {
+			console.warn('webhook: RESEND_SIGNING_SECRET 不是合法的 base64，拒绝请求', e);
+			return false;
+		}
 
 		const signedContent = `${id}.${ts}.${bodyText}`;
 
 		const key = await crypto.subtle.importKey(
 			'raw',
-			new TextEncoder().encode(secret),
+			keyBytes,
 			{ name: 'HMAC', hash: 'SHA-256' },
 			false,
 			['sign']
@@ -100,6 +113,16 @@ const resendService = {
 			return timingSafeEqual(signature, sigB64);
 		});
 	},
+}
+
+// base64 → Uint8Array（Workers 环境用 atob；非法 base64 会抛错，由调用方按 fail-closed 处理）
+function base64Decode(base64) {
+	const binary = atob(base64);
+	const bytes = new Uint8Array(binary.length);
+	for (let i = 0; i < binary.length; i++) {
+		bytes[i] = binary.charCodeAt(i);
+	}
+	return bytes;
 }
 
 // 恒定时间字符串比较（长度不一致立即失败，长度一致时逐字节异或）

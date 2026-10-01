@@ -11,6 +11,17 @@ import verifyUtils from '../utils/verify-utils';
 import { t } from '../i18n/i18n.js';
 import emailUtils from '../utils/email-utils';
 
+// D1 单条语句最多 100 个绑定参数，inArray 统一按 90 分片，留安全余量
+const SQL_BIND_LIMIT = 90;
+
+const chunkArray = (list, size) => {
+	const chunks = [];
+	for (let i = 0; i < list.length; i += size) {
+		chunks.push(list.slice(i, i + size));
+	}
+	return chunks;
+};
+
 const roleService = {
 
 	async add(c, params, userId) {
@@ -136,11 +147,17 @@ const roleService = {
 		return orm(c).select().from(role).where(eq(role.roleId, roleId)).get();
 	},
 
-	selectByIdsHasPermKey(c, types, permKey) {
-		return orm(c).select({ roleId: role.roleId, sendType: role.sendType, sendCount: role.sendCount }).from(perm)
-			.leftJoin(rolePerm, eq(perm.permId, rolePerm.permId))
-			.leftJoin(role, eq(role.roleId, rolePerm.roleId))
-			.where(and(eq(perm.permKey, permKey), inArray(role.roleId, types))).all();
+	// types 来自查询结果，数量随角色数增长：按 ≤90 分片查询，累积合并返回
+	async selectByIdsHasPermKey(c, types, permKey) {
+		const rows = [];
+		for (const chunk of chunkArray([...new Set(types || [])], SQL_BIND_LIMIT)) {
+			const part = await orm(c).select({ roleId: role.roleId, sendType: role.sendType, sendCount: role.sendCount }).from(perm)
+				.leftJoin(rolePerm, eq(perm.permId, rolePerm.permId))
+				.leftJoin(role, eq(role.roleId, rolePerm.roleId))
+				.where(and(eq(perm.permKey, permKey), inArray(role.roleId, chunk))).all();
+			rows.push(...part);
+		}
+		return rows;
 	},
 
 	selectByIdsAndSendType(c, permKey, sendType) {
@@ -175,13 +192,19 @@ const roleService = {
 		return orm(c).select().from(role).where(eq(role.name, roleName)).get();
 	},
 
-	selectByUserIds(c, userIds) {
+	// userIds 数量不限：按 ≤90 分片查询，累积合并返回
+	async selectByUserIds(c, userIds) {
 
 		if (!userIds || userIds.length === 0) {
 			return [];
 		}
 
-		return orm(c).select({ ...role, userId: user.userId }).from(user).leftJoin(role, eq(role.roleId, user.type)).where(inArray(user.userId, userIds)).all();
+		const rows = [];
+		for (const chunk of chunkArray([...new Set(userIds.filter(Boolean))], SQL_BIND_LIMIT)) {
+			const part = await orm(c).select({ ...role, userId: user.userId }).from(user).leftJoin(role, eq(role.roleId, user.type)).where(inArray(user.userId, chunk)).all();
+			rows.push(...part);
+		}
+		return rows;
 
 	},
 

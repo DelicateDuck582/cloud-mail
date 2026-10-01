@@ -7,6 +7,17 @@ import { formatDetailDate, toUtc } from '../utils/date-uitil';
 import userService from './user-service';
 import { t } from '../i18n/i18n.js';
 
+// D1 单条语句最多 100 个绑定参数，inArray 统一按 90 分片，留安全余量
+const SQL_BIND_LIMIT = 90;
+
+const chunkArray = (list, size) => {
+	const chunks = [];
+	for (let i = 0; i < list.length; i += size) {
+		chunks.push(list.slice(i, i + size));
+	}
+	return chunks;
+};
+
 const regKeyService = {
 
 	async add(c, params, userId) {
@@ -44,7 +55,10 @@ const regKeyService = {
 	async delete(c, params) {
 		let {regKeyIds} = params;
 		regKeyIds = regKeyIds.split(',').map(id => Number(id));
-		await orm(c).delete(regKey).where(inArray(regKey.regKeyId,regKeyIds)).run();
+		// 入参 regKeyIds 数量不限，按 D1 绑定参数上限分片删除
+		for (const chunk of chunkArray(regKeyIds, SQL_BIND_LIMIT)) {
+			await orm(c).delete(regKey).where(inArray(regKey.regKeyId, chunk)).run();
+		}
 	},
 
 	async clearNotUse(c) {

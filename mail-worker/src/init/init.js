@@ -44,6 +44,8 @@ const dbInit = {
 		await this.v4_0DB(c);
 		await this.v4_1DB(c);
 		await this.v4_2DB(c);
+		await this.v4_3DB(c);
+		await this.v4_4DB(c);
 		await settingService.refresh(c);
 		return c.text('success');
 	},
@@ -216,6 +218,72 @@ const dbInit = {
 			]);
 		} catch (e) {
 			console.warn(`跳过字段：${e.message}`);
+		}
+	},
+
+	// 附件管理 RBAC（/att/* 已纳入 security.js requirePerms）：
+	//   1) 幂等注册附件权限 key（37 附件管理 / 38 att:query / 39 att:delete）
+	//   2) 给默认角色（is_default = 1）补 att:query、att:delete，
+	//      保证普通用户附件管理页（列表/删除/恢复）不因新 RBAC 回归
+	async v4_3DB(c) {
+		try {
+			await c.env.db.prepare(`
+				INSERT OR IGNORE INTO perm (perm_id, name, perm_key, pid, type, sort) VALUES
+				(37, '附件管理', '', 0, 1, 6),
+				(38, '附件查看', 'att:query', 37, 2, 0),
+				(39, '附件删除', 'att:delete', 37, 2, 1)
+			`).run();
+		} catch (e) {
+			console.warn(`跳过数据：${e.message}`);
+		}
+
+		try {
+			await c.env.db.prepare(`
+				INSERT INTO role_perm (role_id, perm_id)
+				SELECT r.role_id, p.perm_id
+				FROM role r, perm p
+				WHERE r.is_default = 1
+				  AND p.perm_key IN ('att:query', 'att:delete')
+				  AND NOT EXISTS (
+					SELECT 1 FROM role_perm rp WHERE rp.role_id = r.role_id AND rp.perm_id = p.perm_id
+				  )
+			`).run();
+		} catch (e) {
+			console.warn(`跳过数据：${e.message}`);
+		}
+	},
+
+	// EWS（Thunderbird 接入）：同步水位表 + email.update_time 增量列
+	async v4_4DB(c) {
+		try {
+			await c.env.db.prepare(`
+				CREATE TABLE IF NOT EXISTS ews_sync_state (
+					user_id INTEGER NOT NULL,
+					folder TEXT NOT NULL,
+					sync_state TEXT,
+					update_time INTEGER,
+					PRIMARY KEY (user_id, folder)
+				)
+			`).run();
+		} catch (e) {
+			console.warn(`跳过数据：${e.message}`);
+		}
+
+		try {
+			// 与 create_time/trash_time 同格式（text 'YYYY-MM-DD HH:mm:ss'，字典序即时间序）
+			const column = await c.env.db.prepare(`SELECT * FROM pragma_table_info('email') WHERE name = 'update_time' limit 1`).first();
+			if (!column) {
+				await c.env.db.prepare(`ALTER TABLE email ADD COLUMN update_time TEXT;`).run();
+			}
+		} catch (e) {
+			console.warn(`跳过字段：${e.message}`);
+		}
+
+		try {
+			// 回填历史行水位：只补 NULL（幂等，不做全表 UPDATE；新行由 email-service 写入时 touch）
+			await c.env.db.prepare(`UPDATE email SET update_time = create_time WHERE update_time IS NULL;`).run();
+		} catch (e) {
+			console.warn(`跳过数据：${e.message}`);
 		}
 	},
 
