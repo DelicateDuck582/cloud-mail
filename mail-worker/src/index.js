@@ -9,10 +9,18 @@ import oauthService from './service/oauth-service';
 import analysisService from './service/analysis-service';
 import attService from './service/att-service';
 import signUtils from './utils/sign-utils';
+import ewsApp from './ews/router.js';
+import { EWS_PATH } from './ews/const.js';
 export default {
 	 async fetch(req, env, ctx) {
 
 		const url = new URL(req.url)
+
+		// EWS（Exchange Web Services）：Thunderbird 145+ 原生 Exchange 账号接入
+		// 大小写不敏感（TB 实际请求 /EWS/Exchange.asmx）；独立 Hono 实例、独立 Basic 认证
+		if (url.pathname.toLowerCase() === EWS_PATH) {
+			return ewsApp.fetch(req, env, ctx);
+		}
 
 		if (url.pathname.startsWith('/api/')) {
 			url.pathname = url.pathname.replace('/api', '')
@@ -65,8 +73,9 @@ export default {
 	email: email,
 	async scheduled(c, env, ctx) {
 		if (c.cron === '*/5 * * * *') {
-			// COS 恢复后自动把回退附件批量迁回 COS（每次一批，幂等；释放 KV 空间）
-			await r2Service.migrateFallbackBatch({ env });
+			// COS 恢复后自动把回退附件批量迁回 COS（每轮一批，幂等；释放 KV 空间）
+			// 该分支必须最先执行本迁移；批量上限在此显式传入 50（r2-service 内部默认值 30）
+			await r2Service.migrateFallbackBatch({ env }, 50);
 			return;
 		}
 

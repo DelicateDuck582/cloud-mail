@@ -26,7 +26,6 @@
             @clear="search"
         />
         <el-button type="primary" @click="search">{{ $t('search') }}</el-button>
-        <el-button type="primary" @click="search">{{ $t('search') }}</el-button>
         <el-divider direction="vertical" />
         <el-button size="small" :disabled="selected.length === 0" @click="previewSelected">{{ $t('attPreview') }}</el-button>
         <el-button size="small" :disabled="selected.length === 0" @click="downloadSelected">{{ $t('attDownload') }}</el-button>

@@ -77,7 +77,7 @@ const en = {
     attTooLargeMsg: 'Attachment "{name}" exceeds the {size} sending limit and was skipped',
     htmlSignature: 'HTML Signature',
     htmlSignaturePlaceholder: 'Paste your HTML signature, e.g. a QQ Mail signature card',
-    htmlSignatureDesc: 'Automatically appended to the end of new emails (editable / removable in the editor). HTML is supported; dangerous tags like <script> are stripped automatically.',
+    htmlSignatureDesc: 'Automatically appended to the end of new emails (editable / removable in the editor). HTML is supported; content is sanitized and not all tags or styles are guaranteed to be preserved.',
     signaturePreview: 'Preview',
     clearSignature: 'Clear',
     username: 'Username',

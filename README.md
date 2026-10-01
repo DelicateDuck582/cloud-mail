@@ -165,4 +165,54 @@ cloud-mail
 
 [Telegram](https://t.me/cloud_mail_tg)
 
+## Thunderbird 接入（EWS）
+
+CloudMail 内置 EWS（Exchange Web Services）兼容端点，**Thunderbird 145+** 可直接以「Exchange」账号接入收发邮件，无需插件、无需额外开启 IMAP/SMTP。端点地址为 `https://<你的mail域名>/EWS/Exchange.asmx`（大小写不敏感）。
+
+### 一、升级后先执行数据库迁移
+
+EWS 依赖 v4_4DB 迁移（`ews_sync_state` 同步水位表 + `email.update_time` 增量列），部署新版 Worker 后调用一次初始化接口即可（幂等，可重复执行）：
+
+```
+POST https://<你的Worker域名>/api/init
+Body: {"secret":"<你的 INIT_SECRET>"}
+```
+
+### 二、Thunderbird 配置步骤
+
+1. Thunderbird →「账户设置」→「账户操作」→「添加邮件账户」；
+2. 输入姓名、CloudMail 登录邮箱、密码，点击「继续」，若自动探测失败选择「手动配置（Manual config）」；
+3. 传入协议选择 **Exchange**（不要选 IMAP/POP）；
+4. **服务器 URL** 填 `https://<你的mail域名>/EWS/Exchange.asmx`；
+5. 用户名 = CloudMail 登录邮箱，密码 = 登录密码，认证方式为「普通密码 / Normal password」（即 HTTP Basic）；
+6. 完成后可见 Inbox / Sent Items / Deleted Items / Drafts / Outbox 五个文件夹。
+
+> 本实现**不提供 Autodiscover**（`/autodiscover/autodiscover.xml`），必须手动填写 EWS 服务器 URL。
+
+### 三、Free 计划限制
+
+- **附件大小**：经 EWS 收发/读取的单个附件（含内嵌图）默认上限 **1MB**，可用环境变量 `EWS_MAX_ATT_BYTES`（字节）放大，付费计划（CPU 更宽裕）建议放宽；超过上限的附件在 Web 端正常收发，仅 EWS 通道受限：
+  - 发送：超过上限直接报错 `Attachment is too large for EWS ... Please send it from the CloudMail web client.`；
+  - 收取：重建 MIME 时超限附件会被跳过（正文与其它附件正常显示）；`GetAttachment` 超限返回 Fault 提示改用 Web 端下载。
+- **同步分页**：单次 `SyncFolderItems` 最多返回 50 封邮件的变更，邮件很多时 Thunderbird 会自动翻页拉取，首轮同步稍慢。
+- **批量上限**：单次 `GetItem` / `GetAttachment` 最多 200 个 Id（超出返回 `ErrorMaxBatchSizeExceeded`），`DeleteItem` 无此限制（分片执行）。
+- **认证缓存**：EWS 认证结果在 KV 缓存 15 分钟，修改密码后最多 15 分钟内旧密码仍可通过 EWS 认证（Web/JWT 侧不受影响）。
+- **无推送通知**：未实现 `Subscribe/GetEvents/StreamingSubscription`，Thunderbird 会自动降级为定时轮询（`SyncFolderItems`），不消耗长连接。
+
+### 四、不支持的功能
+
+以下操作统一返回 `ErrorNotImplemented` SOAP Fault（Thunderbird 会容忍并降级）：
+
+- 推送通知与事件订阅（Subscribe / Unsubscribe / GetEvents / StreamingSubscription）；
+- 草稿写入（`CreateItem MessageDisposition="SaveOnly"`，收发信正常，但草稿箱只读/为空）；
+- 服务器端搜索与查找（FindItem / FindFolder / SearchMailboxes）、移动/复制邮件（MoveItem / CopyItem）；
+- 日历、会议、联系人、自动回复（OOF）、`ResolveNames`、`GetUserAvailability`、`ConvertId` 等非邮件操作；
+- 附件直读签名与 COS 回退逻辑不受影响：EWS 侧复用了 Web 端同一套存储读取（r2-service），COS 故障期间回退 KV。
+
+### 五、排错
+
+- `401 Unauthorized`：邮箱或密码错误（用户名必须是 CloudMail 登录邮箱，不是别名账户）；同 IP 连续 5 次失败会被锁 10 分钟。
+- `ErrorInternalServerError ... v4_4DB`：数据库未执行升级，见「一、升级后先执行数据库迁移」。
+- `ErrorFolderNotFound`：请求了 CloudMail 不存在的文件夹（仅支持上述五个文件夹）。
+- 邮件正文/附件缺失：多为附件超过 `EWS_MAX_ATT_BYTES`（见「三、Free 计划限制」）。
 

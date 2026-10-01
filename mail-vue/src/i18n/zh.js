@@ -77,7 +77,7 @@ const zh = {
     attTooLargeMsg: '附件「{name}」超过 {size} 发送上限，已忽略',
     htmlSignature: 'HTML 签名',
     htmlSignaturePlaceholder: '粘贴 HTML 签名代码，例如 QQ 邮箱个性签名卡样式',
-    htmlSignatureDesc: '新建邮件时会自动插入到正文末尾（可在编辑器里手动修改或删除）。支持 HTML 标签，script 等危险标签会被编辑器自动清理。',
+    htmlSignatureDesc: '新建邮件时会自动插入到正文末尾（可在编辑器里手动修改或删除）。支持 HTML 标签，内容会经过安全过滤，不保证完整保留所有标签与样式。',
     signaturePreview: '预览',
     clearSignature: '清空',
     username: '用户名',
