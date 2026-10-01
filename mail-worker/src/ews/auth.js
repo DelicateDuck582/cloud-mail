@@ -5,7 +5,7 @@
  * 验证成功把 user 行塞进 Hono context（c.set('user', userRow)），与项目 userContext 约定一致，
  * 后续 handler 可直接复用 email-service / att-service 等现有 service。
  *
- * 防爆破：同 IP 失败 5 次 / 10 分钟锁定（参照 login-service 的 loginFailMap 模式）+ 凭据错误 1 秒延迟。
+ * 防爆破：同 IP 失败 10 次 / 5 分钟锁定（参照 login-service 的 loginFailMap 模式，阈值更宽松以减少误伤）+ 凭据错误 1 秒延迟。
  * 成功结果可写 KV 缓存（ews-auth:sha256(jwt_secret:email:password) → 用户信息，TTL 300s）以减少
  * 每请求查库 + 哈希；键用 jwt_secret 加盐（jwt_secret 未配置时退化为不加盐并告警，生产必配）；
  * 只缓存成功结果，密码变更最多 5 分钟后对 EWS 生效。

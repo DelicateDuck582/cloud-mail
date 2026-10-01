@@ -171,7 +171,7 @@ CloudMail 内置 EWS（Exchange Web Services）兼容端点，**Thunderbird 145+
 
 ### 一、升级后先执行数据库迁移
 
-EWS 依赖 v4_4DB 迁移（`ews_sync_state` 同步水位表 + `email.update_time` 增量列），部署新版 Worker 后调用一次初始化接口即可（幂等，可重复执行）：
+EWS 依赖 v4_4DB 迁移（`ews_sync_state` 同步水位表 + `email.update_time` 增量列 + `ews_tombstone` 物理删除事件表），部署新版 Worker 后调用一次初始化接口即可（幂等，可重复执行）：
 
 ```
 POST https://<你的Worker域名>/api/init
@@ -195,8 +195,9 @@ Body: {"secret":"<你的 INIT_SECRET>"}
   - 发送：超过上限直接报错 `Attachment is too large for EWS ... Please send it from the CloudMail web client.`；
   - 收取：重建 MIME 时超限附件会被跳过（正文与其它附件正常显示）；`GetAttachment` 超限返回 Fault 提示改用 Web 端下载。
 - **同步分页**：单次 `SyncFolderItems` 最多返回 50 封邮件的变更，邮件很多时 Thunderbird 会自动翻页拉取，首轮同步稍慢。
-- **批量上限**：单次 `GetItem` / `GetAttachment` 最多 200 个 Id（超出返回 `ErrorMaxBatchSizeExceeded`），`DeleteItem` 无此限制（分片执行）。
-- **认证缓存**：EWS 认证结果在 KV 缓存 15 分钟，修改密码后最多 15 分钟内旧密码仍可通过 EWS 认证（Web/JWT 侧不受影响）。
+- **批量上限**：单次 `GetItem` / `GetAttachment` 最多 200 个 Id（超出返回 `ErrorMaxBatchSizeExceeded`），`DeleteItem` 无此限制（分片执行）；其中**请求 `MimeContent`（`IncludeMimeContent`）时单次最多重建 20 封**（其余只回元数据，客户端可按需再取），且一次响应内重建的附件总量受 `EWS_MAX_TOTAL_ATT_BYTES`（默认 `2 ×` `EWS_MAX_ATT_BYTES`）限制，超出的附件被跳过。
+- **请求体上限**：单次 POST 的 XML 请求体上限 40MB；服务端在读体前按 `Content-Length` 预检、缺失长度时按流式累计字节，超限直接返回 `413`。
+- **认证缓存**：EWS 认证结果在 KV 缓存 5 分钟（缓存键为带 `jwt_secret` 加盐的 SHA-256，`jwt_secret` 未配置时退化为不加盐并打日志，生产必配），修改密码后最多 5 分钟内旧密码仍可通过 EWS 认证（Web/JWT 侧不受影响）。
 - **无推送通知**：未实现 `Subscribe/GetEvents/StreamingSubscription`，Thunderbird 会自动降级为定时轮询（`SyncFolderItems`），不消耗长连接。
 
 ### 四、不支持的功能
@@ -209,9 +210,12 @@ Body: {"secret":"<你的 INIT_SECRET>"}
 - 日历、会议、联系人、自动回复（OOF）、`ResolveNames`、`GetUserAvailability`、`ConvertId` 等非邮件操作；
 - 附件直读签名与 COS 回退逻辑不受影响：EWS 侧复用了 Web 端同一套存储读取（r2-service），COS 故障期间回退 KV。
 
+> **物理删除的同步已被 tombstone 机制覆盖**：附件彻底删除、自动清理等**服务器主动物理删除**的邮件，会在 **30 天内**通过增量同步（`SyncFolderItems`）以 `Delete` 事件下发给 Thunderbird，客户端不会残留「幽灵邮件」；`ews_tombstone` 表由每日定时任务清理 30 天前的记录（超过 30 天未同步过的客户端需重新同步）。
+
 ### 五、排错
 
-- `401 Unauthorized`：邮箱或密码错误（用户名必须是 CloudMail 登录邮箱，不是别名账户）；同 IP 连续 5 次失败会被锁 10 分钟。
+- `401 Unauthorized`：邮箱或密码错误（用户名必须是 CloudMail 登录邮箱，不是别名账户）；同 IP 连续 10 次失败会被锁 5 分钟，凭据错误的响应带约 1 秒失败延迟（防爆破）。锁定计时以最后一次失败起算，重试会续期——被锁后请等待而不是连续重试。
+- `413`：请求体超过 40MB（服务端在读体前就拒绝，不会把整个 body 读进内存）。
 - `ErrorInternalServerError ... v4_4DB`：数据库未执行升级，见「一、升级后先执行数据库迁移」。
 - `ErrorFolderNotFound`：请求了 CloudMail 不存在的文件夹（仅支持上述五个文件夹）。
 - 邮件正文/附件缺失：多为附件超过 `EWS_MAX_ATT_BYTES`（见「三、Free 计划限制」）。

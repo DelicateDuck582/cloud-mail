@@ -16,9 +16,10 @@ export const EWS_SYNC_PAGE = 50;
 // 5 分钟：缓存键含 jwt_secret 加盐，密码变更/封禁最多 5 分钟后对 EWS 生效
 export const EWS_AUTH_CACHE_TTL = 300;
 
-// 认证防爆破：同 IP 失败 EWS_AUTH_FAIL_MAX 次后锁 EWS_AUTH_FAIL_WINDOW_MS（与 login-service 同规格）
-export const EWS_AUTH_FAIL_MAX = 5;
-export const EWS_AUTH_FAIL_WINDOW_MS = 10 * 60 * 1000;
+// 认证防爆破：同 IP 失败 EWS_AUTH_FAIL_MAX 次后锁 EWS_AUTH_FAIL_WINDOW_MS
+// 阈值比 login-service 宽松（10 次 / 5 分钟）：EWS 客户端（Thunderbird）重试频繁，过严易误伤正常用户
+export const EWS_AUTH_FAIL_MAX = 10;
+export const EWS_AUTH_FAIL_WINDOW_MS = 5 * 60 * 1000;
 export const EWS_AUTH_FAIL_MAP_MAX = 10000;
 
 // 凭据错误时的响应延迟（毫秒）：与 login-service 的失败延迟对齐，抬高在线爆破成本
