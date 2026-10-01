@@ -2,6 +2,13 @@ import { S3Client, PutObjectCommand, DeleteObjectsCommand, GetObjectCommand, Lis
 import settingService from './setting-service';
 import domainUtils from '../utils/domain-uitls';
 import { settingConst } from '../const/entity-const';
+
+// COS 实际用量 KV 缓存（用量统计允许滞后，避免每次请求都全量扫描 bucket）
+const COS_USAGE_CACHE_KEY = 'cos_usage_cache';
+const COS_USAGE_CACHE_TTL = 6 * 60 * 60; // 6 小时（秒）
+// 单次扫描页数上限（每页 1000 对象，约 5 万对象），防止超大桶拖垮请求
+const COS_USAGE_MAX_PAGES = 50;
+
 const s3Service = {
 
 	async putObj(c, key, content, metadata) {
@@ -107,7 +114,20 @@ const s3Service = {
 	},
 
 	// 统计整个 bucket 的实际存储使用量（对象数 + 总大小，非配额）
+	// 命中 KV 缓存（6 小时）直接返回；扫描到页数上限时返回值带 incomplete: true 标记
 	async getBucketUsage(c) {
+
+		if (c.env?.kv) {
+			try {
+				const cached = await c.env.kv.get(COS_USAGE_CACHE_KEY, { type: 'json' });
+				if (cached && typeof cached.count === 'number') {
+					return cached;
+				}
+			} catch (e) {
+				console.error('COS usage cache read error:', e);
+			}
+		}
+
 		const client = await this.client(c);
 		const { bucket } = await settingService.query(c);
 
@@ -115,10 +135,12 @@ const s3Service = {
 		let totalSize = 0;
 		let continuationToken;
 		let pages = 0;
+		let incomplete = false;
 
 		do {
-			// 页数保护：最多遍历 1000 页（约 100 万对象），防止超大桶导致请求超时
-			if (++pages > 1000) {
+			// 页数保护：最多遍历 50 页（约 5 万对象），防止超大桶导致请求超时
+			if (++pages > COS_USAGE_MAX_PAGES) {
+				incomplete = true;
 				break;
 			}
 			const params = { Bucket: bucket, MaxKeys: 1000 };
@@ -133,7 +155,17 @@ const s3Service = {
 			continuationToken = result.IsTruncated ? result.NextContinuationToken : undefined;
 		} while (continuationToken);
 
-		return { count, totalSize };
+		const usage = incomplete ? { count, totalSize, incomplete: true } : { count, totalSize };
+
+		if (c.env?.kv) {
+			try {
+				await c.env.kv.put(COS_USAGE_CACHE_KEY, JSON.stringify(usage), { expirationTtl: COS_USAGE_CACHE_TTL });
+			} catch (e) {
+				console.error('COS usage cache write error:', e);
+			}
+		}
+
+		return usage;
 	}
 }
 

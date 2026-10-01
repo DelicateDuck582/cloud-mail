@@ -26,6 +26,16 @@ import telegramService from './telegram-service';
 import signUtils from '../utils/sign-utils';
 import { sanitizeDocument } from '../utils/html-sanitize';
 
+// D1 单条语句最多 100 个绑定参数，inArray 统一按 90 分片，留安全余量
+const SQL_BIND_LIMIT = 90;
+const chunkArray = (list, size) => {
+	const result = [];
+	for (let i = 0; i < list.length; i += size) {
+		result.push(list.slice(i, i + size));
+	}
+	return result;
+};
+
 const emailService = {
 
 	async list(c, params, userId) {
@@ -237,27 +247,32 @@ const emailService = {
 
 		// 上游 v3.1.0：开启「同步删除」时，删除 = 直接物理删除（服务器/本地同步清理）
 		if (syncDelete === settingConst.syncDelete.OPEN) {
-			const owned = await orm(c).select({ emailId: email.emailId }).from(email)
-				.where(and(eq(email.userId, userId), inArray(email.emailId, emailIdList)))
-				.all();
-			const ownedIds = owned.map(row => row.emailId);
-			if (ownedIds.length) {
-				await this.physicsDelete(c, { emailIds: ownedIds.join(',') });
+			const owned = [];
+			for (const chunk of chunkArray(emailIdList, SQL_BIND_LIMIT)) {
+				const rows = await orm(c).select({ emailId: email.emailId }).from(email)
+					.where(and(eq(email.userId, userId), inArray(email.emailId, chunk)))
+					.all();
+				owned.push(...rows.map(row => row.emailId));
+			}
+			if (owned.length) {
+				await this.physicsDelete(c, { emailIds: owned.join(',') });
 			}
 			return;
 		}
 
 		// 邮件软删除：进垃圾桶（trash=1，记录删除时间），与附件垃圾桶机制一致（7 天后自动清理）
 		const now = dayjs().format('YYYY-MM-DD HH:mm:ss');
-		await orm(c).update(email).set({ trash: 1, trashTime: now }).where(
-			and(
-				eq(email.userId, userId),
-				inArray(email.emailId, emailIdList)))
-			.run();
+		for (const chunk of chunkArray(emailIdList, SQL_BIND_LIMIT)) {
+			await orm(c).update(email).set({ trash: 1, trashTime: now, updateTime: now }).where(
+				and(
+					eq(email.userId, userId),
+					inArray(email.emailId, chunk)))
+				.run();
 
-		// 连带将关联附件也移入垃圾桶（仅限本人附件）
-		await orm(c).update(att).set({ trash: 1, trashTime: now })
-			.where(and(inArray(att.emailId, emailIdList), eq(att.trash, 0), eq(att.userId, userId))).run();
+			// 连带将关联附件也移入垃圾桶（仅限本人附件）
+			await orm(c).update(att).set({ trash: 1, trashTime: now })
+				.where(and(inArray(att.emailId, chunk), eq(att.trash, 0), eq(att.userId, userId))).run();
+		}
 	},
 
 	// 恢复垃圾桶邮件：邮件恢复 + 连带恢复关联附件（删除时间机制与附件一致）
@@ -267,19 +282,24 @@ const emailService = {
 			return;
 		}
 		const emailIdList = emailIds.split(',').map(Number);
+		const now = dayjs().format('YYYY-MM-DD HH:mm:ss');
 
-		await orm(c).update(email).set({ trash: 0, trashTime: null }).where(
-			and(
-				eq(email.userId, userId),
-				inArray(email.emailId, emailIdList)))
-			.run();
+		for (const chunk of chunkArray(emailIdList, SQL_BIND_LIMIT)) {
+			await orm(c).update(email).set({ trash: 0, trashTime: null, updateTime: now }).where(
+				and(
+					eq(email.userId, userId),
+					inArray(email.emailId, chunk)))
+				.run();
 
-		await orm(c).update(att).set({ trash: 0, trashTime: null })
-			.where(and(inArray(att.emailId, emailIdList), eq(att.trash, 1), eq(att.userId, userId))).run();
+			await orm(c).update(att).set({ trash: 0, trashTime: null })
+				.where(and(inArray(att.emailId, chunk), eq(att.trash, 1), eq(att.userId, userId))).run();
+		}
 	},
 
 	receive(c, params, cidAttList, r2domain) {
 		params.content = this.imgReplace(params.content, cidAttList, r2domain)
+		// EWS 增量同步水位：新邮件初始水位 = 入库时间（TEXT，与 create_time 同格式）
+		params.updateTime = dayjs().format('YYYY-MM-DD HH:mm:ss');
 		return orm(c).insert(email).values({ ...params }).returning().get();
 	},
 
@@ -476,7 +496,8 @@ const emailService = {
 			await userService.incrUserSendCount(c, receiveEmail.length, userId);
 		}
 
-		//保存到数据库并返回结果
+		//保存到数据库并返回结果（update_time：EWS 增量水位初始 = 发信时间）
+		emailData.updateTime = dayjs().format('YYYY-MM-DD HH:mm:ss');
 		const emailResult = await orm(c).insert(email).values(emailData).returning().get();
 
 		//保存内嵌附件
@@ -684,8 +705,12 @@ const emailService = {
 
 		const { noRecipient  } = await settingService.query(c);
 
-		//查询所有收件人账号信息
-		let accountList = await orm(c).select().from(account).where(inArray(account.email, receiveEmail)).all();
+		//查询所有收件人账号信息（收件人列表来自外部邮件，按 D1 参数上限分片）
+		let accountList = [];
+		for (const chunk of chunkArray(receiveEmail, SQL_BIND_LIMIT)) {
+			const rows = await orm(c).select().from(account).where(inArray(account.email, chunk)).all();
+			accountList.push(...rows);
+		}
 
 		// 对于含+未精确匹配的收件人，获取基础地址账号
 		const plusEmails = receiveEmail.filter(
@@ -699,8 +724,12 @@ const emailService = {
 			const existing = new Set(accountList.map(a => a.email));
 			const needed = baseEmails.filter(e => !existing.has(e));
 			if (needed.length > 0) {
-				const rows = await orm(c).select().from(account)
-					.where(inArray(account.email, needed)).all();
+				const rows = [];
+				for (const chunk of chunkArray(needed, SQL_BIND_LIMIT)) {
+					const part = await orm(c).select().from(account)
+						.where(inArray(account.email, chunk)).all();
+					rows.push(...part);
+				}
 				baseAccounts.push(...rows);
 			}
 		}
@@ -786,6 +815,7 @@ const emailService = {
 
 		for (const emailData of receiveEmailList) {
 
+			emailData.updateTime = dayjs().format('YYYY-MM-DD HH:mm:ss');
 			const emailRow = await orm(c).insert(email).values(emailData).returning().get();
 
 			//设置附件保存
@@ -911,12 +941,16 @@ const emailService = {
 		emailIds = emailIds.split(',').map(Number);
 		await attService.removeByEmailIds(c, emailIds);
 		await starService.removeByEmailIds(c, emailIds);
-		await orm(c).delete(email).where(inArray(email.emailId, emailIds)).run();
+		for (const chunk of chunkArray(emailIds, SQL_BIND_LIMIT)) {
+			await orm(c).delete(email).where(inArray(email.emailId, chunk)).run();
+		}
 	},
 
 	async physicsDeleteUserIds(c, userIds) {
 		await attService.removeByUserIds(c, userIds);
-		await orm(c).delete(email).where(inArray(email.userId, userIds)).run();
+		for (const chunk of chunkArray(userIds, SQL_BIND_LIMIT)) {
+			await orm(c).delete(email).where(inArray(email.userId, chunk)).run();
+		}
 	},
 
 	updateEmailStatus(c, params) {
@@ -928,19 +962,23 @@ const emailService = {
 	},
 
 	async selectUserEmailCountList(c, userIds, type, del = isDel.NORMAL) {
-		const result = await orm(c)
-			.select({
-				userId: email.userId,
-				count: count(email.emailId)
-			})
-			.from(email)
-			.where(and(
-				inArray(email.userId, userIds),
-				eq(email.type, type),
-				eq(email.isDel, del),
-				ne(email.status, emailConst.status.SAVING),
-			))
-			.groupBy(email.userId);
+		const result = [];
+		for (const chunk of chunkArray(userIds, SQL_BIND_LIMIT)) {
+			const part = await orm(c)
+				.select({
+					userId: email.userId,
+					count: count(email.emailId)
+				})
+				.from(email)
+				.where(and(
+					inArray(email.userId, chunk),
+					eq(email.type, type),
+					eq(email.isDel, del),
+					ne(email.status, emailConst.status.SAVING),
+				))
+				.groupBy(email.userId);
+			result.push(...part);
+		}
 		return result;
 	},
 
@@ -1064,6 +1102,7 @@ const emailService = {
 	},
 
 	//读邮件时给正文内嵌图片和附件列表统一追加短期签名
+	//安全：正文内嵌图签名按邮件归属（ownerUserId）过滤——非本人/非授权可见的 key 不签发，防 IDOR
 	async signEmailList(c, list) {
 
 		if (!list || list.length === 0) {
@@ -1075,7 +1114,7 @@ const emailService = {
 		await Promise.all(list.map(async emailRow => {
 
 			if (emailRow.content) {
-				emailRow.content = await signUtils.signContent(c, emailRow.content, r2Domain);
+				emailRow.content = await signUtils.signContent(c, emailRow.content, r2Domain, { allowedUserIds: [emailRow.userId] });
 			}
 
 			if (emailRow.attList && emailRow.attList.length > 0) {
@@ -1216,7 +1255,12 @@ const emailService = {
 
 	async read(c, params, userId) {
 		const { emailIds } = params;
-		await orm(c).update(email).set({ unread: emailConst.unread.READ }).where(and(eq(email.userId, userId), inArray(email.emailId, emailIds)));
+		const now = dayjs().format('YYYY-MM-DD HH:mm:ss');
+		const emailIdList = (emailIds || '').split(',').map(Number).filter(Boolean);
+		for (const chunk of chunkArray(emailIdList, SQL_BIND_LIMIT)) {
+			await orm(c).update(email).set({ unread: emailConst.unread.READ, updateTime: now })
+				.where(and(eq(email.userId, userId), inArray(email.emailId, chunk)));
+		}
 	}
 };
 

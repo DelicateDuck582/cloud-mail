@@ -68,11 +68,15 @@ const settingService = {
 
 	async get(c, showSiteKey = false) {
 
-		const [settingRow, recordList] = await Promise.all([
+		const [settingData, recordList] = await Promise.all([
 			await this.query(c),
 			verifyRecordService.selectListByIP(c)
 		]);
 
+		// 浅拷贝：掩码只作用于本次返回值，避免就地污染 c / KV 中缓存的 setting 对象
+		const settingRow = { ...settingData };
+		// resendTokens 是嵌套对象，掩码前单独拷贝，避免污染缓存中的原对象
+		settingRow.resendTokens = { ...(settingRow.resendTokens || {}) };
 
 		if (!showSiteKey) {
 			settingRow.siteKey = settingRow.siteKey ? `${settingRow.siteKey.slice(0, 6)}******` : null;

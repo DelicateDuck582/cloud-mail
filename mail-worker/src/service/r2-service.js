@@ -8,8 +8,18 @@ import kvObjService from './kv-obj-service';
 //   - 窗口过后自动重新探测 S3，COS 恢复后自动切回（无需重启/改配置）
 const S3_FAIL_WINDOW_MS = 5 * 60 * 1000; // 5 分钟
 let s3FailUntil = 0;
+// KV 删除批次：Workers 单次请求子请求数量有限，批量删除按 ≤10 一批串行执行，避免批量删除打爆上限
+const KV_DELETE_BATCH_SIZE = 10;
 
 const r2Service = {
+
+	// KV 批量删除：按 KV_DELETE_BATCH_SIZE 串行小批，并发受控（幂等，重复删除无副作用）
+	async deleteKvBatch(c, keys) {
+		const list = (typeof keys === 'string' ? [keys] : (keys || [])).filter(Boolean);
+		for (let i = 0; i < list.length; i += KV_DELETE_BATCH_SIZE) {
+			await kvObjService.deleteObj(c, list.slice(i, i + KV_DELETE_BATCH_SIZE));
+		}
+	},
 
 	isS3Healthy() {
 		return Date.now() >= s3FailUntil;
@@ -139,7 +149,7 @@ const r2Service = {
 		const storageType = await this.storageType(c);
 
 		if (storageType === 'KV') {
-			await kvObjService.deleteObj(c, key);
+			await this.deleteKvBatch(c, key);
 			return;
 		}
 
@@ -152,12 +162,12 @@ const r2Service = {
 			await s3Service.deleteObj(c, key);
 		} catch (e) {
 			this.markS3Failed();
-			await kvObjService.deleteObj(c, key);
+			await this.deleteKvBatch(c, key);
 			return;
 		}
 
 		// 双删：清理可能残留的 KV 回退副本（幂等）
-		await kvObjService.deleteObj(c, key);
+		await this.deleteKvBatch(c, key);
 	},
 
 	// cron 批量回迁：COS 恢复后，把回退期间写入 KV 的附件逐批迁回 COS 并删除 KV，释放空间。
