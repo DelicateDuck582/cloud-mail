@@ -59,40 +59,17 @@
 
 ## 本项目新增功能（Fork 增强）
 
-#### **这是由AI编写的增强功能。本人只是小白，按照自己的想法与实际用到的功能让AI编写的**
+> 这是按照个人使用需求、由 AI 编写的增强功能。安全加固与安全审计的完整说明见 [doc/](doc/)。
 
-本仓库在 upstream 基础上增加了以下自定义功能：
-
-- **🔐 附件签名防伪造**：COS/S3 私有桶存储，附件访问使用后端签发的短期 HMAC 签名（默认 15 分钟有效）+ Referer/Sec-Fetch 双层校验，防止盗链与伪造访问；直读代理 Worker（cos-exchange）验签通过后用 Cache API 按文件缓存（附件 key 为内容哈希，缓存 7 天，文件不变即最多每 7 天回源一次）。改造说明见 [doc/签名防伪造改造说明.md](doc/签名防伪造改造说明.md)，代理 Worker 代码见 [doc/cos-proxy-worker.js](doc/cos-proxy-worker.js)
-- **📁 附件管理器**：独立的附件管理页面
-  
-  - 「全部 / 垃圾桶」双选项卡
-  - **按文件（内容哈希）分组展示**，可展开二级表格查看每个用户的引用明细，支持单用户操作（定位邮件 / 删除 / 恢复）
-  - 类型自动识别显示（`附件-图片` / `附件-Word文档` / `附件-PDF` / `附件-压缩包` 等，按扩展名）
-  - 工具栏操作按钮常驻（预览 / 下载 / 删除 / 恢复 / 彻底删除），未选择附件时给出提示
-  - 管理员可按用户筛选，显示所属用户与权限组
-  - 点击文件名可直接预览（移动端友好）
-  - 响应式布局，表格在容器内滚动不溢出
-- **🗑️ 邮件与附件垃圾桶机制**：删除 = 移入垃圾桶（软删除，原文件不受影响），记录删除时间，7 天后系统自动彻底清理；删除附件会连带邮件一起进垃圾桶，恢复附件也会连带恢复邮件；邮件删除同样进垃圾桶并支持恢复；**仅超级管理员可彻底删除**
-- **📊 COS 使用量统计**：附件管理页展示附件占用 / COS 实际存储 / 已用 / 总量 / 剩余，可配置总容量（GB）与 S3 到期时间（过期红色提醒）
-- **👥 权限组（安全组）**：被授予 `all-email:query` 权限的角色可查看全部用户的邮件与附件，可管理（软删 / 恢复）任意附件，但**不能彻底删除垃圾桶**（该操作仅限超级管理员）
-- **✍️ HTML 签名**：个人设置中配置 HTML 个性签名（如 QQ 邮箱签名卡），新建邮件时自动插入编辑器
-- **📏 附件大小限制**：发送时附件超过 28MB 前端直接提示超限（适配 Resend 整封邮件 40MB、base64 后的实际上限）
-- **🛡️ 安全加固**：
-  - 修复默认角色被误授 `all-email:query`（全站邮件/附件查看）权限的问题
-  - 附件直读端点（`/api/oss`、`/attachments`）强制 HMAC 签名校验，防止绕过签名防伪系统
-  - 无权限的删除 / 恢复操作明确返回 403（不再静默成功）
-  - 邮件删除 / 恢复接口纳入权限中间件与归属校验
-  - COS 用量遍历增加页数上限，错误响应不泄露内部信息
-  - 附件直读代理 Worker（cos-exchange）修复含空格 / Unicode 文件名的签名校验，并对已签名请求放宽 Referer / Sec-Fetch 校验（兼容邮件客户端）
-  - **邮件内容 XSS 防护**：邮件 HTML 在入库时用白名单清洗（linkedom）：移除 `script` / `iframe` / `object` / `embed` / `svg` / `math` / 表单控件、所有 `on*` 事件属性、`javascript:` / `vbscript:` / `data:text/html` 等危险 URL 与危险 CSS；前端渲染（ShadowHtml 详情、回复/转发注入、TG 预览页、签名预览）再做一次同规则清洗兜底旧数据
-- **📋 安全审计记录（2026-08-18 第三轮）**：
-  - **🔴 高危（已修复）**：Resend Webhook Svix 验签解析 bug —— 原实现 `sigHeader.split(' ').includes(sigB64)` 把 `"v1,<签名>"` 整体与裸签名比较，配置 `RESEND_SIGNING_SECRET` 后**所有 webhook 均 401**（送达/退信/已读回执等状态更新全部失效）；已修复为解析 `v1,` 前缀 + `.some()` 支持多签名 token（密钥轮换）+ **恒定时间比较**（`timingSafeEqual`，防时序侧信道）
-  - **📧 已读回执（新功能）**：webhook 支持 `email.opened` / `email.clicked` → 邮件状态标记「已读」（`OPENED=9`），前端已发送列表新增「已读 👁」图标；**未处理事件**（`email.received` / `email.sent` 等）直接忽略、不再误改状态；**状态只升不降**（已读 9 之后迟到的 delivered 2 不会回退覆盖）
-  - **✅ 复核确认安全**：CORS 白名单、`/init` 独立 INIT_SECRET + per-IP 限流、`/oss` + `/attachments` 附件直读 HMAC 签名、TG 预览 token 7 天 TTL + `Cache-Control: no-store`、public token 24h TTL 仅超管签发、登录防爆破（5 次/10 分钟 + 延迟）、`crypto.getRandomValues` 密码学随机、注册/加号 Turnstile + per-IP 验证记录、入站邮件 25MB/20 附件上限、发信前附件数量限制、发信限额/账号归属/域名权限校验、SQL 全参数化（drizzle / `prepare().bind()`）、全局错误脱敏、邮件 XSS 入库清洗 + 前端渲染兜底
-  - **⚠️ 部署要求**：**必须在 Cloudflare 环境变量配置 `RESEND_SIGNING_SECRET`**（= Resend Webhooks 的 Signing secret），否则 webhook 未验签、邮件状态可被伪造；**所有密钥类环境变量不要写入 `wrangler.toml` / 不要提交到 git**（本地开发用 `wrangler-dev.toml`，已被 gitignore）
-  - **☁️ COS 专项审计（2026-08-18）**：附件直读三层防护复核通过（COS 私有桶 + HMAC 短期签名 + 代理 Worker 路径白名单）；修复**中风险**：`/attachments/*` 与 `/browse/api/file` 响应原带 `Cache-Control: public, max-age=604800`，会让 Cloudflare 边缘 HTTP 缓存按完整 URL（含 query）缓存 → 签名过期后 7 天内旧 URL 仍可**直接命中边缘缓存，绕过 Worker 验签 / 网盘密码**。已改为 `private`（仅浏览器缓存、禁用共享缓存），内部 Cache API 7 天缓存不受影响；另给 mail-worker `/oss/*` 直读加 **per-IP 限流（120 次/分）**，防已登录用户反复拉取自己附件刷 COS 下行流量。⚠️ 部署注意：COS 桶必须保持**私有读写**；`ATT_SIGN_SECRET` / `BROWSE_PASS` 不得泄露；旧版 `cos-browser-worker`（files.* 子域名）若未下线，请确认已设置 `BROWSE_PASS`
-
+- **🔐 附件签名防伪造**：COS/S3 私有桶 + 后端签发的短期 HMAC 签名 + Referer/Sec-Fetch 双层校验 + 代理 Worker（cos-exchange）验签与按内容哈希缓存，防盗链防伪造（详见 [doc/签名防伪造改造说明.md](doc/签名防伪造改造说明.md)）
+- **📁 附件管理器**：按文件内容哈希分组展示，支持预览 / 下载 / 删除 / 恢复 / 彻底删除与管理员按用户筛选
+- **🗑️ 垃圾桶机制**：邮件与附件删除均进垃圾桶（软删除，7 天后自动彻底清理），支持恢复；仅超级管理员可彻底删除
+- **📊 COS 使用量统计**：附件占用 / COS 实际存储 / 剩余容量可视化，可配置总容量（GB）与到期红色提醒
+- **👥 权限组（安全组）**：`all-email:query` 角色可查看 / 管理全部用户邮件与附件，彻底删除仅限超级管理员
+- **✍️ HTML 签名**：个人设置中配置 HTML 个性签名，新建邮件时自动插入编辑器
+- **📏 附件大小限制**：发送时附件超过 28MB 前端直接提示超限（适配 Resend 40MB 上限）
+- **🛡️ 安全加固**：邮件 HTML 入库白名单清洗 + 前端渲染兜底、附件直读端点强制 HMAC 签名校验、权限中间件与归属校验、Svix Webhook 恒定时间验签、登录 / 附件直读限流、边缘缓存防绕过等（完整清单见 [doc/安全审计修复记录-2026-08-29.md](doc/安全审计修复记录-2026-08-29.md) 与 [doc/审计报告-COS-EWS-2026-10.md](doc/审计报告-COS-EWS-2026-10.md)）
+- **📥 Thunderbird 接入（EWS）**：内置 EWS 兼容端点，Thunderbird 145+ 可直接以「Exchange」账号收发邮件，支持按收件地址分文件夹（详见 [doc/EWS-Thunderbird.md](doc/EWS-Thunderbird.md)）
 
 ## 技术栈
 
@@ -169,54 +146,11 @@ cloud-mail
 
 CloudMail 内置 EWS（Exchange Web Services）兼容端点，**Thunderbird 145+** 可直接以「Exchange」账号接入收发邮件，无需插件、无需额外开启 IMAP/SMTP。端点地址为 `https://<你的mail域名>/EWS/Exchange.asmx`（大小写不敏感）。
 
-### 一、升级后先执行数据库迁移
-
-EWS 依赖 v4_4DB 迁移（`ews_sync_state` 同步水位表 + `email.update_time` 增量列 + `ews_tombstone` 物理删除事件表），部署新版 Worker 后调用一次初始化接口即可（幂等，可重复执行）：
+部署新版 Worker 后需调用一次初始化接口完成数据库迁移（幂等，可重复执行）：
 
 ```
 POST https://<你的Worker域名>/api/init
 Body: {"secret":"<你的 INIT_SECRET>"}
 ```
 
-### 二、Thunderbird 配置步骤
-
-1. Thunderbird →「账户设置」→「账户操作」→「添加邮件账户」；
-2. 输入姓名、CloudMail 登录邮箱、密码，点击「继续」，若自动探测失败选择「手动配置（Manual config）」；
-3. 传入协议选择 **Exchange**（不要选 IMAP/POP）；
-4. **服务器 URL** 填 `https://<你的mail域名>/EWS/Exchange.asmx`；
-5. 用户名 = CloudMail 登录邮箱，密码 = 登录密码，认证方式为「普通密码 / Normal password」（即 HTTP Basic）；
-6. 完成后可见 Inbox / Sent Items / Deleted Items / Drafts / Outbox 五个文件夹。
-
-> 本实现**不提供 Autodiscover**（`/autodiscover/autodiscover.xml`），必须手动填写 EWS 服务器 URL。
-
-### 三、Free 计划限制
-
-- **附件大小**：经 EWS 收发/读取的单个附件（含内嵌图）默认上限 **1MB**，可用环境变量 `EWS_MAX_ATT_BYTES`（字节）放大，付费计划（CPU 更宽裕）建议放宽；超过上限的附件在 Web 端正常收发，仅 EWS 通道受限：
-  - 发送：超过上限直接报错 `Attachment is too large for EWS ... Please send it from the CloudMail web client.`；
-  - 收取：重建 MIME 时超限附件会被跳过（正文与其它附件正常显示）；`GetAttachment` 超限返回 Fault 提示改用 Web 端下载。
-- **同步分页**：单次 `SyncFolderItems` 最多返回 50 封邮件的变更，邮件很多时 Thunderbird 会自动翻页拉取，首轮同步稍慢。
-- **批量上限**：单次 `GetItem` / `GetAttachment` 最多 200 个 Id（超出返回 `ErrorMaxBatchSizeExceeded`），`DeleteItem` 无此限制（分片执行）；其中**请求 `MimeContent`（`IncludeMimeContent`）时单次最多重建 20 封**（其余只回元数据，客户端可按需再取），且一次响应内重建的附件总量受 `EWS_MAX_TOTAL_ATT_BYTES`（默认 `2 ×` `EWS_MAX_ATT_BYTES`）限制，超出的附件被跳过。
-- **请求体上限**：单次 POST 的 XML 请求体上限 40MB；服务端在读体前按 `Content-Length` 预检、缺失长度时按流式累计字节，超限直接返回 `413`。
-- **认证缓存**：EWS 认证结果在 KV 缓存 5 分钟（缓存键为带 `jwt_secret` 加盐的 SHA-256，`jwt_secret` 未配置时退化为不加盐并打日志，生产必配），修改密码后最多 5 分钟内旧密码仍可通过 EWS 认证（Web/JWT 侧不受影响）。
-- **无推送通知**：未实现 `Subscribe/GetEvents/StreamingSubscription`，Thunderbird 会自动降级为定时轮询（`SyncFolderItems`），不消耗长连接。
-
-### 四、不支持的功能
-
-以下操作统一返回 `ErrorNotImplemented` SOAP Fault（Thunderbird 会容忍并降级）：
-
-- 推送通知与事件订阅（Subscribe / Unsubscribe / GetEvents / StreamingSubscription）；
-- 草稿写入（`CreateItem MessageDisposition="SaveOnly"`，收发信正常，但草稿箱只读/为空）；
-- 服务器端搜索与查找（FindItem / FindFolder / SearchMailboxes）、移动/复制邮件（MoveItem / CopyItem）；
-- 日历、会议、联系人、自动回复（OOF）、`ResolveNames`、`GetUserAvailability`、`ConvertId` 等非邮件操作；
-- 附件直读签名与 COS 回退逻辑不受影响：EWS 侧复用了 Web 端同一套存储读取（r2-service），COS 故障期间回退 KV。
-
-> **物理删除的同步已被 tombstone 机制覆盖**：附件彻底删除、自动清理等**服务器主动物理删除**的邮件，会在 **30 天内**通过增量同步（`SyncFolderItems`）以 `Delete` 事件下发给 Thunderbird，客户端不会残留「幽灵邮件」；`ews_tombstone` 表由每日定时任务清理 30 天前的记录（超过 30 天未同步过的客户端需重新同步）。
-
-### 五、排错
-
-- `401 Unauthorized`：邮箱或密码错误（用户名必须是 CloudMail 登录邮箱，不是别名账户）；同 IP 连续 10 次失败会被锁 5 分钟，凭据错误的响应带约 1 秒失败延迟（防爆破）。锁定计时以最后一次失败起算，重试会续期——被锁后请等待而不是连续重试。
-- `413`：请求体超过 40MB（服务端在读体前就拒绝，不会把整个 body 读进内存）。
-- `ErrorInternalServerError ... v4_4DB`：数据库未执行升级，见「一、升级后先执行数据库迁移」。
-- `ErrorFolderNotFound`：请求了 CloudMail 不存在的文件夹（仅支持上述五个文件夹）。
-- 邮件正文/附件缺失：多为附件超过 `EWS_MAX_ATT_BYTES`（见「三、Free 计划限制」）。
-
+配置步骤、账号文件夹机制、Free 计划限制、不支持的功能与排错，详见 [doc/EWS-Thunderbird.md](doc/EWS-Thunderbird.md)。
