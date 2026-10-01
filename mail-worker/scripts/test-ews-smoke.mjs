@@ -4,17 +4,27 @@
  *   cd mail-worker && node --no-warnings scripts/test-ews-smoke.mjs
  *
  * 覆盖 TB 真实会发出的 SOAP 请求解析、响应模板结构与转义（含 XML 良构校验）、
- * SyncState 编解码、base64 工具、CreateItem 的 cid→data: 内嵌图还原、MimeContent 集成。
+ * SyncState 编解码、base64 工具、CreateItem 的 cid→data: 内嵌图还原、MimeContent 集成、
+ * 请求体大小护栏、MimeContent/附件字节护栏、物理删除 tombstone 的 Delete 事件映射、
+ * 以及 dispatch 对原型链操作名（toString）返回标准 Fault。
  *
  * 只依赖 fast-xml-parser（package.json dependencies）：
- *   - xml.js / protocol.js / const.js 无项目依赖，可直接 file URL import；
- *   - handlers.js / router.js 依赖 hono/drizzle 等，本脚本不 import（由 wrangler 打包验证）。
+ *   - xml.js / protocol.js / const.js / request-guard.js 无项目依赖，可直接 file URL import；
+ *   - handlers.js 依赖 hono/drizzle 等，只在「17. dispatch 原型链」一例里动态 import：
+ *     项目内大量 import 省略了 .js 扩展名（wrangler 打包能解析、node 不能），该用例用
+ *     node:module 的 resolve hook（data: URL 内联注册）补一次 .js 后缀再 import，
+ *     从而对真实的 dispatch 做断言。
  */
 
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
+import { register } from 'node:module';
 import { XMLParser, XMLValidator } from 'fast-xml-parser';
 
 import {
+	EWS_AUTH_CACHE_TTL,
+	EWS_AUTH_FAIL_DELAY_MS,
+	EWS_MAX_MIME_ITEM_IDS,
 	EWS_SYNC_PAGE,
 	ewsFolderDef,
 	ewsMaxAttBytes,
@@ -35,6 +45,7 @@ import {
 	textOf
 } from '../src/ews/xml.js';
 import {
+	attBudgetAllows,
 	base64DecodedSize,
 	base64EncodeBytes,
 	base64ToBytes,
@@ -49,13 +60,17 @@ import {
 	isInlineAttachment,
 	isUnreadRow,
 	isVisibleInFolder,
+	mimeContentIdSet,
 	parseAddressList,
 	parseMailboxList,
 	rowRecipients,
+	selectTombstoneDeletes,
 	splitOutgoingAttachments,
 	stripCidBrackets,
-	toIso
+	toIso,
+	tombstoneFolderToken
 } from '../src/ews/protocol.js';
+import { parseContentLength, precheckContentLength, readLimitedText } from '../src/ews/request-guard.js';
 import { buildMimeBase64 } from '../src/ews/mime-build.js';
 
 const cases = [];
@@ -81,6 +96,22 @@ function assertWellFormed(xml) {
 
 function envelopeFor(operation, body) {
 	return soapEnvelope(operationResponse(operation, body));
+}
+
+/**
+ * handlers.js / router.js 的传递依赖里大量 import 省略 .js 扩展名（wrangler 打包能解析、node 不能），
+ * 注册一次 resolve hook 补后缀，让 node 也能 import 真实模块做断言。
+ */
+let resolveHookReady = false;
+function ensureNodeResolveHook() {
+	if (resolveHookReady) return;
+	const hook = `export async function resolve(specifier, context, next) {
+  if (specifier.startsWith('node:') || specifier.startsWith('file:') || specifier.startsWith('data:')) return next(specifier, context);
+  try { return await next(specifier, context); }
+  catch (e) { try { return await next(specifier + '.js', context); } catch (e2) { throw e; } }
+}`;
+	register('data:text/javascript,' + encodeURIComponent(hook));
+	resolveHookReady = true;
 }
 
 // ------------------------------------------------------- 1. 请求解析（TB 原样）
@@ -532,12 +563,451 @@ testCase('15. SyncFolderItems 增量分类：Create / Update / Delete / 忽略',
 	assert.equal(isUnreadRow({ unread: 1 }), false);
 });
 
+// ------------------------------------------------ 16. 请求体大小护栏 ---------
+
+testCase('16. 请求体大小护栏：Content-Length 预检 + 流式累计字节（超限中止读取）', async () => {
+	const LIMIT = 1024;
+
+	// Content-Length 解析：只有纯十进制才是「可信」
+	assert.equal(parseContentLength('2048'), 2048);
+	assert.equal(parseContentLength(' 2048 '), 2048, '空白被忽略');
+	assert.equal(parseContentLength(null), null);
+	assert.equal(parseContentLength(undefined), null);
+	assert.equal(parseContentLength(''), null);
+	assert.equal(parseContentLength('abc'), null);
+	assert.equal(parseContentLength('-1'), null);
+	assert.equal(parseContentLength('1024, 1024'), null, '多值 Content-Length 视为不可信');
+
+	assert.equal(precheckContentLength(String(LIMIT + 1), LIMIT).state, 'too-large', '超过上限 → 直接 413（不读体）');
+	assert.equal(precheckContentLength(String(LIMIT), LIMIT).state, 'ok', '恰好等于上限：放行');
+	assert.equal(precheckContentLength(null, LIMIT).state, 'unknown', '缺失 Content-Length → 必须流式计数');
+	assert.equal(precheckContentLength('abc', LIMIT).state, 'unknown', '不可信 Content-Length → 同样走流式计数');
+
+	// 无 Content-Length（chunked）：逐块累计字节，超限立即中止（第 3 个 chunk 不会被读取）
+	let chunksRead = 0;
+	const oversize = new ReadableStream({
+		pull(controller) {
+			chunksRead++;
+			if (chunksRead > 3) {
+				controller.close();
+				return;
+			}
+			controller.enqueue(new Uint8Array(700).fill(0x41));
+		}
+	});
+	const tooBig = await readLimitedText(oversize, LIMIT);
+	assert.equal(tooBig.tooLarge, true);
+	assert.equal(tooBig.bytes, 1400, '累计 700 + 700 即超限');
+	assert.equal(chunksRead, 2, '超限后不再读下一个 chunk（内存占用有界）');
+
+	// 未超限：完整读回（含多字节字符按字节计数）
+	const ok = await readLimitedText(new Blob(['<soap:Envelope/>']).stream(), LIMIT);
+	assert.equal(ok.text, '<soap:Envelope/>');
+	const wide = await readLimitedText(new Blob(['中'.repeat(400)]).stream(), LIMIT);
+	assert.equal(wide.tooLarge, true, '按字节数（400 个 3 字节字符 = 1200 > 1024）而非字符数判定');
+	assert.equal(wide.bytes, 1200);
+	assert.deepEqual(await readLimitedText(null, LIMIT), { text: '' }, '无 body 视为空文本');
+});
+
+// ------------------------------------------- 17. dispatch 原型链操作名 ------
+
+testCase('17. dispatch：原型链操作名（toString）返回标准 Fault，而非非 XML 文本', async () => {
+	ensureNodeResolveHook();
+
+	const parsed = parseSoapRequest('<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"><soap:Body><toString/></soap:Body></soap:Envelope>');
+	assert.equal(parsed.error, undefined, '请求本身是合法 SOAP');
+	assert.equal(parsed.operation, 'toString', 'Body 首个元素名即操作名（原样保留，不折大小写）');
+
+	const { dispatch, EwsFault } = await import('../src/ews/handlers.js');
+
+	// 修复前：HANDLERS['toString'] 命中 Object.prototype.toString → 返回 '[object Object]'（非 XML）
+	await assert.rejects(() => dispatch({}, parsed, {}), (error) => {
+		assert.ok(error instanceof EwsFault, '必须是 EwsFault（router 会转成 SOAP Fault）');
+		assert.equal(error.responseCode, 'ErrorNotImplemented');
+		const xml = soapFault(error.responseCode, error.message);
+		assertWellFormed(xml);
+		assert.ok(xml.includes('<faultstring'), 'faultstring 存在');
+		assert.ok(xml.includes('ErrorNotImplemented'), 'Fault 带 ResponseCode');
+		return true;
+	});
+
+	// 正常操作名仍然命中真实 handler（GetFolder 缺 FolderIds → handler 内校验抛 Fault）
+	await assert.rejects(() => dispatch({}, { operation: 'GetFolder', payload: {} }, { userId: 1 }), (error) => {
+		assert.ok(error instanceof EwsFault);
+		assert.equal(error.responseCode, 'ErrorInvalidRequest', '真实 handler 被调用（不是原型链成员）');
+		return true;
+	});
+});
+
+// --------------------------------- 18. MimeContent / 附件字节护栏（纯函数） ---
+
+testCase('18. MimeContent 护栏：Id clamp ≤20 + 本次响应附件字节账本', () => {
+	assert.equal(EWS_MAX_MIME_ITEM_IDS, 20);
+
+	const ids = Array.from({ length: 25 }, (_, index) => index + 1);
+	const set = mimeContentIdSet(ids);
+	assert.equal(set.size, 20, '单次只重建 20 封 MimeContent');
+	assert.ok(set.has(20));
+	assert.equal(set.has(21), false, '第 21 个 Id 起只回元数据');
+	assert.equal(mimeContentIdSet(ids, 3).size, 3, '显式 limit 生效');
+	assert.equal(mimeContentIdSet([0, -1, 'x', Number.NaN, 5]).size, 1, '非法 Id 不入白名单');
+	assert.equal(mimeContentIdSet(ids, 0).size, 20, '非法 limit 回落到默认值');
+
+	const LIMIT = 2 * 1024 * 1024;
+	const budget = { total: 0, limit: LIMIT };
+	assert.equal(attBudgetAllows(budget, 1024 * 1024), true, '未到上限：放行');
+	budget.total += 1024 * 1024;
+	assert.equal(attBudgetAllows(budget, 1024 * 1024), true, '恰好用满：放行');
+	budget.total += 1024 * 1024;
+	assert.equal(attBudgetAllows(budget, 1), false, '累计到上限后剩余附件走跳过路径');
+	assert.equal(attBudgetAllows(budget, 0), true, 'size 未知（<=0）先放行，下载后按实际字节累加');
+	assert.equal(attBudgetAllows(budget, -5), true, '负数同样视为未知大小');
+	assert.equal(attBudgetAllows({ total: 0, limit: 0 }, 1024 ** 3), true, 'limit 非法 → 不设限');
+});
+
+// ------------------------------- 19. 物理删除 tombstone → Delete 事件 -------
+
+testCase('19. tombstone：文件夹映射 + 同轮去重 + Delete 事件 XML 良构', () => {
+	assert.equal(tombstoneFolderToken({ type: 0, trash: 0 }), 'inbox');
+	assert.equal(tombstoneFolderToken({ type: 1, trash: 0 }), 'sentitems');
+	assert.equal(tombstoneFolderToken({ type: 0, trash: 1 }), 'deleteditems', '进过垃圾桶的 → 垃圾桶文件夹');
+	assert.equal(tombstoneFolderToken({ type: 1, trash: 1 }), 'deleteditems');
+
+	const rows = [
+		{ email_id: 11, type: 0, trash: 0 },
+		{ email_id: 12, type: 1, trash: 0 },
+		{ email_id: 13, type: 0, trash: 1 },
+		{ email_id: 11, type: 0, trash: 0 },
+		{ email_id: 14, type: 0, trash: 0 }
+	];
+	assert.deepEqual(selectTombstoneDeletes('inbox', rows, new Set()), [11, 14], '只产出本文件夹 + tombstone 自身去重');
+	assert.deepEqual(selectTombstoneDeletes('sentitems', rows, new Set()), [12]);
+	assert.deepEqual(selectTombstoneDeletes('deleteditems', rows, new Set()), [13]);
+	assert.deepEqual(selectTombstoneDeletes('inbox', rows, new Set([14, 11])), [], '与同轮已产出的 ItemId 去重');
+	assert.deepEqual(selectTombstoneDeletes('inbox', [{ email_id: 0 }, { email_id: 'x' }], new Set()), [], '非法 Id 丢弃');
+	assert.deepEqual(selectTombstoneDeletes('inbox', null, null), [], '无 tombstone / 无已知集合也不炸');
+
+	// handlers.js 的 Delete 事件产出形态（同轮 Delete 与 tombstone Delete 同一模板）
+	const xml = envelopeFor('SyncFolderItems', responseMessage('SyncFolderItems', {
+		body: `<m:SyncState>${escapeXml(encodeSyncState(emptySyncState()))}</m:SyncState>` +
+			'<m:IncludesLastItemInRange>true</m:IncludesLastItemInRange>' +
+			'<m:Changes><t:Delete><t:ItemId Id="11"/></t:Delete><t:Delete><t:ItemId Id="14"/></t:Delete></m:Changes>'
+	}));
+	assertWellFormed(xml);
+	const back = parseBack.parse(xml).Envelope.Body.SyncFolderItemsResponse.ResponseMessages.SyncFolderItemsResponseMessage;
+	assert.deepEqual(asArray(back.Changes.Delete).map((node) => node.ItemId['@_Id']), ['11', '14'], 'Delete 事件带 ItemId');
+});
+
+// --------------------------- 20. IsInline 非 image/video 附件降级 ----------
+
+testCase('20. CreateItem：IsInline 的非 image/video 附件强制按普通附件发出', () => {
+	const content = base64EncodeBytes(Uint8Array.from([1, 2, 3, 4]));
+	const outgoing = [
+		{ name: 'invite.ics', mimeType: 'text/calendar', content, contentId: 'cal@cloud', isInline: true },
+		{ name: 'logo.png', mimeType: 'image/png', content, contentId: 'logo@cloud', isInline: true },
+		{ name: 'clip.mp4', mimeType: 'video/mp4', content, contentId: 'clip@cloud', isInline: true }
+	];
+	const html = '<img src="cid:logo@cloud"><video src="cid:clip@cloud"><span>cid:cal@cloud</span>';
+	const result = splitOutgoingAttachments(html, outgoing);
+
+	assert.ok(result.html.includes('cid:cal@cloud'), '非 image/video 的 IsInline 项不做 cid: → data: 替换');
+	assert.ok(!result.html.includes('data:text/calendar'), '不产生 data:text/calendar');
+	assert.deepEqual(result.attachments.map((a) => a.filename), ['invite.ics'], '降级为普通附件（附件本体不丢）');
+	assert.equal((result.html.match(/data:image\/png/g) || []).length, 1, '图片内联保持原行为');
+	assert.equal((result.html.match(/data:video\/mp4/g) || []).length, 1, 'video 内联为 IsInline 的合法类型');
+});
+
+// ---------------------------------------- 21. 认证护栏常量（TTL / 延迟） ----
+
+testCase('21. 常量：认证缓存 TTL 5 分钟 + 凭据错误延迟 1 秒', () => {
+	assert.equal(EWS_AUTH_CACHE_TTL, 300, '认证缓存 5 分钟（原 15 分钟）');
+	assert.equal(EWS_AUTH_FAIL_DELAY_MS, 1000, '与 login-service 失败延迟一致');
+});
+
+// --------------------------- 22. router 级：请求体超限在读体前 413 ---------
+
+testCase('22. router 级：Content-Length 超限的 POST 在读体前 413（chunked 超限则流式中止）', async () => {
+	ensureNodeResolveHook();
+	const { default: ewsApp } = await import('../src/ews/router.js');
+
+	const email = 'tb-user@example.com';
+	const password = 'secret-password';
+	const jwtSecret = 'unit-test-jwt-secret';
+	// 认证缓存键 = ews-auth:sha256(jwt_secret:email:password)（auth.js 加盐后的键）
+	const cacheKey = 'ews-auth:' + createHash('sha256').update(`${jwtSecret}:${email}:${password}`).digest('hex');
+	const store = new Map([[cacheKey, JSON.stringify({ userId: 7, email, status: 0, isDel: 0 })]]);
+	const env = {
+		jwt_secret: jwtSecret,
+		kv: {
+			get: async (key) => (store.has(key) ? JSON.parse(store.get(key)) : null),
+			put: async () => {},
+			delete: async () => {}
+		}
+	};
+	const auth = 'Basic ' + Buffer.from(`${email}:${password}`).toString('base64');
+
+	// ① Content-Length 超限：直接 413，且 body 从未被读取
+	let pulls = 0;
+	const body = new ReadableStream({
+		pull(controller) {
+			pulls++;
+			controller.enqueue(new TextEncoder().encode('<soap:Envelope/>'));
+		}
+	});
+	const res = await ewsApp.fetch(new Request('https://mail.example.com/EWS/Exchange.asmx', {
+		method: 'POST',
+		headers: {
+			Authorization: auth,
+			'Content-Length': String(41 * 1024 * 1024),
+			'Content-Type': 'text/xml; charset=utf-8'
+		},
+		body,
+		duplex: 'half'
+	}), env, {});
+	assert.equal(res.status, 413, '超过 40MB → HTTP 413');
+	// 注意：undici 对 duplex:'half' 的流式 body 会预取 1 个 chunk（与 router 无关），
+	// 这里断言「router 没有把 body 读完」；faultstring 里出现 too large 也证明走的是预检分支而非读体分支
+	assert.ok(pulls <= 1, `router 不从请求体读数据（pulls=${pulls}）`);
+	assert.equal(res.headers.get('content-type'), 'text/xml; charset=utf-8');
+	const fault = await res.text();
+	assertWellFormed(fault);
+	assert.ok(fault.includes('ErrorInvalidRequest'), '413 body 是标准 SOAP Fault');
+	assert.ok(fault.includes('too large'), '按 Content-Length 预检拒绝（不是读体失败分支）');
+
+	// ② 无 Content-Length（chunked）且实际超限：流式累计字节，超限即中止并 413
+	const chunk = new Uint8Array(1024 * 1024);
+	let sent = 0;
+	let cancelled = false;
+	const chunked = new ReadableStream({
+		pull(controller) {
+			// 声明 100MB 可用，实际读方应在 40MB 处停止（内存有界）
+			if (sent >= 100) {
+				controller.close();
+				return;
+			}
+			sent++;
+			controller.enqueue(chunk);
+		},
+		cancel() {
+			cancelled = true;
+		}
+	});
+	const res2 = await ewsApp.fetch(new Request('https://mail.example.com/EWS/Exchange.asmx', {
+		method: 'POST',
+		headers: { Authorization: auth, 'Content-Type': 'text/xml; charset=utf-8' },
+		body: chunked,
+		duplex: 'half'
+	}), env, {});
+	assert.equal(res2.headers.get('content-length'), null, '前置条件：本请求没有 Content-Length');
+	assert.equal(res2.status, 413, '流式累计超限 → 413');
+	assert.equal(cancelled, true, '超限后主动取消读取（不再拉剩余数据）');
+	assert.ok(sent <= 42, `最多多读一个 chunk（实际读取 ${sent}MB / 共 100MB）`);
+
+	// ③ 正常大小的请求体仍走原路径（缺 Authorization 的握手探测 → 401，不读体不报 413）
+	const res3 = await ewsApp.fetch(new Request('https://mail.example.com/EWS/Exchange.asmx', {
+		method: 'POST',
+		headers: { 'Content-Type': 'text/xml; charset=utf-8' },
+		body: '<soap:Envelope/>'
+	}), env, {});
+	assert.equal(res3.status, 401);
+});
+
+// ------------------------------- 23. 认证：加盐缓存键 + 失败延迟 1 秒 ---------
+
+testCase('23. 认证：缓存键按 jwt_secret 加盐（旧键不再命中）+ 凭据错误延迟 1 秒', async () => {
+	ensureNodeResolveHook();
+	const { authenticate } = await import('../src/ews/auth.js');
+
+	const email = 'tb-user@example.com';
+	const password = 'secret-password';
+	const jwtSecret = 'unit-test-jwt-secret';
+	const entry = JSON.stringify({ userId: 7, email, status: 0, isDel: 0 });
+	const saltedKey = 'ews-auth:' + createHash('sha256').update(`${jwtSecret}:${email}:${password}`).digest('hex');
+	const legacyKey = 'ews-auth:' + createHash('sha256').update(`${email.toLowerCase()}:${password}`).digest('hex');
+
+	// 最小 D1 桩：drizzle 的 d1 driver 走 prepare().bind().raw()/.get()
+	function stubD1() {
+		const stmt = {
+			bind() {
+				return stmt;
+			},
+			async get() {
+				return null;
+			},
+			async all() {
+				return { results: [] };
+			},
+			async run() {
+				return {};
+			},
+			async raw() {
+				return [];
+			}
+		};
+		return { prepare: () => stmt, batch: async () => [] };
+	}
+
+	function makeContext(store, salt) {
+		return {
+			req: {
+				header: (name) => (String(name).toLowerCase() === 'authorization'
+					? 'Basic ' + Buffer.from(`${email}:${password}`).toString('base64')
+					: undefined)
+			},
+			env: {
+				jwt_secret: salt,
+				kv: {
+					get: async (key) => (store.has(key) ? JSON.parse(store.get(key)) : null),
+					put: async () => {},
+					delete: async () => {}
+				},
+				db: stubD1()
+			},
+			set() {},
+			get() {}
+		};
+	}
+
+	// ① 加盐键命中：认证成功（不查库）
+	const okUser = await authenticate(makeContext(new Map([[saltedKey, entry]]), jwtSecret));
+	assert.equal(okUser.userId, 7, '按 sha256(jwt_secret:email:password) 命中缓存');
+
+	// ② 只有旧（未加盐）键有缓存：不再命中 → 凭据错误 → 延迟约 1 秒
+	const t0 = Date.now();
+	const bad = await authenticate(makeContext(new Map([[legacyKey, entry]]), jwtSecret));
+	const elapsed = Date.now() - t0;
+	assert.equal(bad, null, '旧的未加盐缓存键不再被使用（加盐后旧键失效）');
+	assert.ok(elapsed >= 950, `凭据错误响应延迟约 1 秒（实测 ${elapsed}ms）`);
+
+	// ③ jwt_secret 缺失：退化为不加盐旧键（仅告警，保证不因配置缺失而全线 401）
+	const fallback = await authenticate(makeContext(new Map([[legacyKey, entry]]), undefined));
+	assert.equal(fallback.userId, 7, 'jwt_secret 未配置时退化回旧键');
+});
+
+// ------------- 24. SyncFolderItems：tombstone 读侧产出 Delete（含容错） ------
+
+testCase('24. SyncFolderItems：物理删除 tombstone → Delete 事件（水位/文件夹匹配/表缺失容错）', async () => {
+	ensureNodeResolveHook();
+	const { default: ewsApp } = await import('../src/ews/router.js');
+
+	const email = 'tb-user@example.com';
+	const password = 'secret-password';
+	const jwtSecret = 'unit-test-jwt-secret';
+	const cacheKey = 'ews-auth:' + createHash('sha256').update(`${jwtSecret}:${email}:${password}`).digest('hex');
+	const kvStore = new Map([[cacheKey, JSON.stringify({ userId: 7, email, status: 0, isDel: 0 })]]);
+
+	// D1 桩：邮件查询（drizzle 走 .bind().raw()）返回空集；ews_tombstone 查询返回给定行；其余（ews_sync_state）忽略
+	function stubD1(tombstoneRows, { missingTable = false } = {}) {
+		const queries = [];
+		const stmt = {
+			sql: '',
+			params: [],
+			bind(...params) {
+				stmt.params = params;
+				return stmt;
+			},
+			async get() {
+				return null;
+			},
+			async all() {
+				if (/ews_tombstone/.test(stmt.sql)) return { results: tombstoneRows };
+				return { results: [] };
+			},
+			async run() {
+				return {};
+			},
+			async raw() {
+				return [];
+			}
+		};
+		return {
+			queries,
+			prepare(sql) {
+				if (missingTable && /ews_tombstone/.test(sql)) throw new Error('no such table: ews_tombstone');
+				queries.push(sql);
+				stmt.sql = sql;
+				stmt.params = [];
+				return stmt;
+			},
+			batch: async () => []
+		};
+	}
+
+	const SYNC_STATE = encodeSyncState({ v: 1, wm: '2026-10-01 10:00:00', wid: 0, cur: null });
+	const syncRequest = (folder) => `<?xml version="1.0" encoding="utf-8"?>
+<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"
+               xmlns:t="http://schemas.microsoft.com/exchange/services/2006/types"
+               xmlns:m="http://schemas.microsoft.com/exchange/services/2006/messages">
+  <soap:Body>
+    <m:SyncFolderItems>
+      <m:ItemShape><t:BaseShape>IdOnly</t:BaseShape></m:ItemShape>
+      <m:SyncFolderId><t:DistinguishedFolderId Id="${folder}" /></m:SyncFolderId>
+      <m:SyncState>${SYNC_STATE}</m:SyncState>
+      <m:MaxChangesReturned>512</m:MaxChangesReturned>
+    </m:SyncFolderItems>
+  </soap:Body>
+</soap:Envelope>`;
+
+	async function sync(folder, tombstoneRows, options) {
+		const db = stubD1(tombstoneRows, options);
+		const env = {
+			jwt_secret: jwtSecret,
+			kv: { get: async (key) => (kvStore.has(key) ? JSON.parse(kvStore.get(key)) : null), put: async () => {}, delete: async () => {} },
+			db
+		};
+		const res = await ewsApp.fetch(new Request('https://mail.example.com/EWS/Exchange.asmx', {
+			method: 'POST',
+			headers: {
+				Authorization: 'Basic ' + Buffer.from(`${email}:${password}`).toString('base64'),
+				'Content-Type': 'text/xml; charset=utf-8'
+			},
+			body: syncRequest(folder)
+		}), env, {});
+		const xml = await res.text();
+		// 成功响应是裸的 <m:SyncFolderItemsResponse>（router 只对 Fault 走 soapEnvelope），这里只校验良构
+		assert.equal(XMLValidator.validate(xml), true, 'SyncFolderItems 响应必须良构');
+		assert.ok(!xml.includes('<soap:Fault>'), '不应出现 Fault');
+		return { xml, queries: db.queries };
+	}
+
+	// 删除前类型：11=收件（inbox）、12=发件（sentitems）、13=垃圾桶里的收件、14=已进垃圾桶的发件
+	const tombstones = [
+		{ email_id: 11, type: 0, trash: 0 },
+		{ email_id: 12, type: 1, trash: 0 },
+		{ email_id: 13, type: 0, trash: 1 },
+		{ email_id: 14, type: 1, trash: 1 }
+	];
+
+	const inbox = await sync('inbox', tombstones);
+	assert.ok(inbox.xml.includes('<t:Delete><t:ItemId Id="11"/></t:Delete>'), 'inbox 的物理删除 → Delete 11');
+	assert.ok(!inbox.xml.includes('Id="12"'), '发件邮件的 Delete 不进 inbox');
+	assert.ok(!inbox.xml.includes('Id="13"') && !inbox.xml.includes('Id="14"'), '垃圾桶里的 Delete 不进 inbox');
+	// tombstone 查询的绑定参数：user_id + 本轮水位（del_time > wm）
+	const tombstoneQuery = inbox.queries.find((sql) => /ews_tombstone/.test(sql));
+	assert.ok(tombstoneQuery, '确实查询了 ews_tombstone');
+	assert.ok(/del_time > \?/.test(tombstoneQuery), '按 del_time > 水位过滤');
+	assert.ok(inbox.queries.some((sql) => /ews_sync_state/.test(sql)), '同步水位仍会落库');
+
+	const sent = await sync('sentitems', tombstones);
+	assert.ok(sent.xml.includes('<t:Delete><t:ItemId Id="12"/></t:Delete>'), 'sentitems 的物理删除 → Delete 12');
+	assert.ok(!sent.xml.includes('Id="11"'), '收件邮件的 Delete 不进 sentitems');
+
+	const trash = await sync('deleteditems', tombstones);
+	assert.ok(trash.xml.includes('<t:Delete><t:ItemId Id="13"/></t:Delete>'), '垃圾桶文件夹按 trash=1 匹配');
+	assert.ok(trash.xml.includes('<t:Delete><t:ItemId Id="14"/></t:Delete>'));
+
+	// ews_tombstone 未建（未迁移）：容错，不产出 Delete、也不 Fault
+	const missing = await sync('inbox', tombstones, { missingTable: true });
+	assert.ok(!missing.xml.includes('<t:Delete>'), '表缺失时静默跳过（不影响其余同步）');
+	assert.ok(missing.xml.includes('SyncFolderItemsResponse'), '仍是正常的 SyncFolderItems 响应');
+});
+
 // ------------------------------------------------------------------ runner ---
 
 let failed = 0;
 for (const { name, fn } of cases) {
 	try {
-		fn();
+		await fn();
 		console.log(`PASS ${name}`);
 	} catch (error) {
 		failed++;

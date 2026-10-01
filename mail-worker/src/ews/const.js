@@ -13,12 +13,20 @@ export const EWS_PATH = '/ews/exchange.asmx';
 export const EWS_SYNC_PAGE = 50;
 
 // 认证成功的 KV 缓存 TTL（秒）：减少每请求查库 + SHA-256
-export const EWS_AUTH_CACHE_TTL = 900;
+// 5 分钟：缓存键含 jwt_secret 加盐，密码变更/封禁最多 5 分钟后对 EWS 生效
+export const EWS_AUTH_CACHE_TTL = 300;
 
 // 认证防爆破：同 IP 失败 EWS_AUTH_FAIL_MAX 次后锁 EWS_AUTH_FAIL_WINDOW_MS（与 login-service 同规格）
 export const EWS_AUTH_FAIL_MAX = 5;
 export const EWS_AUTH_FAIL_WINDOW_MS = 10 * 60 * 1000;
 export const EWS_AUTH_FAIL_MAP_MAX = 10000;
+
+// 凭据错误时的响应延迟（毫秒）：与 login-service 的失败延迟对齐，抬高在线爆破成本
+export const EWS_AUTH_FAIL_DELAY_MS = 1000;
+
+// 单次请求实际重建 MimeContent（重邮件：MIME + base64 附件）的封数上限：
+// 超出部分只回元数据字段，客户端可按需再取，避免一次响应把多封带附件邮件全部重建打爆内存/CPU
+export const EWS_MAX_MIME_ITEM_IDS = 20;
 
 // 单个附件（含内嵌图）经 EWS 传输的字节上限：
 // Free 计划 10ms CPU 下 base64 编解码的保守值，可用 env.EWS_MAX_ATT_BYTES 调整（付费计划可放大）

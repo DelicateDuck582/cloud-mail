@@ -2,7 +2,7 @@ import orm from '../entity/orm';
 import email from '../entity/email';
 import { emailListColumns, emailBriefColumns, EMAIL_LIST_TEXT_LEN } from '../lib/email-list-columns';
 import { attConst, emailConst, isDel, settingConst } from '../const/entity-const';
-import { and, desc, eq, gt, inArray, notInArray, lt, count, asc, sql, ne, or, like, lte, gte } from 'drizzle-orm';
+import { and, desc, eq, gt, inArray, lt, count, asc, sql, ne, or, like, lte, gte } from 'drizzle-orm';
 import { star } from '../entity/star';
 import settingService from './setting-service';
 import accountService from './account-service';
@@ -35,6 +35,36 @@ const chunkArray = (list, size) => {
 	}
 	return result;
 };
+
+// EWS 增量同步墓碑：物理删除 email 行之前，先按 ≤SQL_BIND_LIMIT 分片读出待删行，
+// 逐行 INSERT OR IGNORE 到 ews_tombstone（user_id/email_id/type/trash/del_time），
+// 供 EWS 增量拉取回放删除事件（表由 init.js v4_4DB 创建）。
+// 写入失败仅告警，不阻断删除主流程（fail-open：墓碑缺失只影响增量同步精度）。
+async function insertEwsTombstones(c, emailIds) {
+	const ids = [...new Set((emailIds || []).map(Number).filter(id => Number.isFinite(id)))];
+	if (ids.length === 0) {
+		return;
+	}
+	const delTime = dayjs().format('YYYY-MM-DD HH:mm:ss');
+	for (const chunk of chunkArray(ids, SQL_BIND_LIMIT)) {
+		try {
+			const placeholders = chunk.map(() => '?').join(',');
+			const rowResult = await c.env.db.prepare(
+				`SELECT email_id, user_id, type, trash FROM email WHERE email_id IN (${placeholders})`
+			).bind(...chunk).all();
+			const rows = rowResult?.results || [];
+			if (rows.length === 0) {
+				continue;
+			}
+			const stmt = c.env.db.prepare(
+				'INSERT OR IGNORE INTO ews_tombstone (user_id, email_id, type, trash, del_time) VALUES (?,?,?,?,?)'
+			);
+			await c.env.db.batch(rows.map(row => stmt.bind(row.user_id, row.email_id, row.type, row.trash, delTime)));
+		} catch (e) {
+			console.warn('写入 EWS 墓碑失败（不影响删除）：', e);
+		}
+	}
+}
 
 const emailService = {
 
@@ -941,6 +971,8 @@ const emailService = {
 		emailIds = emailIds.split(',').map(Number);
 		await attService.removeByEmailIds(c, emailIds);
 		await starService.removeByEmailIds(c, emailIds);
+		// EWS 墓碑：物理删行前先登记（分片 ≤SQL_BIND_LIMIT），写入失败不阻断删除
+		await insertEwsTombstones(c, emailIds);
 		for (const chunk of chunkArray(emailIds, SQL_BIND_LIMIT)) {
 			await orm(c).delete(email).where(inArray(email.emailId, chunk)).run();
 		}
@@ -1166,26 +1198,31 @@ const emailService = {
 
 		let excludeUserIds = [];
 		if (excludeEmails.length) {
-			const rows = await orm(c)
-				.select({ userId: user.userId })
-				.from(user)
-				.where(sql`lower(${user.email}) IN (${sql.join(excludeEmails.map(email => sql`${email.toLowerCase()}`), sql`, `)})`)
-				.all();
-			excludeUserIds = rows.map(row => row.userId);
+			// 排除名单长度不受限：按 ≤SQL_BIND_LIMIT 分片查询（单条 IN 的绑定参数不超上限），合并去重
+			for (const chunk of chunkArray(excludeEmails, SQL_BIND_LIMIT)) {
+				const rows = await orm(c)
+					.select({ userId: user.userId })
+					.from(user)
+					.where(sql`lower(${user.email}) IN (${sql.join(chunk.map(email => sql`${email.toLowerCase()}`), sql`, `)})`)
+					.all();
+				rows.forEach(row => excludeUserIds.push(row.userId));
+			}
+			excludeUserIds = [...new Set(excludeUserIds)];
 		}
+		const excludeSet = new Set(excludeUserIds);
 
 		const batchSize = 95;
 
+		// 排除名单可能超过单条语句绑定参数上限，NOT IN 无法分片（拆开会变成「或」而非「且」），
+		// 故改为按 email_id 键集游标分页拉取候选行（原条件：create_time < cutoff），
+		// 在应用层过滤掉排除用户的 id 后再逐批物理删除；游标保证每轮必然前进，不会因整批被排除而空转
+		let lastEmailId = 0;
 		while (true) {
-			const conditions = [lt(email.createTime, cutoff)];
-			if (excludeUserIds.length) {
-				conditions.push(notInArray(email.userId, excludeUserIds));
-			}
-
 			const rows = await orm(c)
-				.select({ emailId: email.emailId })
+				.select({ emailId: email.emailId, userId: email.userId })
 				.from(email)
-				.where(and(...conditions))
+				.where(and(lt(email.createTime, cutoff), gt(email.emailId, lastEmailId)))
+				.orderBy(asc(email.emailId))
 				.limit(batchSize)
 				.all();
 
@@ -1193,8 +1230,12 @@ const emailService = {
 				break;
 			}
 
-			const emailIds = rows.map(row => row.emailId);
-			await this.physicsDelete(c, { emailIds: emailIds.join(',') });
+			lastEmailId = rows[rows.length - 1].emailId;
+
+			const emailIds = rows.filter(row => !excludeSet.has(row.userId)).map(row => row.emailId);
+			if (emailIds.length > 0) {
+				await this.physicsDelete(c, { emailIds: emailIds.join(',') });
+			}
 
 			if (rows.length < batchSize) {
 				break;
@@ -1245,11 +1286,34 @@ const emailService = {
 
 		await attService.removeByEmailIds(c, emailIds);
 
+		// EWS 墓碑：物理删行前先登记（分片 ≤SQL_BIND_LIMIT），写入失败不阻断删除
+		await insertEwsTombstones(c, emailIds);
+
 		await orm(c).delete(email).where(conditions.length > 1 ? and(...conditions) : conditions[0]).run();
 	},
 
 	async physicsDeleteByAccountId(c, accountId) {
 		await attService.removeByAccountId(c, accountId);
+
+		// EWS 墓碑：物理删行前先登记该账号全部邮件。按 email_id 键集分页读取 id（避免一次拉取过大结果集），
+		// 每页交由 insertEwsTombstones 内部分片写入；全部登记完成后才执行物理删除，写入失败不阻断删除
+		const pageSize = 500;
+		let lastEmailId = 0;
+		while (true) {
+			const idResult = await c.env.db.prepare(
+				'SELECT email_id FROM email WHERE account_id = ? AND email_id > ? ORDER BY email_id ASC LIMIT ?'
+			).bind(accountId, lastEmailId, pageSize).all();
+			const idRows = idResult?.results || [];
+			if (idRows.length === 0) {
+				break;
+			}
+			await insertEwsTombstones(c, idRows.map(row => row.email_id));
+			lastEmailId = idRows[idRows.length - 1].email_id;
+			if (idRows.length < pageSize) {
+				break;
+			}
+		}
+
 		await orm(c).delete(email).where(eq(email.accountId, accountId)).run();
 	},
 
@@ -1259,7 +1323,7 @@ const emailService = {
 		const emailIdList = (emailIds || '').split(',').map(Number).filter(Boolean);
 		for (const chunk of chunkArray(emailIdList, SQL_BIND_LIMIT)) {
 			await orm(c).update(email).set({ unread: emailConst.unread.READ, updateTime: now })
-				.where(and(eq(email.userId, userId), inArray(email.emailId, chunk)));
+				.where(and(eq(email.userId, userId), inArray(email.emailId, chunk))).run();
 		}
 	}
 };

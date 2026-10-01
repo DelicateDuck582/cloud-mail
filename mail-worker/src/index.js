@@ -91,5 +91,13 @@ export default {
 		await oauthService.clearNoBindOathUser({ env })
 		await attService.clearTrash({ env })
 		await analysisService.refreshEchartsCache({ env })
+
+		// EWS 物理删除事件（tombstone）保留 30 天：30 天内同步过的客户端都能拿到 Delete 事件，
+		// 更老的记录不再有意义；失败只告警，不中断后续定时任务
+		try {
+			await env.db.prepare(`DELETE FROM ews_tombstone WHERE del_time < datetime('now','-30 day')`).run();
+		} catch (e) {
+			console.warn(`[ews] tombstone cleanup skipped: ${e.message}`);
+		}
 	},
 };

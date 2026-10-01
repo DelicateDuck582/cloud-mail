@@ -20,6 +20,9 @@ import { and, eq, inArray } from 'drizzle-orm';
 
 // D1 单条语句最多 100 个绑定参数，统一按 90 分片
 const SQL_BIND_LIMIT = 90;
+// 归属查询同一条语句里 owners(IN) 与 keys(IN) 共用绑定参数预算，owners 侧单独收紧上限，
+// 剩余的 45 个预算留给 keys 分片，保证单条语句绑定参数合计 ≤ SQL_BIND_LIMIT
+const OWNERS_BIND_LIMIT = 45;
 
 const signUtils = {
 
@@ -58,9 +61,12 @@ const signUtils = {
 		if (unique.length === 0 || !Array.isArray(allowedUserIds) || allowedUserIds.length === 0) {
 			return owned;
 		}
-		const owners = [...new Set(allowedUserIds)].slice(0, SQL_BIND_LIMIT);
-		for (let i = 0; i < unique.length; i += SQL_BIND_LIMIT) {
-			const chunk = unique.slice(i, i + SQL_BIND_LIMIT);
+		// owners 截断上限 45；keys 分片大小取剩余预算（owners=0 时为 90，owners=45 时为 45），
+		// 保证同一条 SELECT 的 owners + keys 绑定参数合计 ≤ SQL_BIND_LIMIT（D1 上限 100）
+		const owners = [...new Set(allowedUserIds)].slice(0, OWNERS_BIND_LIMIT);
+		const keyChunkSize = Math.max(1, SQL_BIND_LIMIT - owners.length);
+		for (let i = 0; i < unique.length; i += keyChunkSize) {
+			const chunk = unique.slice(i, i + keyChunkSize);
 			const rows = await orm(c).select({ key: att.key }).from(att)
 				.where(and(inArray(att.key, chunk), inArray(att.userId, owners)))
 				.groupBy(att.key)

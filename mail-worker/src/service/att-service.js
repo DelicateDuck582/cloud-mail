@@ -34,6 +34,36 @@ const chunkArray = (list, size) => {
 	return chunks;
 };
 
+// EWS 增量同步墓碑：物理删除 email 行之前，先按 ≤SQL_BIND_LIMIT 分片读出待删行，
+// 逐行 INSERT OR IGNORE 到 ews_tombstone（user_id/email_id/type/trash/del_time），
+// 供 EWS 增量拉取回放删除事件（表由 init.js v4_4DB 创建）。
+// 写入失败仅告警，不阻断删除主流程（fail-open：墓碑缺失只影响增量同步精度）。
+async function insertEwsTombstones(c, emailIds) {
+	const ids = [...new Set((emailIds || []).map(Number).filter(id => Number.isFinite(id)))];
+	if (ids.length === 0) {
+		return;
+	}
+	const delTime = dayjs().format('YYYY-MM-DD HH:mm:ss');
+	for (const chunk of chunkArray(ids, SQL_BIND_LIMIT)) {
+		try {
+			const placeholders = chunk.map(() => '?').join(',');
+			const rowResult = await c.env.db.prepare(
+				`SELECT email_id, user_id, type, trash FROM email WHERE email_id IN (${placeholders})`
+			).bind(...chunk).all();
+			const rows = rowResult?.results || [];
+			if (rows.length === 0) {
+				continue;
+			}
+			const stmt = c.env.db.prepare(
+				'INSERT OR IGNORE INTO ews_tombstone (user_id, email_id, type, trash, del_time) VALUES (?,?,?,?,?)'
+			);
+			await c.env.db.batch(rows.map(row => stmt.bind(row.user_id, row.email_id, row.type, row.trash, delTime)));
+		} catch (e) {
+			console.warn('写入 EWS 墓碑失败（不影响删除）：', e);
+		}
+	}
+}
+
 const MIME_OCTET_STREAM = 'application/octet-stream';
 // 允许内联展示的 MIME 白名单：image/svg+xml、text/html 等可执行内容永不入内
 const MIME_WHITELIST = new Set([
@@ -617,6 +647,8 @@ const attService = {
 		}
 
 		for (const chunk of chunkArray(delEmailIds, SQL_BIND_LIMIT)) {
+			// EWS 墓碑：物理删行前先登记（分片 ≤SQL_BIND_LIMIT），写入失败不阻断删除
+			await insertEwsTombstones(c, chunk);
 			await orm(c).delete(email).where(inArray(email.emailId, chunk)).run();
 			await starService.removeByEmailIds(c, chunk);
 		}
@@ -709,6 +741,8 @@ const attService = {
 			}
 
 			for (const chunk of chunkArray(delEmailIds, SQL_BIND_LIMIT)) {
+				// EWS 墓碑：物理删行前先登记（分片 ≤SQL_BIND_LIMIT），写入失败不阻断删除
+				await insertEwsTombstones(c, chunk);
 				await orm(c).delete(email).where(inArray(email.emailId, chunk)).run();
 				await starService.removeByEmailIds(c, chunk);
 			}

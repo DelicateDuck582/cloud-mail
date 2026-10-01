@@ -5,9 +5,10 @@
  * 验证成功把 user 行塞进 Hono context（c.set('user', userRow)），与项目 userContext 约定一致，
  * 后续 handler 可直接复用 email-service / att-service 等现有 service。
  *
- * 防爆破：同 IP 失败 5 次 / 10 分钟锁定（参照 login-service 的 loginFailMap 模式）。
- * 成功结果可写 KV 缓存（ews-auth:<sha256(email:password)> → userId，TTL 900s）以减少每请求查库 + 哈希；
- * 只缓存成功结果，密码变更最多 15 分钟后对 EWS 生效。
+ * 防爆破：同 IP 失败 5 次 / 10 分钟锁定（参照 login-service 的 loginFailMap 模式）+ 凭据错误 1 秒延迟。
+ * 成功结果可写 KV 缓存（ews-auth:sha256(jwt_secret:email:password) → 用户信息，TTL 300s）以减少
+ * 每请求查库 + 哈希；键用 jwt_secret 加盐（jwt_secret 未配置时退化为不加盐并告警，生产必配）；
+ * 只缓存成功结果，密码变更最多 5 分钟后对 EWS 生效。
  */
 
 import { sql } from 'drizzle-orm';
@@ -18,12 +19,16 @@ import saltHashUtils from '../utils/crypto-utils';
 import reqUtils from '../utils/req-utils';
 import {
 	EWS_AUTH_CACHE_TTL,
+	EWS_AUTH_FAIL_DELAY_MS,
 	EWS_AUTH_FAIL_MAP_MAX,
 	EWS_AUTH_FAIL_MAX,
 	EWS_AUTH_FAIL_WINDOW_MS
 } from './const.js';
 
 const EWS_AUTH_CACHE_PREFIX = 'ews-auth:';
+
+// jwt_secret 缺失只在首个请求告警一次（避免每请求刷日志）
+let warnedMissingSalt = false;
 
 const authFailMap = new Map();
 
@@ -77,6 +82,23 @@ async function sha256Hex(text) {
 	return hex;
 }
 
+/**
+ * KV 缓存键：sha256(jwt_secret + ':' + email + ':' + password)（email 统一小写）。
+ * 用 jwt_secret 加盐，避免仅凭「已知邮箱 + 弱密码字典」离线枚举 KV 键反推/碰撞缓存；
+ * jwt_secret 未配置时退化为不加盐的旧键（仅告警一次，生产必须配置 jwt_secret）。
+ */
+async function authCacheKey(c, email, password) {
+	const salt = String(c.env?.jwt_secret ?? '').trim();
+	if (salt === '') {
+		if (!warnedMissingSalt) {
+			warnedMissingSalt = true;
+			console.warn('[ews] jwt_secret is not configured: EWS auth cache key is unsalted. Configure jwt_secret in production.');
+		}
+		return EWS_AUTH_CACHE_PREFIX + await sha256Hex(email.toLowerCase() + ':' + password);
+	}
+	return EWS_AUTH_CACHE_PREFIX + await sha256Hex(salt + ':' + email.toLowerCase() + ':' + password);
+}
+
 function isUsableUser(userRow) {
 	return !!userRow && userRow.isDel !== isDel.DELETE && userRow.status !== userConst.status.BAN;
 }
@@ -105,7 +127,7 @@ async function writeCache(c, cacheKey, userRow) {
 }
 
 async function verifyCredentials(c, email, password) {
-	const cacheKey = EWS_AUTH_CACHE_PREFIX + await sha256Hex(email.toLowerCase() + ':' + password);
+	const cacheKey = await authCacheKey(c, email, password);
 
 	const cached = await readCache(c, cacheKey);
 	if (cached) {
@@ -134,6 +156,7 @@ async function verifyCredentials(c, email, password) {
 /**
  * 认证主入口：成功返回 user 行（已写入 c），失败返回 null（由 router 回 401 + WWW-Authenticate）。
  * 只有「携带了错误的凭据」才计入失败次数：无 Authorization 头的握手探测不计（TB 首次探测即此形态）。
+ * 凭据错误返回前统一延迟 EWS_AUTH_FAIL_DELAY_MS（1000ms），与 login-service 的失败延迟对齐。
  */
 export async function authenticate(c) {
 	const ip = reqUtils.getIp(c);
@@ -146,6 +169,8 @@ export async function authenticate(c) {
 
 	if (!userRow) {
 		authFailRecord(ip);
+		// 失败延迟：与 login-service 的 1 秒失败延迟对齐（锁定路径在上面提前返回，不再额外延迟）
+		await new Promise((resolve) => setTimeout(resolve, EWS_AUTH_FAIL_DELAY_MS));
 		return null;
 	}
 

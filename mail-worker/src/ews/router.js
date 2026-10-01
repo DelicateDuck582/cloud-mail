@@ -16,6 +16,7 @@ import { authenticate } from './auth.js';
 import { parseSoapRequest, soapFault } from './xml.js';
 import { dispatch, EwsFault } from './handlers.js';
 import { EWS_MAX_REQUEST_BYTES } from './const.js';
+import { precheckContentLength, readLimitedText } from './request-guard.js';
 
 const ewsApp = new Hono();
 
@@ -35,6 +36,18 @@ function unauthorizedResponse() {
 		headers: {
 			'WWW-Authenticate': 'Basic realm="CloudMail EWS"',
 			'Content-Type': 'text/plain; charset=utf-8',
+			'Cache-Control': 'no-store'
+		}
+	});
+}
+
+/** 请求体超限：HTTP 413 + SOAP Fault（在把 body 读进内存之前就拒绝） */
+function tooLargeResponse(bytes) {
+	return new Response(soapFault('ErrorInvalidRequest',
+		`Request body is too large for EWS (${bytes} bytes > ${EWS_MAX_REQUEST_BYTES} bytes).`), {
+		status: 413,
+		headers: {
+			'Content-Type': 'text/xml; charset=utf-8',
 			'Cache-Control': 'no-store'
 		}
 	});
@@ -62,15 +75,30 @@ ewsApp.all('*', async (c) => {
 	// 与项目 userContext 约定对齐：后续 service 通过 c.get('user').userId 取当前用户
 	c.set('user', user);
 
+	// 读体前的预检：有可信 Content-Length 且超限 → 立即 413，绝不把大 body 读进内存
+	const precheck = precheckContentLength(c.req.header('content-length'), EWS_MAX_REQUEST_BYTES);
+	if (precheck.state === 'too-large') {
+		return tooLargeResponse(precheck.declared);
+	}
+
 	let bodyText = '';
 	try {
-		bodyText = await c.req.text();
+		if (precheck.state === 'unknown') {
+			// chunked 等没有可信长度：流式累计字节，累计超限立即中止读取
+			const limited = await readLimitedText(c.req.raw.body, EWS_MAX_REQUEST_BYTES);
+			if (limited.tooLarge) {
+				return tooLargeResponse(limited.bytes);
+			}
+			bodyText = limited.text;
+		} else {
+			bodyText = await c.req.text();
+		}
 	} catch (e) {
 		return xmlResponse(soapFault('ErrorInvalidRequest', 'Unable to read the request body.'));
 	}
+	// 双保险：Content-Length 可被伪造，读完后仍复查一次
 	if (bodyText.length > EWS_MAX_REQUEST_BYTES) {
-		return xmlResponse(soapFault('ErrorInvalidRequest',
-			`Request body is too large for EWS (${bodyText.length} bytes > ${EWS_MAX_REQUEST_BYTES} bytes).`));
+		return tooLargeResponse(bodyText.length);
 	}
 
 	const parsed = parseSoapRequest(bodyText);

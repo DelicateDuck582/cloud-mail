@@ -27,6 +27,7 @@ import { attConst, emailConst, isDel } from '../const/entity-const';
 import BizError from '../error/biz-error';
 import { buildMimeBase64 } from './mime-build.js';
 import {
+	EWS_MAX_MIME_ITEM_IDS,
 	EWS_ROOT_CHILDREN,
 	EWS_SYNC_PAGE,
 	ewsFolderDef,
@@ -45,6 +46,7 @@ import {
 	textOf
 } from './xml.js';
 import {
+	attBudgetAllows,
 	base64DecodedSize,
 	base64EncodeBytes,
 	base64ToBytes,
@@ -58,9 +60,11 @@ import {
 	encodeSyncState,
 	isInlineAttachment,
 	isSentRow,
+	mimeContentIdSet,
 	parseAddressList,
 	parseMailbox,
 	parseMailboxList,
+	selectTombstoneDeletes,
 	splitOutgoingAttachments,
 	stripCidBrackets,
 	toDateMs
@@ -242,8 +246,16 @@ async function attachmentRows(c, emailId, userId) {
 		.all();
 }
 
+/**
+ * 本次响应「已重建附件字节」账本：跨本次响应内多封邮件累计（呼应 EWS_MAX_TOTAL_ATT_BYTES）。
+ * 超过 limit 后剩余附件走「跳过」路径（与单附件超限同一处理），避免一次响应重建过多附件打爆内存。
+ */
+function newAttBudget(c) {
+	return { total: 0, limit: ewsMaxTotalAttBytes(c.env), warned: false };
+}
+
 /** 用 COS 附件 + 库内正文重建完整 MIME（base64），供 EWS MimeContent */
-async function buildMimeForRow(c, row, maxAttBytes) {
+async function buildMimeForRow(c, row, maxAttBytes, budget) {
 	const rows = await attachmentRows(c, row.emailId, row.userId);
 	let html = row.content || '';
 	const inlineImages = [];
@@ -252,9 +264,18 @@ async function buildMimeForRow(c, row, maxAttBytes) {
 	for (const attRow of rows) {
 		// 超限附件不进 MIME（TB 侧表现为该附件缺失，正文与其它附件仍可见）
 		if ((Number(attRow.size) || 0) > maxAttBytes) continue;
+		// 本次响应累计护栏：多封邮件累计超出 ewsMaxTotalAttBytes 后，剩余附件同样跳过
+		if (!attBudgetAllows(budget, attRow.size)) {
+			if (!budget.warned) {
+				budget.warned = true;
+				console.warn(`[ews] rebuilding MimeContent hit the total attachment budget (${budget.limit} bytes): remaining attachments are skipped in this response.`);
+			}
+			continue;
+		}
 		const object = await r2Service.getObj(c, attRow.key);
 		if (!object) continue;
 		const data = new Uint8Array(await object.arrayBuffer());
+		budget.total += data.length;
 
 		if (isInlineAttachment(attRow)) {
 			// 库内正文引用 {{domain}}attachments/<key>，mime-build 需要 cid:<contentId>
@@ -345,6 +366,24 @@ async function snapshotWatermark(c, userId, kind) {
 	}
 }
 
+/**
+ * 物理删除 tombstone（邮件行已不存在：附件彻底删除 / 自动清理等服务器主动物理删）。
+ * 表由 v4_4DB 建；表不存在（未迁移）时不产出 Delete 事件，绝不影响其余同步。
+ */
+async function readTombstones(c, userId, watermark) {
+	try {
+		const result = await c.env.db.prepare(
+			`SELECT email_id, type, trash FROM ews_tombstone
+			 WHERE user_id = ? AND del_time > ?
+			 ORDER BY del_time ASC, email_id ASC`
+		).bind(userId, watermark).all();
+		return Array.isArray(result?.results) ? result.results : [];
+	} catch (error) {
+		if (/no such table/i.test(String(error?.message || error))) return [];
+		throw error;
+	}
+}
+
 // ---------------------------------------------------------------- GetFolder ----
 
 async function handleGetFolder(c, payload, user) {
@@ -413,10 +452,12 @@ async function handleSyncFolderHierarchy(c, payload, user) {
 async function buildChangesXml(c, tag, rows, options) {
 	if (rows.length === 0) return '';
 	const presence = await attachmentPresence(c, rows.map((row) => row.emailId));
+	// MimeContent 只重建前 EWS_MAX_MIME_ITEM_IDS 封（其余只回元数据），且多封共用一份附件字节账本
+	const mimeIds = options.mimeIds ?? new Set();
 	const items = [];
 	for (const row of rows) {
-		const mimeContent = options.includeMimeContent
-			? await buildMimeForRow(c, row, options.maxAttBytes)
+		const mimeContent = options.includeMimeContent && mimeIds.has(row.emailId)
+			? await buildMimeForRow(c, row, options.maxAttBytes, options.attBudget)
 			: '';
 		items.push(`<t:${tag}>${buildItemXml(row, {
 			changeKey: changeKeyOf(row),
@@ -465,10 +506,15 @@ async function handleSyncFolderItems(c, payload, user) {
 	const creates = [];
 	const updates = [];
 	const deletes = [];
+	let tombstoneDeletes = [];
 	let wm = state.wm;
 	let wid = state.wid;
 	let cur = state.cur;
 	let more = false;
+	// 本轮进入增量扫描时的水位：tombstone 与邮件共用同一「eff 水位」语义（del_time > wm）
+	const sweepWm = wm;
+	// 历史积压分页进行中：此时客户端尚未拿到全量，Delete 事件留到积压翻页结束后再产出
+	let backfilling = false;
 
 	try {
 		// ① 历史积压分页：最后修改时间 <= 水位快照 且 emailId < 游标
@@ -490,6 +536,7 @@ async function handleSyncFolderItems(c, payload, user) {
 			if (rows.length >= pageSize) {
 				cur = rows[rows.length - 1].emailId;
 				more = true;
+				backfilling = true;
 			} else {
 				cur = null;
 			}
@@ -521,6 +568,14 @@ async function handleSyncFolderItems(c, payload, user) {
 			}
 			if (rows.length >= budget) more = true;
 		}
+
+		// ③ 物理删除 tombstone：邮件行已不存在，增量扫描看不到 → 按 del_time > 本轮进入时的水位补 Delete 事件。
+		//    与同轮已产出的 ItemId 去重；积压翻页中不产出（客户端尚未拿到全量，Delete 无意义且会跨轮重复）
+		if (!backfilling) {
+			const tombstones = await readTombstones(c, userId, sweepWm);
+			const knownIds = new Set([...creates, ...updates, ...deletes].map((row) => Number(row.emailId)));
+			tombstoneDeletes = selectTombstoneDeletes(def.token, tombstones, knownIds);
+		}
 	} catch (error) {
 		requireMigrated(error);
 	}
@@ -528,10 +583,17 @@ async function handleSyncFolderItems(c, payload, user) {
 	const nextState = { v: 1, wm, wid, cur };
 	await storeSyncState(c, userId, def.token, nextState);
 
+	// MimeContent 只重建前 EWS_MAX_MIME_ITEM_IDS 封（Create/Update 合并计数），
+	// 且所有邮件共用一份本次响应的附件字节账本
+	const attBudget = newAttBudget(c);
+	const mimeIds = includeMimeContent
+		? mimeContentIdSet([...creates, ...updates].map((row) => row.emailId), EWS_MAX_MIME_ITEM_IDS)
+		: new Set();
 	const changesXml = [
-		await buildChangesXml(c, 'Create', creates, { includeMimeContent, maxAttBytes, folderToken: def.token }),
-		await buildChangesXml(c, 'Update', updates, { includeMimeContent, maxAttBytes, folderToken: def.token }),
-		deletes.map((row) => `<t:Delete><t:ItemId Id="${escapeXml(row.emailId)}"/></t:Delete>`).join('')
+		await buildChangesXml(c, 'Create', creates, { includeMimeContent, maxAttBytes, attBudget, mimeIds, folderToken: def.token }),
+		await buildChangesXml(c, 'Update', updates, { includeMimeContent, maxAttBytes, attBudget, mimeIds, folderToken: def.token }),
+		deletes.map((row) => `<t:Delete><t:ItemId Id="${escapeXml(row.emailId)}"/></t:Delete>`).join(''),
+		tombstoneDeletes.map((emailId) => `<t:Delete><t:ItemId Id="${escapeXml(String(emailId))}"/></t:Delete>`).join('')
 	].join('');
 
 	const body = `<m:SyncState>${escapeXml(encodeSyncState(nextState))}</m:SyncState>` +
@@ -568,10 +630,16 @@ async function handleGetItem(c, payload, user) {
 		}));
 	}
 
+	// MimeContent（重邮件重建）单独 clamp 到前 EWS_MAX_MIME_ITEM_IDS 个 Id：其余 Id 仍回元数据；
+	// 全部 MimeContent 共用一份附件字节账本（ewsMaxTotalAttBytes）
+	const mimeIds = includeMimeContent ? mimeContentIdSet(ids, EWS_MAX_MIME_ITEM_IDS) : new Set();
+	const attBudget = newAttBudget(c);
 	const presence = await attachmentPresence(c, rows.map((row) => row.emailId));
 	const items = [];
 	for (const row of rows) {
-		const mimeContent = includeMimeContent ? await buildMimeForRow(c, row, maxAttBytes) : '';
+		const mimeContent = includeMimeContent && mimeIds.has(row.emailId)
+			? await buildMimeForRow(c, row, maxAttBytes, attBudget)
+			: '';
 		const body = wantBody ? { html: row.content || '', text: row.text || '' } : null;
 		items.push(buildItemXml(row, {
 			changeKey: changeKeyOf(row),
@@ -918,7 +986,9 @@ const HANDLERS = {
 };
 
 export async function dispatch(c, parsed, user) {
-	const handler = HANDLERS[parsed.operation];
+	// 只认 HANDLERS 自身属性：operation 名来自请求 XML，toString/constructor/valueOf 等
+	// 原型链成员不能当操作名命中（否则会被当成 handler 调用，返回非 XML 的垃圾响应）
+	const handler = Object.hasOwn(HANDLERS, parsed.operation) ? HANDLERS[parsed.operation] : null;
 	if (!handler) {
 		throw new EwsFault('ErrorNotImplemented',
 			`Operation ${parsed.operation} is not implemented by the CloudMail EWS bridge.`);

@@ -253,7 +253,7 @@ const dbInit = {
 		}
 	},
 
-	// EWS（Thunderbird 接入）：同步水位表 + email.update_time 增量列
+	// EWS（Thunderbird 接入）：同步水位表 + email.update_time 增量列 + 物理删除 tombstone
 	async v4_4DB(c) {
 		try {
 			await c.env.db.prepare(`
@@ -263,6 +263,23 @@ const dbInit = {
 					sync_state TEXT,
 					update_time INTEGER,
 					PRIMARY KEY (user_id, folder)
+				)
+			`).run();
+		} catch (e) {
+			console.warn(`跳过数据：${e.message}`);
+		}
+
+		try {
+			// 物理删除（附件彻底删除 / 自动清理等）的 tombstone：邮件行已不存在，增量扫描看不到，
+			// 写侧在物理删除前 INSERT OR IGNORE，读侧据此在 SyncFolderItems 里补 Delete 事件
+			await c.env.db.prepare(`
+				CREATE TABLE IF NOT EXISTS ews_tombstone (
+					user_id INTEGER NOT NULL,
+					email_id INTEGER NOT NULL,
+					type INTEGER NOT NULL DEFAULT 0,
+					trash INTEGER NOT NULL DEFAULT 0,
+					del_time TEXT NOT NULL,
+					PRIMARY KEY (user_id, email_id)
 				)
 			`).run();
 		} catch (e) {

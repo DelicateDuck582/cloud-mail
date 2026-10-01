@@ -8,7 +8,7 @@
  * 为保持零项目依赖而内联，注释处标注了来源。
  */
 
-import { EWS_ROOT_CHILDREN } from './const.js';
+import { EWS_MAX_MIME_ITEM_IDS, EWS_ROOT_CHILDREN } from './const.js';
 import { children, escapeXml, firstChild, textOf } from './xml.js';
 
 // ../const/entity-const：emailConst.unread（0=未读，1=已读）
@@ -248,6 +248,75 @@ export function classifySyncRow(kind, row, watermark) {
 	return known ? 'update' : 'create';
 }
 
+// ------------------------------------------------ 资源护栏（纯函数） --------
+
+/**
+ * MimeContent 单次响应的 Id 白名单：只允许前 limit 个 Id 真正重建 MimeContent，
+ * 其余 Id 仍回元数据（客户端可按需再取），避免一次响应重建过多重邮件。
+ * 返回 Set 便于 O(1) 判定。
+ */
+export function mimeContentIdSet(ids, limit = EWS_MAX_MIME_ITEM_IDS) {
+	const value = Number(limit);
+	const max = Number.isFinite(value) && value > 0 ? Math.floor(value) : EWS_MAX_MIME_ITEM_IDS;
+	const set = new Set();
+	for (const id of ids || []) {
+		if (set.size >= max) break;
+		const emailId = Number(id);
+		if (Number.isFinite(emailId) && emailId > 0) set.add(emailId);
+	}
+	return set;
+}
+
+/**
+ * 本次响应「已重建附件字节」账本护栏：budget = { total, limit }（跨多封邮件累计）。
+ * 返回 false 表示本附件会使累计超出 limit → 调用方走既有「跳过该附件」路径。
+ * size <= 0 视为大小未知（老数据 size 未回填）：放行，下载后由调用方按实际字节累加。
+ */
+export function attBudgetAllows(budget, size) {
+	const limit = Number(budget?.limit);
+	const total = Number(budget?.total);
+	if (!Number.isFinite(limit) || limit <= 0) return true;
+	if (!Number.isFinite(total)) return true;
+	const value = Number(size) || 0;
+	if (value <= 0) return true;
+	return total + value <= limit;
+}
+
+/**
+ * 物理删除 tombstone（ews_tombstone 行）→ 该邮件物理删除前所属的文件夹 token：
+ * trash=1 → deleteditems；否则按 type（0=收件 → inbox，1=发件 → sentitems）。
+ * 与 handlers.js 的 visibleFilter/scopeFilter 口径一致。
+ */
+export function tombstoneFolderToken(row) {
+	if (Number(row?.trash) === 1) return 'deleteditems';
+	return Number(row?.type) === TYPE_SEND ? 'sentitems' : 'inbox';
+}
+
+/**
+ * 物理删除事件 → 本次请求文件夹要产出的 Delete ItemId 列表（纯函数）：
+ *   - 只产出「物理删除前属于本文件夹」的行（其它文件夹的 Delete 由各自的 SyncFolderItems 负责）；
+ *   - 与同轮已知 ItemId 集合（Create/Update/Delete 已产出的 Id）去重，同一 Id 一轮只出现一次；
+ *   - tombstone 内自身重复（同 emailId）也去重。
+ * @param {string} folderToken 本次请求的文件夹 token（inbox/sentitems/deleteditems）
+ * @param {Array<{email_id?: number, emailId?: number, type?: number, trash?: number}>} tombstones
+ * @param {Set<number>|null} knownIds
+ * @returns {number[]}
+ */
+export function selectTombstoneDeletes(folderToken, tombstones, knownIds = null) {
+	const seen = new Set();
+	const out = [];
+	for (const row of tombstones || []) {
+		const emailId = Number(row?.email_id ?? row?.emailId);
+		if (!Number.isFinite(emailId) || emailId <= 0) continue;
+		if (tombstoneFolderToken(row) !== folderToken) continue;
+		if (knownIds && knownIds.has(emailId)) continue;
+		if (seen.has(emailId)) continue;
+		seen.add(emailId);
+		out.push(emailId);
+	}
+	return out;
+}
+
 // ---------------------------------------------------------- CreateItem 侧 ----
 
 export function parseMailbox(node) {
@@ -276,6 +345,7 @@ export function parseMailboxList(container) {
 export function splitOutgoingAttachments(html, outgoing) {
 	const source = typeof html === 'string' ? html : '';
 	const attachments = [];
+	const demoted = [];
 	let result = source;
 
 	for (const item of outgoing || []) {
@@ -284,7 +354,13 @@ export function splitOutgoingAttachments(html, outgoing) {
 		// 少数客户端用文件名当 cid
 		const referencedByName = result.includes(`cid:${item.name}`);
 
-		if (item.isInline || referencedByCid || referencedByName) {
+		// IsInline 但类型不是 image/* 或 video/*（如 text/calendar、application/pdf）：
+		// 发信链路只把 data: 图片/视频内联（att-service.toImageUrlHtml），替换成 data: URL 只会
+		// 变成正文里的坏内容甚至丢件 → 强制按普通附件发出（不做 cid: → data: 替换）
+		const demotedInline = item.isInline === true && !/^(image|video)\//i.test(String(item.mimeType ?? ''));
+		if (demotedInline) demoted.push(item.name);
+
+		if (!demotedInline && (item.isInline || referencedByCid || referencedByName)) {
 			let replaced = result;
 			if (item.contentId !== '') replaced = replaced.split(`cid:${item.contentId}`).join(dataUrl);
 			if (replaced === result) replaced = replaced.split(`cid:${item.name}`).join(dataUrl);
@@ -304,6 +380,10 @@ export function splitOutgoingAttachments(html, outgoing) {
 			mimeType: item.mimeType,
 			contentType: item.mimeType
 		});
+	}
+
+	if (demoted.length > 0) {
+		console.info(`[ews] IsInline attachments with non image/video type are sent as regular attachments: ${demoted.join(', ')}`);
 	}
 
 	return { html: result, attachments };
