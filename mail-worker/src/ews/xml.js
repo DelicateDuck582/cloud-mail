@@ -121,11 +121,17 @@ export function parseSoapRequest(xmlText) {
 	return { operation, payload: body[operation], header: envelope.Header ?? null };
 }
 
-/** SOAP 信封 + ServerVersionInfo（部分客户端会据此判断服务端版本，缺失时降级） */
+/**
+ * SOAP 信封 + ServerVersionInfo：应答 Exchange 2013 SP1，与 TB 请求的
+ * RequestServerVersion=Exchange2013_SP1 一致。
+ * Version 必须是 TB（rust/ews 的 ServerVersion）认识的标准字面量（Exchange2013_SP1 / Exchange2013 /
+ * Exchange2010_SP2 / Exchange2010_SP1 / Exchange2010 / Exchange2007_SP1 / Exchange2007）；
+ * V2_14 之类的版本号不在其列，会被当未知值处理；V2_7（Exchange 2010 SP1）则会让客户端降级甚至拒收。
+ */
 export function soapEnvelope(innerXml) {
 	return '<?xml version="1.0" encoding="utf-8"?>' +
 		`<soap:Envelope xmlns:soap="${SOAP_NS}" xmlns:t="${TYPES_NS}" xmlns:m="${MESSAGES_NS}">` +
-		'<soap:Header><t:ServerVersionInfo MajorVersion="15" MinorVersion="0" MajorBuildNumber="1" MinorBuildNumber="0" Version="V2_7" /></soap:Header>' +
+		'<soap:Header><t:ServerVersionInfo MajorVersion="15" MinorVersion="0" MajorBuildNumber="847" MinorBuildNumber="0" Version="Exchange2013_SP1" /></soap:Header>' +
 		`<soap:Body>${innerXml}</soap:Body>` +
 		'</soap:Envelope>';
 }
@@ -145,11 +151,19 @@ export function soapFault(responseCode, faultString, faultCode = 'soap:Client') 
 	return soapEnvelope(inner);
 }
 
-/** <m:XxxResponse><m:ResponseMessages>…</m:ResponseMessages></m:XxxResponse> */
+/**
+ * 成功响应 = 完整 SOAP 信封（soapEnvelope）+ <m:XxxResponse><m:ResponseMessages>…</m:ResponseMessages></m:XxxResponse>。
+ *
+ * 所有 handler 的成功返回都经本函数（唯一出口）：SOAP 客户端（TB 145）要求 200 响应必须是完整
+ * 信封，裸的操作响应会解析失败 → TB 统一显示「身份验证出错」。Fault 走 soapFault（另经
+ * soapEnvelope），与本函数互不嵌套，不会双重包裹。
+ * 操作根元素上的 m:/t: xmlns 声明原样保留（外层信封也声明了同名前缀，两处都可达）。
+ */
 export function operationResponse(operationName, responseMessagesXml) {
-	return `<m:${operationName}Response xmlns:m="${MESSAGES_NS}" xmlns:t="${TYPES_NS}">` +
+	const inner = `<m:${operationName}Response xmlns:m="${MESSAGES_NS}" xmlns:t="${TYPES_NS}">` +
 		`<m:ResponseMessages>${responseMessagesXml}</m:ResponseMessages>` +
 		`</m:${operationName}Response>`;
+	return soapEnvelope(inner);
 }
 
 /**

@@ -5,6 +5,7 @@
  *   - 非 POST → 405
  *   - HTTP Basic 认证失败 → 401 + WWW-Authenticate（不带 SOAP body，客户端会重发凭据）
  *   - 认证通过 → c.set('user', userRow)，解析 SOAP 后分发到 handlers.js
+ *   - 成功 → HTTP 200 + 完整 SOAP 信封（handler 经 operationResponse 已包好信封，这里不再二次包裹）
  *   - 业务错误 → HTTP 200 + SOAP Fault（EWS 惯例，TB 两种都吃）
  *
  * 独立 Hono 实例的目的：handler 拿到的是真正的 Hono context c，
@@ -100,6 +101,11 @@ ewsApp.all('*', async (c) => {
 	if (bodyText.length > EWS_MAX_REQUEST_BYTES) {
 		return tooLargeResponse(bodyText.length);
 	}
+
+	// 诊断日志（已认证用户的请求，泄露风险低）：tail CF 日志可确认 TB 各阶段实际发送的 SOAP 原文
+	// 截断放宽到 2500：TB 一次 GetFolder/FindFolder 会点名十来个 Distinguished 文件夹，
+	// 500 字符看不到完整 FolderIds 列表（排查「只发 GetFolder 就停」时必需）
+	console.log('EWS req body:', bodyText.slice(0, 2500));
 
 	const parsed = parseSoapRequest(bodyText);
 	if (parsed.error) {

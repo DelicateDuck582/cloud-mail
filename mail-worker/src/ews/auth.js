@@ -169,6 +169,8 @@ export async function authenticate(c) {
 
 	if (!userRow) {
 		authFailRecord(ip);
+		// 诊断：记录失败尝试的用户名（不含密码），便于排查客户端配置（生产可移除）
+		console.warn(`EWS auth failed: user=${JSON.stringify(credentials.email)} domain=${credentials.email.split('@')[1] || '(no-domain)'} ip=${ip}`);
 		// 失败延迟：与 login-service 的 1 秒失败延迟对齐（锁定路径在上面提前返回，不再额外延迟）
 		await new Promise((resolve) => setTimeout(resolve, EWS_AUTH_FAIL_DELAY_MS));
 		return null;

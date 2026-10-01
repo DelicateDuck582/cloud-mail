@@ -73,8 +73,67 @@ export const EWS_FOLDER_ALIASES = {
 // root 的子文件夹（ChildFolderCount 与层级同步用）
 export const EWS_ROOT_CHILDREN = ['inbox', 'sentitems', 'deleteditems', 'drafts', 'outbox'];
 
+/**
+ * 标准 EWS DistinguishedFolderId 名（小写，MS 文档里的完整枚举），本服务未实现它们。
+ *
+ * Thunderbird「收取邮件」会在一次 GetFolder 里点名一串 Distinguished 文件夹
+ * （msgfolderroot/inbox/junkemail/archive/calendar…），其中未实现的若回 ErrorFolderNotFound，
+ * TB 见到「成功 + 失败」混合的 GetFolder 响应会中止整个收取流程（后续不再发 Sync*）。
+ * 故对它们兜底成「空文件夹成功」（kind='empty'，计数恒 0、恒无邮件，不泄露任何数据）。
+ */
+export const EWS_EMPTY_DISTINGUISHED_NAMES = new Set([
+	'archive', 'calendar', 'contacts', 'conversationhistory', 'journal', 'junkemail',
+	'notes', 'searchfolders', 'tasks', 'voicemail', 'nonipmroot', 'publicfoldersroot',
+	'imcontactlist', 'quickcontacts', 'companycontacts', 'organizationalcontacts', 'directory',
+	'syncissues', 'conflicts', 'localfailures', 'serverfailures',
+	'recoverableitemsroot', 'recoverableitemsdeletions', 'recoverableitemsversions',
+	'recoverableitemspurges', 'recoverableitemsdiscoveryholds',
+	'archivemsgfolderroot', 'archivedeleteditems', 'archiveinbox',
+	'archiverecoverableitemsroot', 'archiverecoverableitemsdeletions', 'archiverecoverableitemsversions',
+	'archiverecoverableitemspurges', 'archiverecoverableitemsdiscoveryholds'
+]);
+
+// 账号文件夹前缀：该用户名下每个收件账号（account 表一行）一个自定义文件夹，
+// FolderId = 'acct-<accountId>'（如 acct-3），DisplayName = 账号邮箱地址。
+export const EWS_ACCOUNT_FOLDER_PREFIX = 'acct-';
+
+/**
+ * 'acct-<accountId>' → 正整数 accountId；其余（Distinguished 名 / 非数字 / 注入串）→ null。
+ * token 来自客户端，只接受纯数字主键，绝不把字符串拼进查询。
+ */
+export function parseAccountFolder(token) {
+	const text = String(token ?? '').trim().toLowerCase();
+	if (!text.startsWith(EWS_ACCOUNT_FOLDER_PREFIX)) return null;
+	const digits = text.slice(EWS_ACCOUNT_FOLDER_PREFIX.length);
+	if (!/^\d+$/.test(digits)) return null;
+	const value = Number(digits);
+	return Number.isSafeInteger(value) && value > 0 ? value : null;
+}
+
+/** accountId → 账号文件夹 token（DisplayName 需查 account 表，由 handlers 填充，本层零依赖不查库） */
+export function accountFolderId(accountId) {
+	return `${EWS_ACCOUNT_FOLDER_PREFIX}${Number(accountId)}`;
+}
+
+/**
+ * token → 文件夹定义：Distinguished（含别名）优先，其次账号文件夹 'acct-<id>'，
+ * 最后是「未实现的标准 Distinguished 名」→ kind='empty' 空文件夹兜底
+ * （token/DisplayName 原样回传请求里的 Id，客户端必须能对上自己请求的文件夹）。
+ * 账号文件夹的 displayName 留空，由 handlers 用账号邮箱填充；归属（属于当前用户）也在 handlers 校验。
+ * 既非 Distinguished 也非 acct- 前缀的非法 token 仍返回 null（调用方回 ErrorFolderNotFound）。
+ */
 export function ewsFolderDef(token) {
-	const normalized = String(token ?? '').trim().toLowerCase();
+	const original = String(token ?? '').trim();
+	const normalized = original.toLowerCase();
 	const canonical = EWS_FOLDER_ALIASES[normalized] || normalized;
-	return EWS_FOLDER_DEFS.find((def) => def.token === canonical) || null;
+	const def = EWS_FOLDER_DEFS.find((item) => item.token === canonical);
+	if (def) return def;
+	const accountId = parseAccountFolder(canonical);
+	if (accountId === null) {
+		if (EWS_EMPTY_DISTINGUISHED_NAMES.has(canonical)) {
+			return { token: original, kind: 'empty', displayName: original };
+		}
+		return null;
+	}
+	return { token: accountFolderId(accountId), kind: 'account', accountId, displayName: '' };
 }

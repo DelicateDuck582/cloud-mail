@@ -2,12 +2,18 @@
  * EWS 操作编排（handler）：D1 查询 / COS 读取 / 发信走项目现有 service。
  *
  * 覆盖 Thunderbird 145+ 原生 Exchange 账号会发起的操作：
- *   GetFolder / SyncFolderHierarchy / SyncFolderItems / GetItem / GetAttachment /
- *   CreateItem / UpdateItem / DeleteItem / SendItem
+ *   GetFolder / FindFolder / SyncFolderHierarchy / SyncFolderItems / GetItem / GetAttachment /
+ *   CreateItem / UpdateItem / DeleteItem / SendItem /
+ *   ResolveNames / GetMailTips / GetServerTimeZones（TB 账号验证阶段会发，
+ *   其中 ResolveNames 缺一条 Fault 就会被 TB 当成「身份验证出错」）
  * 其余操作统一回 ErrorNotImplemented Fault（TB 会自动降级，如轮询代替推送）。
  *
  * 约定：
- *   - 所有按 Id 取数据的操作强制 where userId = 当前登录用户，防越权；
+ *   - 可见域：Distinguished 文件夹（收件箱/已发送/已删除）按用户聚合（userId 全量，信息不丢）；
+ *     该用户名下每个收件账号（account 表一行）另有一个自定义文件夹：FolderId = acct-<accountId>、
+ *     DisplayName = 账号邮箱，只含该账号的可见收件（type=0, is_del=0, trash=0）；
+ *   - 所有按 Id 取数据的操作强制 where userId = 当前登录用户，防越权；账号文件夹额外校验
+ *     account.user_id = 当前用户（他人账号按 ErrorFolderNotFound 处理，不泄露存在性）；
  *   - 以纯元数据为主，只有 GetItem(MimeContent) / GetAttachment / CreateItem 触碰 COS；
  *   - 邮件「最后修改时间」= COALESCE(NULLIF(update_time,''), create_time)（同为
  *     'YYYY-MM-DD HH:mm:ss' text，字典序即时间序），增量水位存 ews_sync_state；
@@ -19,6 +25,7 @@ import dayjs from 'dayjs';
 import PostalMime from 'postal-mime';
 import orm from '../entity/orm';
 import email from '../entity/email';
+import account from '../entity/account';
 import { att } from '../entity/att';
 import emailService from '../service/email-service';
 import accountService from '../service/account-service';
@@ -30,6 +37,7 @@ import {
 	EWS_MAX_MIME_ITEM_IDS,
 	EWS_ROOT_CHILDREN,
 	EWS_SYNC_PAGE,
+	accountFolderId,
 	ewsFolderDef,
 	ewsMaxAttBytes,
 	ewsMaxTotalAttBytes
@@ -55,18 +63,25 @@ import {
 	changeKeyOf,
 	classifySyncRow,
 	cleanBase64,
+	createItemItemsXml,
 	decodeSyncState,
 	emptySyncState,
 	encodeSyncState,
+	findFolderRootXml,
 	isInlineAttachment,
 	isSentRow,
+	mailTipsXml,
 	mimeContentIdSet,
 	parseAddressList,
 	parseMailbox,
 	parseMailboxList,
+	replaceInlineImagesWithPlaceholder,
+	resolutionSetXml,
+	resolveNameMatches,
 	selectTombstoneDeletes,
 	splitOutgoingAttachments,
 	stripCidBrackets,
+	timeZoneDefinitionsXml,
 	toDateMs
 } from './protocol.js';
 
@@ -108,8 +123,89 @@ function emailSelect() {
 
 const DISTINGUISHED_IDS = ['FolderId', 'DistinguishedFolderId'];
 
-/** 正常列表可见的邮件条件；trash 文件夹为垃圾桶语义（与 Web 端一致） */
-function visibleFilter(kind, userId) {
+/**
+ * 与登录邮箱同名的收件账号行（必须属于当前 user）：发件账号优先选它（CreateItem），
+ * 账号文件夹排序也以它为首（EWS 账户 = 该地址的直觉）。
+ * account.email 是 NOCASE 唯一索引，但列默认 BINARY 排序规则 → 需显式 COLLATE NOCASE 才大小写不敏感。
+ * 无同名账号（或用户信息不完整）返回 null。
+ */
+function selectLoginEmailAccount(c, user) {
+	const userId = Number(user?.userId);
+	const address = String(user?.email ?? '').trim();
+	if (!Number.isInteger(userId) || userId <= 0 || address === '') return Promise.resolve(null);
+	return orm(c).select().from(account)
+		.where(and(eq(account.userId, userId), sql`${account.email} COLLATE NOCASE = ${address}`))
+		.get();
+}
+
+/** 同名账号的 accountId（number）；无同名账号 → null */
+async function resolveUserAccount(c, user) {
+	const row = await selectLoginEmailAccount(c, user);
+	return row ? Number(row.accountId) : null;
+}
+
+/** 该用户名下的全部收件账号（账号文件夹的来源，一个账号一个文件夹）；account_id 升序保证顺序稳定 */
+async function selectUserAccounts(c, userId) {
+	return orm(c).select({ accountId: account.accountId, email: account.email })
+		.from(account)
+		.where(eq(account.userId, userId))
+		.orderBy(asc(account.accountId))
+		.all();
+}
+
+/**
+ * 当前用户名下的账号（accountId → 邮箱）：账号文件夹的 DisplayName 与归属校验。
+ * 他人账号 / 不存在的账号不在结果里 → 调用方按 ErrorFolderNotFound 处理（不泄露账号是否存在）。
+ */
+async function selectOwnedAccounts(c, userId, accountIds) {
+	const result = new Map();
+	const ids = [...new Set((accountIds || []).map(Number)
+		.filter((id) => Number.isSafeInteger(id) && id > 0))];
+	if (ids.length === 0) return result;
+	for (const chunk of chunkList(ids)) {
+		const rows = await orm(c).select({ accountId: account.accountId, email: account.email })
+			.from(account)
+			.where(and(eq(account.userId, userId), inArray(account.accountId, chunk)))
+			.all();
+		for (const row of rows) result.set(Number(row.accountId), String(row.email ?? ''));
+	}
+	return result;
+}
+
+/** 账号文件夹定义：FolderId = acct-<accountId>，DisplayName = 账号邮箱（查 account 表后填充） */
+function accountFolderDef(accountId, address) {
+	return {
+		token: accountFolderId(accountId),
+		kind: 'account',
+		accountId: Number(accountId),
+		displayName: String(address ?? '')
+	};
+}
+
+/** 账号文件夹的收件账号条件；accountId 非法（非数字 / <=0）→ null（调用方回永不匹配条件，绝不放宽为全量） */
+function accountFilter(accountId) {
+	const value = Number(accountId);
+	if (!Number.isFinite(value) || value <= 0) return null;
+	return eq(email.accountId, value);
+}
+
+/**
+ * 正常列表可见的邮件条件；trash 文件夹为垃圾桶语义（与 Web 端一致）。
+ * accountId 仅账号文件夹（kind='account'）使用：只含该账号的可见收件；
+ * Distinguished 文件夹不传（用户级聚合，见 handlers 头部约定）。
+ */
+function visibleFilter(kind, userId, accountId = null) {
+	if (kind === 'account') {
+		const scoped = accountFilter(accountId);
+		if (scoped === null) return sql`1 = 0`;
+		return and(
+			eq(email.userId, userId),
+			scoped,
+			eq(email.type, emailConst.type.RECEIVE),
+			eq(email.isDel, isDel.NORMAL),
+			eq(email.trash, 0)
+		);
+	}
 	if (kind === 'inbox') {
 		return and(
 			eq(email.userId, userId),
@@ -130,19 +226,32 @@ function visibleFilter(kind, userId) {
 		// 软删进垃圾桶（trash=1）；附件彻底删除会连带把邮件标 isDel=1（att-service.purgeAttRows）
 		return and(eq(email.userId, userId), or(eq(email.trash, 1), eq(email.isDel, isDel.DELETE)));
 	}
+	// 空文件夹（drafts/outbox，以及未实现的 Distinguished 兜底兜出的空文件夹）：恒不可见，
+	// 绝不放宽为全量（返回 null 会被 drizzle 忽略成无 where 条件 → 扫到全部用户的数据）
+	if (kind === 'empty') return sql`1 = 0`;
 	return null;
 }
 
-/** 增量扫描范围（含垃圾桶里的行，用于产出 Delete 事件） */
-function scopeFilter(kind, userId) {
+/**
+ * 增量扫描范围（含垃圾桶里的行，用于产出 Delete 事件）。
+ * 账号文件夹的范围 = 该账号的全部收件（含已进垃圾桶/已删的行），可见性由 classifySyncRow 判定。
+ */
+function scopeFilter(kind, userId, accountId = null) {
+	if (kind === 'account') {
+		const scoped = accountFilter(accountId);
+		if (scoped === null) return sql`1 = 0`;
+		return and(eq(email.userId, userId), scoped, eq(email.type, emailConst.type.RECEIVE));
+	}
 	if (kind === 'inbox') return and(eq(email.userId, userId), eq(email.type, emailConst.type.RECEIVE));
 	if (kind === 'sent') return and(eq(email.userId, userId), eq(email.type, emailConst.type.SEND));
 	if (kind === 'trash') return eq(email.userId, userId);
+	// 空文件夹（含未实现的 Distinguished 兜底）：扫描域为空（同 visibleFilter，绝不退化成全量）
+	if (kind === 'empty') return sql`1 = 0`;
 	return null;
 }
 
 function isMailFolder(kind) {
-	return kind === 'inbox' || kind === 'sent' || kind === 'trash';
+	return kind === 'inbox' || kind === 'sent' || kind === 'trash' || kind === 'account';
 }
 
 /**
@@ -158,11 +267,20 @@ function containerFolderToken(container) {
 	return attr(node, 'Id') || '';
 }
 
-function extractFolderTokens(payload) {
-	const container = firstChild(payload, 'FolderIds');
+/**
+ * 取容器里的全部文件夹 Id：children() 取同名元素的全部（文件夹 Id 可重复），
+ * 单元素时 fast-xml-parser 不返回数组，故禁止用 firstChild。命名空间前缀已被解析器剥离。
+ * 容器名由调用方指定：FolderIds（GetFolder）/ ParentFolderIds（FindFolder）。
+ * 按容器内元素的出现顺序取（同一元素名的重复项本身就是数组，顺序不变）：响应顺序 = 请求顺序，
+ * 客户端按序对齐请求项与 ResponseMessage（仅两种 Id 元素相互交错时会被解析器按名归组而重排）。
+ */
+function extractFolderTokens(payload, containerName = 'FolderIds') {
+	const container = firstChild(payload, containerName);
+	if (!container || typeof container !== 'object') return [];
 	const tokens = [];
-	for (const name of DISTINGUISHED_IDS) {
-		for (const node of children(container, name)) {
+	for (const [name, value] of Object.entries(container)) {
+		if (!DISTINGUISHED_IDS.includes(name)) continue;
+		for (const node of asArray(value)) {
 			const token = attr(node, 'Id');
 			if (token) tokens.push(token);
 		}
@@ -197,12 +315,12 @@ function assertBatchSize(ids, operation) {
 		`Too many ids in one ${operation} call (${ids.length} > ${EWS_MAX_ITEM_IDS}).`);
 }
 
-async function folderCounts(c, userId, kind) {
+async function folderCounts(c, userId, kind, accountId = null) {
 	if (!isMailFolder(kind)) return { total: 0, unread: 0 };
 	const row = await orm(c).select({
 		total: count(),
 		unread: sql`SUM(CASE WHEN ${email.unread} = ${emailConst.unread.UNREAD} THEN 1 ELSE 0 END)`
-	}).from(email).where(visibleFilter(kind, userId)).get();
+	}).from(email).where(visibleFilter(kind, userId, accountId)).get();
 	return { total: Number(row?.total) || 0, unread: Number(row?.unread) || 0 };
 }
 
@@ -254,22 +372,41 @@ function newAttBudget(c) {
 	return { total: 0, limit: ewsMaxTotalAttBytes(c.env), warned: false };
 }
 
+/**
+ * 记录被跳过的内嵌图在正文里的引用形态：`cid:<contentId>`（成功替换后的形态）
+ * 与 `{{domain}}<key>`（库内正文的原始形态），供循环后把 <img ...> 整段换成可见占位。
+ * 普通附件（非内嵌图）被跳过时不记录：正文里没有它的引用。
+ */
+function collectSkippedInlineRef(refs, attRow) {
+	if (!isInlineAttachment(attRow)) return;
+	const key = String(attRow.key ?? '');
+	const contentId = stripCidBrackets(attRow.contentId) || stripCidBrackets(key);
+	if (contentId !== '') refs.add(`cid:${contentId}`);
+	if (key !== '') refs.add(`{{domain}}${key}`);
+}
+
 /** 用 COS 附件 + 库内正文重建完整 MIME（base64），供 EWS MimeContent */
 async function buildMimeForRow(c, row, maxAttBytes, budget) {
 	const rows = await attachmentRows(c, row.emailId, row.userId);
 	let html = row.content || '';
 	const inlineImages = [];
 	const attachments = [];
+	// 被跳过的内嵌图引用：循环后统一把正文里的 <img> 换成文字占位（图片无声消失用户无从得知）
+	const skippedInlineRefs = new Set();
 
 	for (const attRow of rows) {
 		// 超限附件不进 MIME（TB 侧表现为该附件缺失，正文与其它附件仍可见）
-		if ((Number(attRow.size) || 0) > maxAttBytes) continue;
+		if ((Number(attRow.size) || 0) > maxAttBytes) {
+			collectSkippedInlineRef(skippedInlineRefs, attRow);
+			continue;
+		}
 		// 本次响应累计护栏：多封邮件累计超出 ewsMaxTotalAttBytes 后，剩余附件同样跳过
 		if (!attBudgetAllows(budget, attRow.size)) {
 			if (!budget.warned) {
 				budget.warned = true;
 				console.warn(`[ews] rebuilding MimeContent hit the total attachment budget (${budget.limit} bytes): remaining attachments are skipped in this response.`);
 			}
+			collectSkippedInlineRef(skippedInlineRefs, attRow);
 			continue;
 		}
 		const object = await r2Service.getObj(c, attRow.key);
@@ -291,6 +428,10 @@ async function buildMimeForRow(c, row, maxAttBytes, budget) {
 			attachments.push({ filename: attRow.filename, mimeType: attRow.mimeType, data });
 		}
 	}
+
+	// 被跳过的内嵌图：正文里引用它的整段 <img ...> 替换为可见占位（提示大小阈值与网页版入口），
+	// 成功重建的内嵌图此刻已是 cid: 形态、不受影响
+	html = replaceInlineImagesWithPlaceholder(html, skippedInlineRefs, maxAttBytes);
 
 	const dateMs = toDateMs(row.createTime);
 	return buildMimeBase64({
@@ -355,10 +496,10 @@ async function storeSyncState(c, userId, folder, state) {
 }
 
 /** 当前可见邮件的最大「最后修改时间」= 初始全量水位快照 */
-async function snapshotWatermark(c, userId, kind) {
+async function snapshotWatermark(c, userId, kind, accountId = null) {
 	try {
 		const row = await orm(c).select({ wm: sql`MAX(${effTime()})` }).from(email)
-			.where(visibleFilter(kind, userId)).get();
+			.where(visibleFilter(kind, userId, accountId)).get();
 		if (row?.wm === null || row?.wm === undefined) return '';
 		return String(row.wm);
 	} catch (error) {
@@ -393,31 +534,110 @@ async function handleGetFolder(c, payload, user) {
 		throw new EwsFault('ErrorInvalidRequest', 'GetFolder requires FolderIds.');
 	}
 
-	const known = [];
-	const unknown = [];
-	for (const token of tokens) {
-		const def = ewsFolderDef(token);
-		if (def) known.push(def);
-		else unknown.push(token);
-	}
+	// TB 一次 GETFOLDER 点名一串 DistinguishedFolderId（msgfolderroot 第一个）并按序 zip 请求项与
+	// ResponseMessages：数量必须 = 请求数、顺序必须 = 请求顺序，root 必须第一条且成功
+	// → 逐个 token 产出一条 ResponseMessage（每条只含自己那个文件夹），绝不合并成一条。
+	const defs = tokens.map((token) => ewsFolderDef(token));
+	// 账号文件夹：批量取当前用户名下的账号行（DisplayName = 账号邮箱）
+	// 查不到 = 不属于当前用户（或已不存在）→ ErrorFolderNotFound，不泄露账号是否存在
+	const ownedAccounts = await selectOwnedAccounts(c, userId, defs.map((def) => def?.accountId));
 
 	const messages = [];
-	if (known.length > 0) {
-		const folders = [];
-		for (const def of known) {
-			folders.push(buildFolderXml(def, await folderCounts(c, userId, def.kind)));
+	for (let i = 0; i < tokens.length; i++) {
+		const token = tokens[i];
+		const def = defs[i];
+		if (!def || (def.kind === 'account' && !ownedAccounts.has(def.accountId))) {
+			messages.push(responseMessage('GetFolder', {
+				responseClass: 'Error',
+				responseCode: 'ErrorFolderNotFound',
+				messageText: `Folder not found: ${token}`
+			}));
+			continue;
 		}
-		messages.push(responseMessage('GetFolder', { body: `<m:Folders>${folders.join('')}</m:Folders>` }));
-	}
-	for (const token of unknown) {
+		let xmlDef = def;
+		let changeKey = '1';
+		if (def.kind === 'account') {
+			xmlDef = accountFolderDef(def.accountId, ownedAccounts.get(def.accountId));
+			changeKey = String(def.accountId);
+		} else if (def.kind === 'root') {
+			// root 的 ChildFolderCount 含账号文件夹（与 SyncFolderHierarchy 的 Create 集合自洽）
+			const accounts = await selectUserAccounts(c, userId);
+			xmlDef = { ...def, extraChildCount: accounts.length };
+		}
 		messages.push(responseMessage('GetFolder', {
-			responseClass: 'Error',
-			responseCode: 'ErrorFolderNotFound',
-			messageText: `Folder not found: ${token}`
+			body: `<m:Folders>${buildFolderXml(xmlDef,
+				await folderCounts(c, userId, def.kind, def.accountId), changeKey)}</m:Folders>`
 		}));
 	}
 
-	return operationResponse('GetFolder', messages.join(''));
+	const xml = operationResponse('GetFolder', messages.join(''));
+	// 诊断（TB「收取邮件」只发 GetFolder、后续 Sync* 静默缺席时用）：完整输出（该请求频率低，日志量可控），
+	// 需要看到响应中后段（每个 FolderId 的 ChildFolderCount/DisplayName）才能判断 TB 为何不再继续
+	console.log('EWS GetFolder resp:', xml);
+	return xml;
+}
+
+// ---------------------------------------------------------------- FindFolder ----
+
+/**
+ * root（msgfolderroot / ipm_subtree 别名同为 'root'）的子文件夹：5 个 Distinguished（inbox/sentitems/
+ * deleteditems/drafts/outbox）+ 当前用户名下每个账号文件夹（acct-<id>，DisplayName = 账号邮箱）。
+ * 与 SyncFolderHierarchy 的 Create 集合口径一致；他人账号天然不在 selectUserAccounts 结果里（跳过）。
+ */
+async function rootChildFolders(c, userId) {
+	const folders = [];
+	for (const childToken of EWS_ROOT_CHILDREN) {
+		const def = ewsFolderDef(childToken);
+		folders.push(buildFolderXml(def, await folderCounts(c, userId, def.kind)));
+	}
+	for (const row of await selectUserAccounts(c, userId)) {
+		const def = accountFolderDef(row.accountId, row.email);
+		folders.push(buildFolderXml(def, await folderCounts(c, userId, 'account', def.accountId),
+			String(def.accountId)));
+	}
+	return folders;
+}
+
+/**
+ * FindFolder：枚举父文件夹的子文件夹（TB 拉文件夹树的另一条路径，与 SyncFolderHierarchy 并列）。
+ * 请求形如 <m:FindFolder Traversal="Shallow"><m:ParentFolderIds><t:DistinguishedFolderId Id="msgfolderroot"/>…
+ *   - 每个 ParentFolderId 一条 ResponseMessage（顺序与请求一致，客户端按序对齐）；
+ *   - root/msgfolderroot → 全部子文件夹；其余父（Distinguished / 账号文件夹）→ 空列表（浅遍历，
+ *     Traversal 忽略：本服务的层级只有两层）；
+ *   - 账号文件夹父需归属校验，他人账号 → 与不存在的文件夹同一错误（不泄露账号是否存在）；
+ *   - 未知 token → ResponseClass=Error + ErrorFolderNotFound（绝不兜底成空列表）。
+ * FolderShape/BaseShape 忽略：恒回完整字段（IdOnly 的客户端只读 FolderId，多余字段无害）。
+ */
+async function handleFindFolder(c, payload, user) {
+	const userId = user.userId;
+	const tokens = extractFolderTokens(payload, 'ParentFolderIds');
+	if (tokens.length === 0) {
+		throw new EwsFault('ErrorInvalidRequest', 'FindFolder requires ParentFolderIds.');
+	}
+
+	// 账号文件夹：批量取当前用户名下的账号行一次（DisplayName = 账号邮箱 + 归属校验共用）
+	const defs = tokens.map((token) => ewsFolderDef(token));
+	const ownedAccounts = await selectOwnedAccounts(c, userId,
+		defs.map((def) => def?.accountId));
+
+	const messages = [];
+	for (let i = 0; i < tokens.length; i++) {
+		const token = tokens[i];
+		const def = defs[i];
+		if (!def || (def.kind === 'account' && !ownedAccounts.has(def.accountId))) {
+			messages.push(responseMessage('FindFolder', {
+				responseClass: 'Error',
+				responseCode: 'ErrorFolderNotFound',
+				messageText: `Folder not found: ${token}`
+			}));
+			continue;
+		}
+		// 浅遍历：只有 root 有子文件夹；Distinguished / 账号文件夹都是叶子（回空列表，不是错误）
+		const folders = def.kind === 'root' ? await rootChildFolders(c, userId) : [];
+		messages.push(responseMessage('FindFolder', { body: findFolderRootXml(folders) }));
+	}
+
+	return operationResponse('FindFolder', messages.join(''));
 }
 
 // ------------------------------------------------- SyncFolderHierarchy --------
@@ -426,18 +646,34 @@ async function handleSyncFolderHierarchy(c, payload, user) {
 	const userId = user.userId;
 	const token = textOf(firstChild(payload, 'SyncState')).trim();
 
-	// 文件夹集合是静态的（Inbox/Sent/Deleted/Drafts/Outbox）：已有 SyncState 直接回空变更
+	// 文件夹集合是静态的（Inbox/Sent/Deleted/Drafts/Outbox + 每个收件账号一个 acct-<id>）：
+	// 已有 SyncState 直接回空变更（账号列表变化不做增量：TB 重建账户时重新全量取）
+	// 三件套恒存在（TB 硬校验）：SyncState（非空）+ IncludesLastFolderInRange + Changes（可为空）
 	if (token !== '' && decodeSyncState(token)) {
 		return operationResponse('SyncFolderHierarchy', responseMessage('SyncFolderHierarchy', {
 			body: `<m:SyncState>${escapeXml(token)}</m:SyncState>` +
-				'<m:IncludesLastFolderInRange>true</m:IncludesLastFolderInRange>'
+				'<m:IncludesLastFolderInRange>true</m:IncludesLastFolderInRange>' +
+				'<m:Changes></m:Changes>'
 		}));
 	}
 
+	// 该用户名下每个收件账号 → 一个自定义文件夹（DisplayName = 账号邮箱）
+	// 同名账号（EWS 账户本身的地址）排最前，符合「账户先看到自己」的直觉
+	const preferredAccountId = await resolveUserAccount(c, user);
+	const accounts = await selectUserAccounts(c, userId);
+	const preferredIndex = accounts.findIndex((row) => Number(row.accountId) === preferredAccountId);
+	if (preferredIndex > 0) accounts.unshift(accounts.splice(preferredIndex, 1)[0]);
+
 	const changes = [];
 	for (const childToken of EWS_ROOT_CHILDREN) {
-		const def = ewsFolderDef(childToken);
+		let def = ewsFolderDef(childToken);
+		// root 的 ChildFolderCount 要含账号文件夹：同一响应里 Create 了它们，计数必须自洽
+		if (def.kind === 'root') def = { ...def, extraChildCount: accounts.length };
 		changes.push(`<t:Create>${buildFolderXml(def, await folderCounts(c, userId, def.kind))}</t:Create>`);
+	}
+	for (const row of accounts) {
+		const def = accountFolderDef(row.accountId, row.email);
+		changes.push(`<t:Create>${buildFolderXml(def, await folderCounts(c, userId, def.kind, def.accountId), String(def.accountId))}</t:Create>`);
 	}
 
 	return operationResponse('SyncFolderHierarchy', responseMessage('SyncFolderHierarchy', {
@@ -476,6 +712,10 @@ async function handleSyncFolderItems(c, payload, user) {
 	if (!def) {
 		throw new EwsFault('ErrorFolderNotFound', `Folder not found: ${folderToken}`);
 	}
+	// 账号文件夹：先校验该账号属于当前用户（他人账号 → 与不存在的文件夹同一错误；过滤条件本身也强制 userId）
+	if (def.kind === 'account' && !(await selectOwnedAccounts(c, userId, [def.accountId])).has(def.accountId)) {
+		throw new EwsFault('ErrorFolderNotFound', `Folder not found: ${folderToken}`);
+	}
 
 	const requested = Number(textOf(firstChild(payload, 'MaxChangesReturned')));
 	const pageSize = Math.max(1, Math.min(EWS_SYNC_PAGE,
@@ -485,12 +725,18 @@ async function handleSyncFolderItems(c, payload, user) {
 	const maxAttBytes = ewsMaxAttBytes(c.env);
 
 	// 根/草稿/发件箱：不承载邮件，回空变更
+	// 三件套恒存在（TB 硬校验）：SyncState（非空）+ IncludesLastItemInRange + Changes（可为空）
 	if (!isMailFolder(def.kind)) {
 		return operationResponse('SyncFolderItems', responseMessage('SyncFolderItems', {
 			body: `<m:SyncState>${escapeXml(encodeSyncState(emptySyncState()))}</m:SyncState>` +
-				'<m:IncludesLastItemInRange>true</m:IncludesLastItemInRange>'
+				'<m:IncludesLastItemInRange>true</m:IncludesLastItemInRange>' +
+				'<m:Changes></m:Changes>'
 		}));
 	}
+
+	// 邮件范围：Distinguished 文件夹 = 用户级聚合（全部收件账号）；账号文件夹（acct-<id>）= 该账号口径
+	// （可见域/水位快照/增量扫描共用同一过滤，本请求内所有查询复用）
+	const accountId = def.kind === 'account' ? def.accountId : null;
 
 	const token = textOf(firstChild(payload, 'SyncState')).trim();
 	let state = decodeSyncState(token);
@@ -500,7 +746,7 @@ async function handleSyncFolderItems(c, payload, user) {
 	}
 	if (!state) {
 		// 初始全量：以当前可见邮件的最大 update_time 为水位快照，再按 emailId 倒序分页回补历史
-		state = { ...emptySyncState(), wm: await snapshotWatermark(c, userId, def.kind), cur: FRESH_CURSOR };
+		state = { ...emptySyncState(), wm: await snapshotWatermark(c, userId, def.kind, accountId), cur: FRESH_CURSOR };
 	}
 
 	const creates = [];
@@ -521,7 +767,7 @@ async function handleSyncFolderItems(c, payload, user) {
 		if (cur !== null) {
 			const rows = await orm(c).select(emailSelect()).from(email)
 				.where(and(
-					visibleFilter(def.kind, userId),
+					visibleFilter(def.kind, userId, accountId),
 					lte(effTime(), wm),
 					lt(email.emailId, cur)
 				))
@@ -547,7 +793,7 @@ async function handleSyncFolderItems(c, payload, user) {
 			const budget = Math.max(1, pageSize - creates.length);
 			const rows = await orm(c).select(emailSelect()).from(email)
 				.where(and(
-					scopeFilter(def.kind, userId),
+					scopeFilter(def.kind, userId, accountId),
 					sql`(${effTime()} > ${wm} OR (${effTime()} = ${wm} AND ${email.emailId} > ${wid}))`
 				))
 				.orderBy(asc(effTime()), asc(email.emailId))
@@ -570,8 +816,10 @@ async function handleSyncFolderItems(c, payload, user) {
 		}
 
 		// ③ 物理删除 tombstone：邮件行已不存在，增量扫描看不到 → 按 del_time > 本轮进入时的水位补 Delete 事件。
-		//    与同轮已产出的 ItemId 去重；积压翻页中不产出（客户端尚未拿到全量，Delete 无意义且会跨轮重复）
-		if (!backfilling) {
+		//    与同轮已产出的 ItemId 去重；积压翻页中不产出（客户端尚未拿到全量，Delete 无意义且会跨轮重复）。
+		//    账号文件夹跳过：ews_tombstone 只记 type/trash 不记 account_id，无法归属到 acct-<id>
+		//    （同名邮件在 inbox 侧仍会收到 Delete；账号文件夹内的物理删除残留由客户端重新全量同步消化）
+		if (!backfilling && def.kind !== 'account') {
 			const tombstones = await readTombstones(c, userId, sweepWm);
 			const knownIds = new Set([...creates, ...updates, ...deletes].map((row) => Number(row.emailId)));
 			tombstoneDeletes = selectTombstoneDeletes(def.token, tombstones, knownIds);
@@ -596,9 +844,11 @@ async function handleSyncFolderItems(c, payload, user) {
 		tombstoneDeletes.map((emailId) => `<t:Delete><t:ItemId Id="${escapeXml(String(emailId))}"/></t:Delete>`).join('')
 	].join('');
 
+	// Changes 恒存在（无变更时也输出空元素：TB 反序列化要求该节点在场）；
+	// IncludesLastItemInRange 语义：more=true（还有下一页）→ false，否则 true
 	const body = `<m:SyncState>${escapeXml(encodeSyncState(nextState))}</m:SyncState>` +
 		`<m:IncludesLastItemInRange>${more ? 'false' : 'true'}</m:IncludesLastItemInRange>` +
-		(changesXml === '' ? '' : `<m:Changes>${changesXml}</m:Changes>`);
+		`<m:Changes>${changesXml}</m:Changes>`;
 
 	return operationResponse('SyncFolderItems', responseMessage('SyncFolderItems', { body }));
 }
@@ -837,13 +1087,17 @@ async function handleCreateItem(c, payload, user) {
 		throw new EwsFault('ErrorInvalidRequest', 'CreateItem requires at least one recipient (To/Cc/Bcc).');
 	}
 
-	// 发件账号：优先 From（必须是本人账号），否则用登录邮箱对应的主账号
-	let accountRow = from?.address ? await accountService.selectByEmailIncludeDel(c, from.address) : null;
-	if (!accountRow || accountRow.userId !== user.userId) {
-		accountRow = await accountService.selectByEmailIncludeDel(c, user.email);
-	}
-	if (!accountRow || accountRow.userId !== user.userId) {
-		throw new EwsFault('ErrorInvalidRequest', `No sender account available for ${user.email}.`);
+	// 发件账号：优先「与登录邮箱同名的收件账号」（与可见域同一口径，EWS 账户 = 该账号）；
+	// 无同名账号时保持原行为：From（必须是本人账号）→ 登录邮箱对应的主账号
+	let accountRow = await selectLoginEmailAccount(c, user);
+	if (!accountRow) {
+		accountRow = from?.address ? await accountService.selectByEmailIncludeDel(c, from.address) : null;
+		if (!accountRow || accountRow.userId !== user.userId) {
+			accountRow = await accountService.selectByEmailIncludeDel(c, user.email);
+		}
+		if (!accountRow || accountRow.userId !== user.userId) {
+			throw new EwsFault('ErrorInvalidRequest', `No sender account available for ${user.email}.`);
+		}
 	}
 
 	let emailRow = null;
@@ -867,19 +1121,23 @@ async function handleCreateItem(c, payload, user) {
 		throw error;
 	}
 
+	// TB 从 m:Items 里的 ItemId 取新建邮件 Id（缺失 → MissingIdInResponse）
 	const itemId = Number(emailRow?.emailId) || 0;
 	return operationResponse('CreateItem', responseMessage('CreateItem', {
-		body: `<m:Items><t:Message><t:ItemId Id="${escapeXml(String(itemId))}" ChangeKey="${escapeXml(String(emailRow?.createTime ?? ''))}"/></t:Message></m:Items>`
+		body: createItemItemsXml(itemId, emailRow?.createTime ?? '')
 	}));
 }
 
 // -------------------------------------------------------------- UpdateItem ---
 
-/** 已读标记：项目 unread 语义 0=未读 / 1=已读；同时 touch update_time 让增量同步能发出 Update 事件 */
-async function updateReadFlag(c, userId, emailId, unread) {
+/**
+ * 已读标记：项目 unread 语义 0=未读 / 1=已读；同时 touch update_time 让增量同步能发出 Update 事件。
+ * stamp 由调用方传入（响应里的 ChangeKey 必须与实际写入的 update_time 一致，不能各自取 nowText）。
+ */
+async function updateReadFlag(c, userId, emailId, unread, stamp = nowText()) {
 	try {
 		await c.env.db.prepare('UPDATE email SET unread = ?, update_time = ? WHERE email_id = ? AND user_id = ?')
-			.bind(unread, nowText(), emailId, userId).run();
+			.bind(unread, stamp, emailId, userId).run();
 	} catch (error) {
 		if (!isMissingColumnError(error)) throw error;
 		await c.env.db.prepare('UPDATE email SET unread = ? WHERE email_id = ? AND user_id = ?')
@@ -915,7 +1173,11 @@ async function handleUpdateItem(c, payload, user) {
 		}
 
 		// 归属校验：防越权改他人邮件
-		const row = await orm(c).select({ emailId: email.emailId }).from(email)
+		const row = await orm(c).select({
+			emailId: email.emailId,
+			createTime: email.createTime,
+			eff: sql`COALESCE(NULLIF(update_time, ''), create_time)`.as('eff')
+		}).from(email)
 			.where(and(eq(email.userId, userId), eq(email.emailId, itemId)))
 			.get();
 		if (!row) {
@@ -925,11 +1187,19 @@ async function handleUpdateItem(c, payload, user) {
 			continue;
 		}
 
+		// 成功响应带更新后的 ItemId（TB 从 m:Items 里读回写结果；ChangeKey = 新的「最后修改时间」）
+		let changeKey = changeKeyOf(row);
 		if (unread !== null) {
-			await updateReadFlag(c, userId, itemId, unread);
+			const stamp = nowText();
+			await updateReadFlag(c, userId, itemId, unread, stamp);
+			changeKey = stamp;
 		}
 
-		messages.push(responseMessage('UpdateItem', {}));
+		messages.push(responseMessage('UpdateItem', {
+			body: '<m:Items><t:Message>' +
+				`<t:ItemId Id="${escapeXml(String(itemId))}" ChangeKey="${escapeXml(changeKey)}"/>` +
+				'</t:Message></m:Items>'
+		}));
 	}
 
 	return operationResponse('UpdateItem', messages.join(''));
@@ -944,24 +1214,29 @@ async function handleDeleteItem(c, payload, user) {
 	}
 
 	// 分片查询 + 分批删除：批量删除可能超过 D1 绑定参数上限
-	const ownedIds = [];
+	const ownedIds = new Set();
 	for (const chunk of chunkList(ids)) {
-		const owned = await orm(c).select({ emailId: email.emailId }).from(email)
+		const rows = await orm(c).select({ emailId: email.emailId }).from(email)
 			.where(and(eq(email.userId, user.userId), inArray(email.emailId, chunk)))
 			.all();
-		ownedIds.push(...owned.map((row) => row.emailId));
-	}
-	if (ownedIds.length === 0) {
-		return operationResponse('DeleteItem', responseMessage('DeleteItem', {
-			responseClass: 'Error', responseCode: 'ErrorItemNotFound', messageText: 'Item not found.'
-		}));
+		for (const row of rows) ownedIds.add(Number(row.emailId));
 	}
 
 	// HardDelete 也按软删除处理（安全）：与 Web 端 DELETE /email/delete 完全同一路径（含 syncDelete 设置）
-	for (const chunk of chunkList(ownedIds)) {
+	const deletable = ids.filter((id) => ownedIds.has(id));
+	for (const chunk of chunkList(deletable)) {
 		await emailService.delete(c, { emailIds: chunk.join(',') }, user.userId);
 	}
-	return operationResponse('DeleteItem', responseMessage('DeleteItem', {}));
+
+	// TB 校验 ResponseMessage 数量 = 请求 ItemId 数量（顺序一致）：每个 ItemId 一条；
+	// 未找到的 Id 回 ErrorItemNotFound（TB 容忍该错误，不当整体失败）
+	return operationResponse('DeleteItem', ids.map((id) => (ownedIds.has(id)
+		? responseMessage('DeleteItem', {})
+		: responseMessage('DeleteItem', {
+			responseClass: 'Error',
+			responseCode: 'ErrorItemNotFound',
+			messageText: `Item not found: ${id}`
+		}))).join(''));
 }
 
 // ---------------------------------------------------------------- SendItem ---
@@ -971,10 +1246,68 @@ async function handleSendItem() {
 	throw new EwsFault('ErrorItemNotFound', 'SendItem is not supported: messages are sent by CreateItem.');
 }
 
+// ------------------------------------------------------------ ResolveNames ---
+
+/** 目录项显示名：优先 user.name（库内一般没有），否则邮箱本地部分 */
+function resolutionDisplayName(user) {
+	const name = String(user?.name ?? '').trim();
+	if (name !== '') return name;
+	const email = String(user?.email ?? '').trim();
+	const at = email.lastIndexOf('@');
+	return at > 0 ? email.slice(0, at) : email;
+}
+
+/**
+ * ResolveNames：TB 账号验证阶段用它解析/校验地址（验证失败会显示「身份验证出错」）。
+ * 与当前认证用户的邮箱/名做不区分大小写匹配 → Success；无匹配回
+ * ErrorNameResolutionNoResults（标准 ResponseMessage，不抛 Fault）。
+ * ReturnFullContactData / SearchScope 忽略（不做目录检索，只回当前用户）。
+ */
+async function handleResolveNames(c, payload, user) {
+	const entry = textOf(firstChild(payload, 'UnresolvedEntry')).trim();
+	if (entry === '') {
+		throw new EwsFault('ErrorInvalidRequest', 'ResolveNames requires UnresolvedEntry.');
+	}
+
+	const address = String(user?.email ?? '').trim();
+	const matched = address !== '' && resolveNameMatches(entry, address, user?.name);
+	if (!matched) {
+		return operationResponse('ResolveNames', responseMessage('ResolveNames', {
+			responseClass: 'Error',
+			responseCode: 'ErrorNameResolutionNoResults',
+			messageText: `No results were found for "${entry}".`
+		}));
+	}
+
+	return operationResponse('ResolveNames', responseMessage('ResolveNames', {
+		body: resolutionSetXml([{ name: resolutionDisplayName(user), address }])
+	}));
+}
+
+// -------------------------------------------------------------- GetMailTips --
+
+/** GetMailTips：每个收件人一个 Success/NoError 的 MailTips ResponseMessage（无特殊提示字段） */
+async function handleGetMailTips(c, payload) {
+	const recipients = parseMailboxList(firstChild(payload, 'Recipients'));
+	const messages = recipients.map((item) => responseMessage('MailTips', { body: mailTipsXml([item]) }));
+	return operationResponse('GetMailTips',
+		messages.length > 0 ? messages.join('') : responseMessage('MailTips', {}));
+}
+
+// --------------------------------------------------------- GetServerTimeZones -
+
+/** GetServerTimeZones：只回标准 UTC 时区定义（时区数据缺失时部分客户端拒绝完成向导） */
+async function handleGetServerTimeZones() {
+	return operationResponse('GetServerTimeZones', responseMessage('GetServerTimeZones', {
+		body: timeZoneDefinitionsXml()
+	}));
+}
+
 // ---------------------------------------------------------------- 分发 -------
 
 const HANDLERS = {
 	GetFolder: handleGetFolder,
+	FindFolder: handleFindFolder,
 	SyncFolderHierarchy: handleSyncFolderHierarchy,
 	SyncFolderItems: handleSyncFolderItems,
 	GetItem: handleGetItem,
@@ -982,10 +1315,15 @@ const HANDLERS = {
 	CreateItem: handleCreateItem,
 	UpdateItem: handleUpdateItem,
 	DeleteItem: handleDeleteItem,
-	SendItem: handleSendItem
+	SendItem: handleSendItem,
+	ResolveNames: handleResolveNames,
+	GetMailTips: handleGetMailTips,
+	GetServerTimeZones: handleGetServerTimeZones
 };
 
 export async function dispatch(c, parsed, user) {
+	// 诊断日志：tail wrangler 日志可确认 TB 各阶段（含账号验证）实际发送的 EWS 操作
+	console.log('EWS operation:', parsed.operation);
 	// 只认 HANDLERS 自身属性：operation 名来自请求 XML，toString/constructor/valueOf 等
 	// 原型链成员不能当操作名命中（否则会被当成 handler 调用，返回非 XML 的垃圾响应）
 	const handler = Object.hasOwn(HANDLERS, parsed.operation) ? HANDLERS[parsed.operation] : null;

@@ -153,4 +153,8 @@ POST https://<你的Worker域名>/api/init
 Body: {"secret":"<你的 INIT_SECRET>"}
 ```
 
+已知限制（Free 计划单请求 10ms CPU 约束）：
+
+- 经 EWS（MIME 重建）读取邮件时，单个内嵌图/附件超过 `EWS_MAX_ATT_BYTES`（默认 **1MB**，可用环境变量调大）不会随 MIME 下发：内嵌图在 Thunderbird 正文里显示为「图片过大（>1MB）…请使用网页版查看」的文字占位，附件则直接不显示（邮件本体与其余附件正常）。Workers Paid 计划 CPU 更宽裕，可调大 `EWS_MAX_ATT_BYTES` 放宽该限制。
+
 配置步骤、账号文件夹机制、Free 计划限制、不支持的功能与排错，详见 [doc/EWS-Thunderbird.md](doc/EWS-Thunderbird.md)。
