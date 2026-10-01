@@ -12,16 +12,73 @@
 //   ATT_SIGN_MAX_TTL       可选。允许的最大签名有效期（秒），默认 3600
 //   S3_ENDPOINT / REGION / AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY
 //                           原有配置，用于回源 COS 的 S3 签名
+//   MAIL_ORIGIN            可选。邮件域（根路径跳转 / Referer 白名单 / ACAO 的唯一来源），
+//                          默认 mail.duckgame-play.top；可写纯域名或完整 URL
 // =====================================================================
+
+// 邮件域：根路径跳转目标、Referer 白名单、Access-Control-Allow-Origin 均由它派生
+// （原先三处各自硬编码，换邮件域必须改代码；现只需改环境变量）
+// 默认值 = 历史硬编码值：部署时漏配 MAIL_ORIGIN 也不会导致跳转/校验失效
+const MAIL_ORIGIN_DEFAULT = 'mail.duckgame-play.top';
+function mailOrigin(env) {
+  let raw = String((env && env.MAIL_ORIGIN) || '').trim();
+  if (!raw) raw = MAIL_ORIGIN_DEFAULT;
+  try {
+    // 允许「纯域名」与「完整 URL」两种写法；只取主机名（统一按 https 派生）
+    const u = new URL(raw.indexOf('://') >= 0 ? raw : 'https://' + raw);
+    if (!u.hostname) throw new Error('bad host');
+    return { host: u.hostname, origin: 'https://' + u.hostname };
+  } catch (e) {
+    return { host: MAIL_ORIGIN_DEFAULT, origin: 'https://' + MAIL_ORIGIN_DEFAULT };
+  }
+}
+
+// =====================================================================
+// 【文件响应头策略】—— 所有「文件内容」响应（回源返回 / 写入缓存 / 命中缓存）统一过这一层
+// ---------------------------------------------------------------------
+// 1) MIME 白名单：仅允许可直接渲染且无脚本执行能力的类型按原值透传
+//    （image/png|jpeg|gif|webp|bmp|avif、video/*、audio/*、application/pdf、text/plain、
+//     application/octet-stream）；text/html、image/svg+xml、application/xhtml+xml
+//    及未知/空类型一律强制 application/octet-stream + Content-Disposition: attachment，
+//    阻止桶内对象被当页面/脚本在同源渲染（存储型 XSS）。
+// 2) octet-stream 保持「附件下载」语义（显式标注 attachment，不参与内联渲染）。
+// 3) 所有文件响应追加 Content-Security-Policy: default-src 'none'
+//    （纵深防御：即使某响应被当文档加载，也不加载/执行任何子资源）。
+// 4) /static/ 响应加 CORP: same-site（只服务登录背景图，禁止被其它站点跨站嵌入）。
+//    注意：只对 /static/ 加，附件响应不能加 —— 邮件页与 Worker 域可能不同站，
+//    CORP 会把附件图片/内嵌图直接拦掉。
+// =====================================================================
+function fileTypeAllowed(base) {
+  if (base.indexOf('video/') === 0 || base.indexOf('audio/') === 0) return true;
+  if (base === 'application/pdf' || base === 'text/plain' || base === 'application/octet-stream') return true;
+  return ['image/png', 'image/jpeg', 'image/gif', 'image/webp', 'image/bmp', 'image/avif'].includes(base);
+}
+
+function applyFileHeaderPolicy(pathname, headers) {
+  const base = String(headers.get('Content-Type') || '').split(';')[0].trim().toLowerCase();
+  if (!fileTypeAllowed(base)) {
+    headers.set('Content-Type', 'application/octet-stream');
+    headers.set('Content-Disposition', 'attachment');
+  } else if (base === 'application/octet-stream') {
+    headers.set('Content-Disposition', 'attachment');
+  }
+  headers.set('X-Content-Type-Options', 'nosniff');
+  headers.set('Content-Security-Policy', "default-src 'none'");
+  if (String(pathname || '').indexOf('/static/') === 0) {
+    headers.set('Cross-Origin-Resource-Policy', 'same-site');
+  }
+}
+
 export default {
   async fetch(request, env, ctx) {
     try {
       const url = new URL(request.url);
 
-      // 1. 根路径拦截：访问根域名时自动跳转到邮件登录页
-      const REDIRECT_TARGET = 'https://mail.duckgame-play.top';
+      // 1. 根路径拦截：访问根域名时自动跳转到邮件登录页（目标域来自 MAIL_ORIGIN）
+      const mail = mailOrigin(env);
+      const REDIRECT_TARGET = mail.origin;
       if (url.pathname === '/' || url.pathname === '') {
-        // 防自杀式重定向：若本代码被误部署到跳转目标域名（如 mail.duckgame-play.top），
+        // 防自杀式重定向：若本代码被误部署到跳转目标域名（如邮件域本身），
         // 302 到自身会无限循环（ERR_TOO_MANY_REDIRECTS）。命中即 200 兜底，不跳转。
         try {
           if (url.hostname === new URL(REDIRECT_TARGET).hostname) {
@@ -68,6 +125,12 @@ export default {
         return new Response('Forbidden', { status: 403 });
       }
 
+      // /static/ 只放行登录背景图前缀 static/background/，其余 /static/* 一律 404：
+      // 防止把 /static/ 前缀当成无签名的「整桶旁路」（任意 key 都能被公开拉取）
+      if (url.pathname.startsWith('/static/') && !url.pathname.startsWith('/static/background/')) {
+        return new Response('Not Found', { status: 404 });
+      }
+
       // /static/ 无签名（仅 Referer/Sec-Fetch，可被脚本伪造）：加 per-IP 限流，
       // 防攻击者用随机 static/* 路径刷 COS 回源（每个唯一路径都会打一次 COS）
       if (url.pathname.startsWith('/static/')) {
@@ -107,8 +170,8 @@ export default {
       const secFetchSite = request.headers.get('Sec-Fetch-Site') || '';
       const secFetchDest = request.headers.get('Sec-Fetch-Dest') || '';
 
-      // ① Referer 必须是邮件域
-      const refererOk = refererHost === 'mail.duckgame-play.top';
+      // ① Referer 必须是邮件域（MAIL_ORIGIN，默认 mail.duckgame-play.top）
+      const refererOk = refererHost === mail.host;
       // ② Sec-Fetch-Site 必须是 same-site/same-origin
       const siteOk = secFetchSite === 'same-site' || secFetchSite === 'same-origin';
       // ③ Sec-Fetch-Dest：image / 旧浏览器无此头；附件下载/预览场景放行 document 等
@@ -136,7 +199,15 @@ export default {
       const cacheKey = new Request(url.origin + url.pathname);
       const cached = await caches.default.match(cacheKey);
       if (cached) {
-        return cached;
+        // 命中缓存也必须重套响应头策略：缓存条目可能是本次部署（收紧策略）之前写入的，
+        // 直接回放会让缺口继续生效最长 7 天（Cache API 的 key 不含响应头，无法靠版本号区分）
+        const cachedHeaders = new Headers(cached.headers);
+        applyFileHeaderPolicy(url.pathname, cachedHeaders);
+        return new Response(cached.body, {
+          status: cached.status,
+          statusText: cached.statusText,
+          headers: cachedHeaders,
+        });
       }
       // 4. 获取并标准化 Endpoint 地址（必须配置，不再内置默认域名）
       let rawEndpoint = (env.S3_ENDPOINT || '').trim();
@@ -210,12 +281,14 @@ export default {
         }
       }
 
-      // 设置跨域 Header（只放行邮件域）并去除敏感头
+      // 设置跨域 Header（只放行邮件域 = MAIL_ORIGIN）并去除敏感头
       const newHeaders = new Headers(response.headers);
-      newHeaders.set('Access-Control-Allow-Origin', 'https://mail.duckgame-play.top');
+      newHeaders.set('Access-Control-Allow-Origin', mail.origin);
       newHeaders.delete('x-cos-request-id');
       newHeaders.delete('x-cos-hash-crc64ecma');
-      newHeaders.set('X-Content-Type-Options', 'nosniff');
+      // 文件响应头策略（MIME 白名单 + CSP；/static/ 另加 CORP）：
+      // 下面所有分支（200 缓存 / HEAD / 206 / 3xx）都复用这份头，策略不会被分支绕过
+      applyFileHeaderPolicy(url.pathname, newHeaders);
 
       // =====================================================
       // 7. 回源成功后写入 Cache API（按 path；内容哈希不变则无需重复回源）
@@ -424,6 +497,7 @@ export {
 //
 // 其他环境变量：
 //   TEMP_PASS        临时网盘 /temp 独立访问密码（必填，普通密码登录，无 2FA）
+//                    —— 应配置为 Secret（不要写进 wrangler [vars] 明文）
 //   TEMP_STORAGE     kv（默认）| cos（预留位，暂未启用）
 //   TEMP_TOTAL_MB    临时文件「总容量」上限（默认 800，可取 1~900，单位 MiB）
 //                    —— 只限总量：单文件大小、文件数量均不再设业务上限
@@ -432,12 +506,16 @@ export {
 //   TOTP_ISSUER      验证器显示的发行方（默认 COS-Exchange）
 //   TOTP_ACCOUNT     验证器显示的账户名（默认 cos-exchange）
 //   SESSION_TTL      会话有效期秒数（默认 604800=7 天，3600~2592000）
+//   MAIL_ORIGIN      邮件域（根路径跳转 / Referer 白名单 / ACAO），默认 mail.duckgame-play.top
+//   BROWSE_DENY_PREFIXES  /browse 前缀黑名单（逗号分隔，默认 attachments/,static/；空值=用默认）
 //
 // KV 键设计（命名空间内按前缀隔离）：
 //   auth:totp   → {secret, at}   TOTP 密钥（Base32，仅服务端持有）
 //   sess:<id>   → {at, ip}       只读网盘登录会话（expirationTtl 自动过期）
+//   temp:sess:<sid> → {at}       临时网盘 /temp 登录会话（随机 sid，TTL 12 小时）
 //   tmp/<id>    → 临时文件内容（metadata: {name,type,size,at}，到期自动删除）
 //   tmp.__usage → {bytes,n,at}   总占用账本（不在 tmp/ 前缀内：用户接口读不到也删不掉）
+//   sniff:<key> → 'img'|'vid'|'aud'  魔数嗅探结果二级缓存（TTL 7 天，key 为 COS 对象键）
 // =====================================================================
 function authStore(env) {
   if (!env) return null;
@@ -550,10 +628,14 @@ async function totpAt(secret, counter) {
 async function verifyTotp(secret, code, nowSec) {
   const c = String(code || '').replace(/\s/g, '');
   if (!/^[0-9]{6}$/.test(c)) return false;
+  // 密钥非法（空/非 Base32/过短）一律判「验证失败」并直接返回：
+  // 绝不因 importKey 抛异常把调用方推进 fail-open 分支（结构非法记录走这里）
+  const s = String(secret || '').toUpperCase().replace(/[^A-Z2-7]/g, '');
+  if (s.length < 8) return false;
   const now = Number.isFinite(nowSec) ? nowSec : Math.floor(Date.now() / 1000);
   const counter = Math.floor(now / 30);
   for (const d of [-1, 0, 1]) {
-    if (timingSafeEqual(await totpAt(secret, counter + d), c)) return true;
+    if (timingSafeEqual(await totpAt(s, counter + d), c)) return true;
   }
   return false;
 }
@@ -566,30 +648,48 @@ function otpauthUri(env, secret) {
     '&algorithm=SHA1&digits=6&period=30';
 }
 
+// TOTP 异常只告警一次（按异常类别各一次，isolate 内），避免刷日志
+const totpWarnedSet = new Set();
+function totpWarnOnce(tag, msg) {
+  if (totpWarnedSet.has(tag)) return;
+  totpWarnedSet.add(tag);
+  console.warn('cos-proxy: ' + msg);
+}
+
 async function getTotp(env, strict) {
   const store = authStore(env);
   if (!store) return null;
+  let v;
   try {
-    const v = await store.get('auth:totp', { type: 'json' });
-    return v && v.secret ? v : null;
+    v = await store.get('auth:totp', { type: 'json' });
   } catch (e) {
     // strict=true（登录等安全关键路径）：KV 读取失败必须抛错，禁止「读不到就当作未绑定」
     // 否则 KV 抖动期间会退化为仅密码登录（2FA 被静默绕过）
+    totpWarnOnce('read', 'auth:totp 读取/解析失败（KV 异常或记录损坏），按 fail-closed 处理');
     if (strict) throw e;
     return null;
   }
+  if (v === null || v === undefined) return null; // 未绑定
+  // 记录存在但结构非法（字段缺失/类型错误/密钥形态非法）：绝不能当作「未绑定」，
+  // 否则 2FA 被静默绕过（fail-open）。返回哨兵 {secret:'', invalid:true}：
+  // 调用方按「验证失败」处理（verifyTotp 对空密钥恒返回 false）。
+  if (typeof v !== 'object' || typeof v.secret !== 'string' || !/^[A-Z2-7]{16,64}$/.test(v.secret)) {
+    totpWarnOnce('shape', 'auth:totp 记录结构非法，按验证失败处理（fail-closed）');
+    return { secret: '', invalid: true };
+  }
+  return v;
 }
 
 // 跨站 POST 防护（纵深防御，SameSite=Lax 之外再校验 Origin）：
 // 浏览器跨站表单/脚本 POST 会带 Origin；无 Origin（curl/旧客户端）放行由 SameSite 兜底。
-function sameSitePostOk(request) {
+function sameSitePostOk(request, env) {
   const origin = request.headers.get('Origin');
   if (!origin) return true;
   let oh = '';
   try { oh = new URL(origin).hostname; } catch (e) { return false; }
   let rh = '';
   try { rh = new URL(request.url).hostname; } catch (e) {}
-  return oh === rh || oh === 'mail.duckgame-play.top';
+  return oh === rh || oh === mailOrigin(env).host;
 }
 
 // ---------- 会话（KV 随机 token；未绑定 KV 时回退旧版密码指纹 cookie）----------
@@ -1049,36 +1149,55 @@ function tempCosDelete(env, key) { throw tempCosNotReady(); }
 // ---------------------------------------------------------------------
 //   - 独立密码 TEMP_PASS（普通密码登录，不使用 2FA）
 //   - 独立 KV：TEMP_KV（未绑定时回退 BROWSE_KV）
-//   - 独立 cookie（HMAC 指纹，密钥常量 cos-temp-cookie-fp-v1）
+//   - 独立会话：登录成功后生成随机 sid 存 KV（temp:sess:<sid>，TTL 12 小时），cookie 只带 sid。
+//     旧实现是 HMAC(固定密钥, 密码) 的确定性指纹 cookie —— 密钥硬编码在代码里、可离线爆破、
+//     且改密码前无法吊销，故整体废弃（cookie 值不再是密码指纹）
 //   - 文件到期由 KV expirationTtl 自动删除
 // =====================================================================
-const TEMP_SESSION_COOKIE = 'temp_pwd';
-let tempFpCachePass = '';
-let tempFpCacheVal = '';
+const TEMP_SESSION_COOKIE = 'temp_pwd';   // 值 = 随机 sid（不是密码指纹）
+const TEMP_SESSION_PREFIX = 'temp:sess:';
+const TEMP_SESSION_TTL = 12 * 3600;       // 会话 12 小时（比文件 TTL 短，缩小 cookie 失窃窗口）
+const TEMP_SESSION_RE = /^[0-9a-f]{32}$/; // sid 形态：16 字节随机数的 hex
 
-async function tempFingerprint(pass) {
-  if (tempFpCachePass === pass && tempFpCacheVal) return tempFpCacheVal;
-  const key = await crypto.subtle.importKey(
-    'raw',
-    new TextEncoder().encode('cos-temp-cookie-fp-v1'),
-    { name: 'HMAC', hash: 'SHA-256' },
-    false,
-    ['sign']
-  );
-  const sig = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(pass));
-  tempFpCachePass = pass;
-  tempFpCacheVal = Array.from(new Uint8Array(sig)).map(b => b.toString(16).padStart(2, '0')).join('');
-  return tempFpCacheVal;
+function tempSessionNew() {
+  const b = crypto.getRandomValues(new Uint8Array(16));
+  return Array.from(b).map(x => x.toString(16).padStart(2, '0')).join('');
 }
 
+// 登录成功后写会话；KV 写失败必须抛错（登录失败），不得签发无法校验的 cookie
+async function tempSessionCreate(env) {
+  const store = tempStore(env);
+  if (!store) throw new Error('未绑定 KV（TEMP_KV / BROWSE_KV）');
+  const sid = tempSessionNew();
+  await store.put(TEMP_SESSION_PREFIX + sid, JSON.stringify({ at: Date.now() }), { expirationTtl: TEMP_SESSION_TTL });
+  return sid;
+}
+
+// 退出登录 / 吊销：删除 KV 记录后，旧 cookie 立即成为废票
+async function tempSessionDelete(env, sid) {
+  const store = tempStore(env);
+  if (!store || !TEMP_SESSION_RE.test(String(sid || ''))) return;
+  try { await store.delete(TEMP_SESSION_PREFIX + sid); } catch (e) {}
+}
+
+// 校验会话：形态非法直接拒；KV 查不到（未签发 / 已过期 / 已吊销）也拒
 async function tempAuthed(request, env) {
   const pass = (env.TEMP_PASS || '').trim();
   if (!pass) return false;
-  return timingSafeEqual(cookieValue(request, TEMP_SESSION_COOKIE), await tempFingerprint(pass));
+  const sid = cookieValue(request, TEMP_SESSION_COOKIE);
+  if (!TEMP_SESSION_RE.test(sid)) return false;
+  const store = tempStore(env);
+  if (!store) return false;
+  try {
+    const v = await store.get(TEMP_SESSION_PREFIX + sid);
+    return v !== null && v !== undefined;
+  } catch (e) {
+    return false;
+  }
 }
 
 async function tempLogin(request, env) {
-  if (!sameSitePostOk(request)) {
+  if (!sameSitePostOk(request, env)) {
     return new Response('Forbidden', { status: 403 });
   }
   const ip = 'temp:' + clientIP(request);
@@ -1093,12 +1212,22 @@ async function tempLogin(request, env) {
   const pass = (env.TEMP_PASS || '').trim();
   if (pass && timingSafeEqual(p, pass)) {
     loginOk(ip);
-    const fp = await tempFingerprint(pass);
+    let sid;
+    try {
+      sid = await tempSessionCreate(env);
+    } catch (e) {
+      // 签发会话失败（KV 异常）：拒绝登录，绝不发放无法校验的 cookie
+      console.error('temp session create error:', e);
+      return new Response('服务暂时不可用，请稍后重试', {
+        status: 503,
+        headers: { 'Content-Type': 'text/plain; charset=utf-8', 'Retry-After': '30' },
+      });
+    }
     return new Response('', {
       status: 302,
       headers: {
         Location: '/temp',
-        'Set-Cookie': TEMP_SESSION_COOKIE + '=' + fp + '; Path=/; Max-Age=604800; SameSite=Lax; HttpOnly; Secure',
+        'Set-Cookie': TEMP_SESSION_COOKIE + '=' + sid + '; Path=/; Max-Age=' + TEMP_SESSION_TTL + '; SameSite=Lax; HttpOnly; Secure',
       },
     });
   }
@@ -1115,7 +1244,7 @@ async function handleTemp(request, env, ctx) {
   const url = new URL(request.url);
 
   // 跨站 POST 防护（纵深防御；SameSite=Lax 之外再校验 Origin）
-  if (request.method === 'POST' && !sameSitePostOk(request)) {
+  if (request.method === 'POST' && !sameSitePostOk(request, env)) {
     return new Response('Forbidden', { status: 403 });
   }
 
@@ -1150,8 +1279,9 @@ async function handleTemp(request, env, ctx) {
   if (request.method === 'POST' && url.pathname === '/temp/login') {
     return await tempLogin(request, env);
   }
-  // 退出登录
+  // 退出登录：删除 KV 会话（撤销，立即失效；不只是清 cookie）
   if (url.pathname === '/temp/logout') {
+    await tempSessionDelete(env, cookieValue(request, TEMP_SESSION_COOKIE));
     return new Response('', {
       status: 302,
       headers: {
@@ -1213,7 +1343,7 @@ async function handleTemp(request, env, ctx) {
       tempUploadGapMs: tcfg.uploadGapMs,
       kvName: env.TEMP_KV ? 'TEMP_KV' : 'BROWSE_KV',
     };
-    return new Response(tempIndexHtml(cfg), {
+    return new Response(tempIndexHtml(cfg, env), {
       headers: { 'Content-Type': 'text/html; charset=utf-8', 'X-Content-Type-Options': 'nosniff', 'X-Frame-Options': 'DENY', 'Cache-Control': 'no-store' },
     });
   }
@@ -1489,6 +1619,30 @@ function cosDownHtml() {
 </html>`;
 }
 
+// ---------- /browse 前缀黑名单（防「整桶旁路」）----------
+// 附件（attachments/）与静态资源（static/）不属于个人网盘的浏览范围：
+// 若允许在 /browse 里列出/下载它们，等于用网盘密码旁路附件签名体系与静态资源约束。
+// 默认拒绝这两个前缀（等价 'attachments/,static/'）；BROWSE_DENY_PREFIXES 可覆盖（逗号分隔）。
+// 未配置/空值一律回退默认值（fail-closed：误配不会把黑名单整体关掉）。
+const BROWSE_DENY_PREFIXES_DEFAULT = ['attachments', 'static'];
+function browseDenyPrefixes(env) {
+  const raw = String((env && env.BROWSE_DENY_PREFIXES) || '').trim();
+  if (!raw) return BROWSE_DENY_PREFIXES_DEFAULT;
+  const list = raw.split(',').map(s => s.trim().replace(/^\/+/, '').replace(/\/+$/, '')).filter(Boolean);
+  return list.length ? list : BROWSE_DENY_PREFIXES_DEFAULT;
+}
+
+// key/prefix 是否命中黑名单：命中目录名本身或其下任意层级（attachments 与 attachments/x 都算），
+// 但不误伤同名前缀的普通目录（如 attachments-old）
+function browsePathDenied(env, path) {
+  const p = String(path || '').replace(/^\/+/, '');
+  if (!p) return false;
+  for (const d of browseDenyPrefixes(env)) {
+    if (p === d || p.indexOf(d + '/') === 0) return true;
+  }
+  return false;
+}
+
 async function handleBrowse(request, env, ctx) {
   const url = new URL(request.url);
 
@@ -1558,7 +1712,7 @@ async function handleBrowse(request, env, ctx) {
       needs2faBind: !!authStore(env) && !totp,
       tempEnabled: !!(tempStore(env) && (env.TEMP_PASS || '').trim()),
     };
-    return new Response(browseIndexHtml(cfg), {
+    return new Response(browseIndexHtml(cfg, env), {
       headers: { 'Content-Type': 'text/html; charset=utf-8', 'X-Content-Type-Options': 'nosniff', 'X-Frame-Options': 'DENY', 'Cache-Control': 'no-store' },
     });
   }
@@ -1580,7 +1734,7 @@ async function handleBrowse(request, env, ctx) {
   }
 
   if (url.pathname === '/browse/api/2fa/bind' && request.method === 'POST') {
-    if (!sameSitePostOk(request)) return new Response('Forbidden', { status: 403 });
+    if (!sameSitePostOk(request, env)) return new Response('Forbidden', { status: 403 });
     if (!authStore(env)) return jsonResp({ error: '未绑定 KV（BROWSE_KV / TEMP_KV），无法使用 2FA' }, 501);
     const rlBind = rateLimitCheck('2fabind:' + clientIP(request), 10, 60000);
     if (rlBind.limited) {
@@ -1610,7 +1764,7 @@ async function handleBrowse(request, env, ctx) {
   }
 
   if (url.pathname === '/browse/api/2fa/disable' && request.method === 'POST') {
-    if (!sameSitePostOk(request)) return new Response('Forbidden', { status: 403 });
+    if (!sameSitePostOk(request, env)) return new Response('Forbidden', { status: 403 });
     if (!authStore(env)) return jsonResp({ error: '未绑定 KV' }, 501);
     const rlDis = rateLimitCheck('2fadisable:' + clientIP(request), 10, 60000);
     if (rlDis.limited) {
@@ -1642,6 +1796,10 @@ async function handleBrowse(request, env, ctx) {
       // prefix/token 限制长度：防超长参数滥用（COS 对超长 prefix 会 400，限流兜底）
       const prefix = (url.searchParams.get('prefix') || '').slice(0, 1024);
       const token = (url.searchParams.get('token') || '').slice(0, 2048);
+      // 前缀黑名单：附件/静态前缀不属于浏览范围（防整桶旁路，见 browsePathDenied）
+      if (browsePathDenied(env, prefix)) {
+        return jsonResp({ error: '该目录不在浏览范围内' }, 403);
+      }
       // per_page：每页条数（前端 30/60/100），限制 1~200，非法值回退 100
       let perPage = parseInt(url.searchParams.get('per_page') || '', 10);
       if (!Number.isFinite(perPage) || perPage < 1) perPage = 100;
@@ -1655,16 +1813,10 @@ async function handleBrowse(request, env, ctx) {
         headers: { 'Content-Type': 'application/json; charset=utf-8', 'X-Content-Type-Options': 'nosniff', 'Cache-Control': 'no-store' },
       });
     } catch (e) {
-      // 只把 error 字段回给前端：browseList 的 throw 里带 ourSTS/cosSTS/sentUrl 等排错字段，
-      // 原样返回会泄露 COS 桶域名与签名中间值；调试细节只在服务端日志
+      // 只记服务端日志：browseList 的 throw 里带 ourSTS/cosSTS/sentUrl 等排错字段，
+      // 原样返回会泄露 COS 桶域名与签名中间值；空结果附带的原始 XML 同理，一律不外发
       console.error('browse list error:', e);
-      const msg = String((e && e.message) || e);
-      let errMsg = msg;
-      try {
-        const parsed = JSON.parse(msg);
-        if (parsed && parsed.error) errMsg = parsed.error;
-      } catch (e2) {}
-      return new Response(JSON.stringify({ error: errMsg.slice(0, 500) }), {
+      return new Response(JSON.stringify({ error: '目录读取失败，请稍后重试' }), {
         status: 500,
         headers: { 'Content-Type': 'application/json; charset=utf-8' },
       });
@@ -1682,6 +1834,10 @@ async function handleBrowse(request, env, ctx) {
     // （对象存储无目录上溯，但拦截这些字符可避免奇怪的 key 与回源 URL 歧义）
     if (!key || key.startsWith('/') || key.includes('\\') || key.includes('../')) {
       return new Response('bad key', { status: 400 });
+    }
+    // 前缀黑名单：附件/静态 key 不经 /browse 下载（防整桶旁路绕过签名与静态资源约束）
+    if (browsePathDenied(env, key)) {
+      return new Response('Forbidden', { status: 403 });
     }
     try {
       // 透传 Range 头：视频/音频播放器靠 Range 流式分段下载 + seek，
@@ -1709,7 +1865,7 @@ async function browseAuthed(request, env) {
 }
 
 async function browseLogin(request, env) {
-  if (!sameSitePostOk(request)) {
+  if (!sameSitePostOk(request, env)) {
     return new Response('Forbidden', { status: 403 });
   }
   const ip = clientIP(request);
@@ -1983,7 +2139,12 @@ async function browseList(env, prefix, token, perPage) {
   const xml = await res.text();
   const parsed = parseListXml(xml);
   if (parsed.folders.length === 0 && parsed.files.length === 0) {
-    parsed.raw = xml.slice(0, 800); // 空结果时带回原始 XML，便于确认 COS 返回格式
+    // 空结果：原始 XML 只进服务端日志（可能含桶名 / RequestId 等内部信息），
+    // 不再随响应回显给客户端；且仅记录「可疑响应」（COS 报错或非 XML），正常空目录不刷日志
+    const raw = xml.slice(0, 800);
+    if (raw.indexOf('<Error>') >= 0 || raw.indexOf('<?xml') !== 0) {
+      console.warn('browse list: 可疑空响应 XML（仅服务端诊断）:', raw);
+    }
   }
   return parsed;
 }
@@ -2084,11 +2245,50 @@ function sniffTypeFromBytes(buf) {
   return null;
 }
 
+// 二级缓存（BROWSE_KV）：内存缓存随 isolate 消失，冷启动/多 isolate 时同一文件会被
+// 反复 Range 嗅探；KV 命中即回填内存缓存，省一次 COS 请求。
+// 只缓存「嗅探成功」的结果（失败/未知不写 KV：避免把 COS 抖动固化 7 天，
+// 失败仍由内存缓存的短 TTL 兜底）；KV key 超长（>500 字符）时跳过，不影响功能。
+// 注：类型放在 value 而不是 key 里 —— key 里带类型就无法用「只知文件 key」反查。
+const SNIFF_KV_PREFIX = 'sniff:';
+const SNIFF_KV_TTL = 7 * 24 * 3600; // 秒；与内存缓存 TTL 一致（COS key = 内容哈希，类型恒定）
+
+async function sniffKvRead(env, key) {
+  const store = authStore(env); // BROWSE_KV 优先（未绑定时回退 TEMP_KV）
+  const k = SNIFF_KV_PREFIX + key;
+  if (!store || k.length > 500) return null;
+  try {
+    const v = await store.get(k);
+    const t = v === null || v === undefined ? '' : String(v).trim();
+    return t === 'img' || t === 'vid' || t === 'aud' ? t : null;
+  } catch (e) {
+    return null;
+  }
+}
+
+async function sniffKvWrite(env, key, type) {
+  const store = authStore(env);
+  const k = SNIFF_KV_PREFIX + key;
+  if (!store || k.length > 500) return;
+  try {
+    await store.put(k, String(type), { expirationTtl: SNIFF_KV_TTL });
+  } catch (e) {
+    console.warn('cos-proxy: 嗅探结果写 KV 失败（忽略，内存缓存仍生效）');
+  }
+}
+
 // 对单个 COS 对象做 Range GET(0-15B) 读魔数
 async function sniffOne(env, key) {
   const cached = sniffCache.get(key);
   if (cached && cached.t > Date.now()) return cached.type;
   if (cached && cached.type === null && cached.attempts > 3) return null; // 之前嗅探失败过，不再重复打 COS
+
+  // 二级缓存：KV 命中则回填内存缓存直接返回（跨 isolate / 冷启动都省一次 COS Range）
+  const kvType = await sniffKvRead(env, key);
+  if (kvType) {
+    sniffCacheSet(key, { t: Date.now() + SNIFF_CACHE_TTL, type: kvType, attempts: 0 });
+    return kvType;
+  }
 
   const rawEndpoint = (env.S3_ENDPOINT || '').trim().replace(/\/+$/, '');
   const region = (env.REGION || '').trim();
@@ -2110,6 +2310,7 @@ async function sniffOne(env, key) {
     const ab = await res.arrayBuffer();
     const type = sniffTypeFromBytes(ab);
     sniffCacheSet(key, { t: Date.now() + SNIFF_CACHE_TTL, type, attempts: 0 });
+    if (type) await sniffKvWrite(env, key, type); // 仅成功结果写 KV（二级缓存）
     return type;
   } catch (e) {
     sniffCacheSet(key, { t: Date.now() + 3600000, type: null, attempts: (cached?.attempts || 0) + 1 });
@@ -2153,7 +2354,16 @@ async function browseFetchFile(env, key, ctx, method, range) {
   const cacheKey = new Request('https://' + new URL(rawEndpoint).host + '/_browse/' + encodedPath);
   if (!isRange) {
     const cached = await caches.default.match(cacheKey);
-    if (cached) return cached;
+    if (cached) {
+      // 命中缓存也要重套头策略（旧缓存条目可能是收紧前写入的，无 MIME 白名单/CSP）
+      const cachedHeaders = new Headers(cached.headers);
+      applyFileHeaderPolicy('/browse/api/file', cachedHeaders);
+      return new Response(cached.body, {
+        status: cached.status,
+        statusText: cached.statusText,
+        headers: cachedHeaders,
+      });
+    }
   }
 
   const signedHeaders = await getS3v4Headers({
@@ -2178,7 +2388,9 @@ async function browseFetchFile(env, key, ctx, method, range) {
   const newHeaders = new Headers(final.headers);
   newHeaders.delete('x-cos-request-id');
   newHeaders.delete('x-cos-hash-crc64ecma');
-  newHeaders.set('X-Content-Type-Options', 'nosniff');
+  // 文件响应头策略（MIME 白名单 + CSP）：/browse 的对象类型由用户上传内容决定，
+  // 必须阻止 text/html、image/svg+xml 等被同源内联渲染（存储型 XSS）
+  applyFileHeaderPolicy('/browse/api/file', newHeaders);
   // 非 200 时标记上游状态：X-Upstream-Status 存在 = 429 来自 COS；不存在 = 429 来自 CF（worker 前被拒）
   if (!final.ok) newHeaders.set('X-Upstream-Status', String(final.status));
   // 只对 GET 写缓存：HEAD 无 body、Range 的 206 分段都不写入（否则污染同 key 的
@@ -2327,7 +2539,7 @@ form.addEventListener('submit',function(ev){
 </script>
 </body></html>`;
 }
-function browseIndexHtml(cfg) {
+function browseIndexHtml(cfg, env) {
   const cfgJson = JSON.stringify(cfg || {}).replace(/</g, '\\u003c');
   const tempBtnHtml = (cfg && cfg.tempEnabled)
     ? '<a class="iconbtn" href="/temp" title="临时网盘" style="text-decoration:none"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M11.99 2C6.47 2 2 6.48 2 12s4.47 10 9.99 10C17.52 22 22 17.52 22 12S17.52 2 11.99 2zM12 20c-4.42 0-8-3.58-8-8s3.58-8 8-8 8 3.58 8 8-3.58 8-8 8zm.5-13H11v6l5.25 3.15.75-1.23-4.5-2.67z"/></svg></a>'
@@ -3418,7 +3630,7 @@ $('themeBtn').onclick=function(){
   $('themeBtn').innerHTML=document.body.classList.contains('dark')?'&#x2600;&#xFE0F;':'&#x1F319;';
 };
 $('mailBtn').onclick=function(){
-  window.location.href='https://mail.duckgame-play.top';
+  window.location.href='${mailOrigin(env).origin}';
 };
 $('logoutBtn').onclick=function(){
   // HttpOnly cookie \\u524D\\u7AEF JS \\u5220\\u4E0D\\u6389\\uFF0C\\u8D70\\u670D\\u52A1\\u7AEF /browse/logout\\uFF08Set-Cookie \\u6E05\\u9664\\u540E\\u518D\\u8DF3\\u8F6C\\uFF09
@@ -3741,7 +3953,7 @@ form.addEventListener('submit',function(ev){
 </body></html>`;
 }
 
-function tempIndexHtml(cfg) {
+function tempIndexHtml(cfg, env) {
   const cfgJson = JSON.stringify(cfg || {}).replace(/</g, '\\u003c');
   return `<!DOCTYPE html>
 <html lang="zh-CN"><head>
@@ -3869,7 +4081,7 @@ body.dark .pill:hover{background:rgba(77,159,255,.25)}
       <svg viewBox="0 0 24 24" fill="currentColor"><path d="M10 4H4c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V8c0-1.1-.9-2-2-2h-8l-2-2z"/></svg>
       <span>&#x53EA;&#x8BFB;&#x7F51;&#x76D8;</span>
     </a>
-    <a class="iconbtn" href="https://mail.duckgame-play.top" title="&#x8FD4;&#x56DE;&#x90AE;&#x4EF6;">
+    <a class="iconbtn" href="${mailOrigin(env).origin}" title="&#x8FD4;&#x56DE;&#x90AE;&#x4EF6;">
       <svg viewBox="0 0 24 24" fill="currentColor"><path d="M20 4H4c-1.1 0-1.99.9-1.99 2L2 18c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V6c0-1.1-.9-2-2-2zm0 4l-8 5-8-5V6l8 5 8-5v2z"/></svg>
     </a>
     <button class="iconbtn" id="themeBtn" title="&#x4E3B;&#x9898;">&#x1F319;</button>
