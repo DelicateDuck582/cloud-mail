@@ -28,8 +28,10 @@ id = "2fe4f308183e4c44b162469e787178b5"	#kv数据库id
 #[[send_email]]
 #name = "email"			#CF发件, 配置后优先使用
 
-[ai]
-binding = "ai"
+# [ai]
+# binding = "ai"		# 临时移除：绕过 CF code 10021 AI binding 校验故障（2026-10-01）；
+						# ai-service.extractCode 对缺失 env.ai 有 catch 容错，仅验证码提取静默降级。
+						# CF 故障恢复后取消注释重新部署。
 
 [assets]
 binding = "assets"		#静态资源绑定名默认不可修改
