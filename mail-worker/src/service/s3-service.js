@@ -1,7 +1,23 @@
 import { S3Client, PutObjectCommand, DeleteObjectsCommand, GetObjectCommand, ListObjectsV2Command } from "@aws-sdk/client-s3";
+import { DOMParser, Node } from 'linkedom';
 import settingService from './setting-service';
 import domainUtils from '../utils/domain-uitls';
 import { settingConst } from '../const/entity-const';
+
+// Workers 运行时没有 DOM。而 @aws-sdk/client-s3 的 ListObjectsV2 响应 XML 反序列化
+// 走的是 @aws-sdk/xml-builder 的 browser 变体（dist-es/xml-parser.browser.js，被 wrangler
+// 的 browser 字段解析选中），它依赖两个全局：DOMParser 和 Node 常量（Node.TEXT_NODE /
+// Node.ELEMENT_NODE）。缺失时报 "DOMParser is not defined"（下一步就是 "Node is not defined"）。
+// 本地已实测：只补 DOMParser 仍会 ReferenceError: Node is not defined；
+// 补齐两者后真实 ListObjectsV2 XML 可正确解析（KeyCount/Contents/Size 均正确）。
+// 两个 polyfill 都带 undefined 守卫，workerd 若自带则不覆盖。
+// polyfill 失败只会退化为「用量统计不可用」，不影响存储读写路径。
+if (typeof globalThis.DOMParser === 'undefined') {
+	globalThis.DOMParser = DOMParser;
+}
+if (typeof globalThis.Node === 'undefined') {
+	globalThis.Node = Node;
+}
 
 // COS 实际用量 KV 缓存（用量统计允许滞后，避免每次请求都全量扫描 bucket）
 const COS_USAGE_CACHE_KEY = 'cos_usage_cache';

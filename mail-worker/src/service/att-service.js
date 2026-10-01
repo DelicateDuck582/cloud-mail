@@ -806,8 +806,9 @@ const attService = {
 			}
 		} catch (e) {
 			console.error('COS usage error:', e);
-			// COS 不可用时同样标记故障，让后续附件读写自动回退 KV
-			r2Service.markS3Failed();
+			// 用量统计失败 ≠ 存储故障：这里绝不调用 r2Service.markS3Failed()。
+			// 统计失败只影响用量展示（cos 置 0），绝不触发 5 分钟 COS 回退 KV，
+			// 绝不影响存储读写路径（putObj/getObj/deleteObj 的失败才标记故障）。
 		}
 
 		return {

@@ -114,6 +114,10 @@ export function sanitizeCss(css) {
 	if (!css) return '';
 	let out = String(css);
 
+	// 安全：CSS 转义（反斜杠）可改写关键字字面量（如 url(\6a avascript:...)）绕过下方黑名单，
+	// 现代浏览器已不据此执行脚本，仍按纵深防御一律清空
+	if (/\\/.test(out)) return '';
+
 	if (/expression\s*\(|javascript\s*:|vbscript\s*:|-moz-binding|behavior\s*:|@import|@charset|@namespace/i.test(out)) {
 		out = out.replace(/url\(([^)]*)\)/g, '');
 	}
