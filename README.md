@@ -168,5 +168,24 @@ cloud-mail
 
 [Telegram](https://t.me/cloud_mail_tg)
 
+## Thunderbird 接入（EWS）
+
+CloudMail 内置 EWS（Exchange Web Services）兼容端点，**Thunderbird 145+** 可直接以「Exchange」账号接入收发邮件，无需插件、无需额外开启 IMAP/SMTP。端点地址为 `https://<你的mail域名>/EWS/Exchange.asmx`（大小写不敏感）。
+
+部署新版 Worker 后需调用一次初始化接口完成数据库迁移（幂等，可重复执行）：
+
+```
+POST https://<你的Worker域名>/api/init
+Body: {"secret":"<你的 INIT_SECRET>"}
+```
+
+已知限制（Free 计划单请求 10ms CPU 约束）：
+
+- 经 EWS（MIME 重建）读取邮件时，单个内嵌图/附件超过 `EWS_MAX_ATT_BYTES`（默认 **1MB**，可用环境变量调大）不会随 MIME 下发：内嵌图在 Thunderbird 正文里显示为「图片过大（>1MB）…请使用网页版查看」的文字占位，附件则直接不显示（邮件本体与其余附件正常）。Workers Paid 计划 CPU 更宽裕，可调大 `EWS_MAX_ATT_BYTES` 放宽该限制。
+
+**多域名发信**：一个用户可在 CloudMail 后台配置多个域名/账号。Thunderbird 里为该用户名下的各个地址添加「身份」（账户设置 → 身份 → 添加，邮箱填该用户名下的收件地址），写信时用 From 下拉切换身份，后端即按 From 地址在当前用户名下匹配对应账号，并用该账号域名对应的 Resend 密钥发信——密钥始终只存于后端（按发件域名自动选择），Thunderbird 无需也不应配置任何发信密钥。From 不属于当前登录用户时会被直接拒绝（禁止冒用他人身份发信）；未选择身份（From 为空）时仍使用登录邮箱同名账号。
+
+在 Thunderbird 中添加「Exchange」账号时，邮箱填 CloudMail 登录邮箱，密码填该用户登录密码，服务器地址填上述 EWS 端点即可。
+
 
 

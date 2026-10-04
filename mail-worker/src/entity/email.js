@@ -24,6 +24,8 @@ export const email = sqliteTable('email', {
 	message: text('message'),
 	unread: integer('unread').default(0).notNull(),
 	createTime: text('create_time').default(sql`CURRENT_TIMESTAMP`).notNull(),
-	isDel: integer('is_del').default(0).notNull()
+	isDel: integer('is_del').default(0).notNull(),
+	// EWS 增量水位：已读/软删/恢复等状态变化时 touch（v4_4DB 迁移加列，老数据回填 create_time）
+	updateTime: text('update_time')
 });
 export default email

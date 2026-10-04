@@ -25,6 +25,50 @@ import account from "../entity/account";
 import { att } from '../entity/att';
 import telegramService from './telegram-service';
 
+// D1 单条语句最多 100 个绑定参数，inArray/tombstone 统一按 90 分片，留安全余量
+const SQL_BIND_LIMIT = 90;
+const chunkArray = (list, size) => {
+	const result = [];
+	for (let i = 0; i < list.length; i += size) {
+		result.push(list.slice(i, i + size));
+	}
+	return result;
+};
+
+// EWS 增量同步墓碑：物理删除 email 行之前，先按 ≤SQL_BIND_LIMIT 分片读出待删行，
+// 逐行 INSERT OR IGNORE 到 ews_tombstone（user_id/email_id/type/trash/del_time），
+// 供 EWS 增量拉取回放删除事件（表由 init.js v4_4DB 创建）。
+// 主分支 email 表没有 trash 列（无附件垃圾桶特性）：以 is_del 映射 tombstone.trash
+// （is_del=1 = 已进「已删除」文件夹），读侧据此在 deleteditems 产出 Delete，否则按 type 归 inbox/sentitems。
+// 写入失败仅告警，不阻断删除主流程（fail-open：墓碑缺失只影响增量同步精度）。
+async function insertEwsTombstones(c, emailIds) {
+	const ids = [...new Set((emailIds || []).map(Number).filter(id => Number.isFinite(id)))];
+	if (ids.length === 0) {
+		return;
+	}
+	const delTime = dayjs().format('YYYY-MM-DD HH:mm:ss');
+	for (const chunk of chunkArray(ids, SQL_BIND_LIMIT)) {
+		try {
+			const placeholders = chunk.map(() => '?').join(',');
+			const rowResult = await c.env.db.prepare(
+				`SELECT email_id, user_id, type, is_del FROM email WHERE email_id IN (${placeholders})`
+			).bind(...chunk).all();
+			const rows = rowResult?.results || [];
+			if (rows.length === 0) {
+				continue;
+			}
+			const stmt = c.env.db.prepare(
+				'INSERT OR IGNORE INTO ews_tombstone (user_id, email_id, type, trash, del_time) VALUES (?,?,?,?,?)'
+			);
+			await c.env.db.batch(rows.map(row => stmt.bind(
+				row.user_id, row.email_id, row.type,
+				Number(row.is_del) === isDel.DELETE ? 1 : 0, delTime)));
+		} catch (e) {
+			console.warn('写入 EWS 墓碑失败（不影响删除）：', e);
+		}
+	}
+}
+
 const emailService = {
 
 	async list(c, params, userId) {
@@ -235,7 +279,9 @@ const emailService = {
 			return;
 		}
 
-		await orm(c).update(email).set({ isDel: isDel.DELETE }).where(
+		// EWS 增量水位：软删除（进已删除文件夹）也 touch update_time，增量同步才能发出 Update/Delete 事件
+		const now = dayjs().format('YYYY-MM-DD HH:mm:ss');
+		await orm(c).update(email).set({ isDel: isDel.DELETE, updateTime: now }).where(
 			and(
 				eq(email.userId, userId),
 				inArray(email.emailId, emailIdList)))
@@ -244,6 +290,8 @@ const emailService = {
 
 	receive(c, params, cidAttList, r2domain) {
 		params.content = this.imgReplace(params.content, cidAttList, r2domain)
+		// EWS 增量同步水位：新邮件初始水位 = 入库时间（TEXT，与 create_time 同格式）
+		params.updateTime = dayjs().format('YYYY-MM-DD HH:mm:ss');
 		return orm(c).insert(email).values({ ...params }).returning().get();
 	},
 
@@ -440,7 +488,8 @@ const emailService = {
 			await userService.incrUserSendCount(c, receiveEmail.length, userId);
 		}
 
-		//保存到数据库并返回结果
+		//保存到数据库并返回结果（update_time：EWS 增量水位初始 = 发信时间）
+		emailData.updateTime = dayjs().format('YYYY-MM-DD HH:mm:ss');
 		const emailResult = await orm(c).insert(email).values(emailData).returning().get();
 
 		//保存内嵌附件
@@ -747,6 +796,8 @@ const emailService = {
 
 		for (const emailData of receiveEmailList) {
 
+			// EWS 增量同步水位：站内收件新行初始水位 = 入库时间
+			emailData.updateTime = dayjs().format('YYYY-MM-DD HH:mm:ss');
 			const emailRow = await orm(c).insert(email).values(emailData).returning().get();
 
 			//设置附件保存
@@ -868,6 +919,8 @@ const emailService = {
 		emailIds = emailIds.split(',').map(Number);
 		await attService.removeByEmailIds(c, emailIds);
 		await starService.removeByEmailIds(c, emailIds);
+		// EWS 墓碑：物理删行前先登记（分片 ≤SQL_BIND_LIMIT），写入失败不阻断删除
+		await insertEwsTombstones(c, emailIds);
 		await orm(c).delete(email).where(inArray(email.emailId, emailIds)).run();
 	},
 
@@ -1019,7 +1072,9 @@ const emailService = {
 	},
 
 	async restoreByUserId(c, userId) {
-		await orm(c).update(email).set({ isDel: isDel.NORMAL }).where(eq(email.userId, userId)).run();
+		// EWS 增量水位：恢复（is_del 回 NORMAL）touch update_time，增量同步才能发出 Update 事件
+		const now = dayjs().format('YYYY-MM-DD HH:mm:ss');
+		await orm(c).update(email).set({ isDel: isDel.NORMAL, updateTime: now }).where(eq(email.userId, userId)).run();
 	},
 
 	async completeReceive(c, status, emailId) {
@@ -1139,17 +1194,46 @@ const emailService = {
 
 		await attService.removeByEmailIds(c, emailIds);
 
+		// EWS 墓碑：物理删行前先登记（分片 ≤SQL_BIND_LIMIT），写入失败不阻断删除
+		await insertEwsTombstones(c, emailIds);
+
 		await orm(c).delete(email).where(conditions.length > 1 ? and(...conditions) : conditions[0]).run();
 	},
 
 	async physicsDeleteByAccountId(c, accountId) {
 		await attService.removeByAccountId(c, accountId);
+
+		// EWS 墓碑：物理删行前先登记该账号全部邮件。按 email_id 键集分页读取 id（避免一次拉取过大结果集），
+		// 每页交由 insertEwsTombstones 内部分片写入；全部登记完成后才执行物理删除，写入失败不阻断删除
+		const pageSize = 500;
+		let lastEmailId = 0;
+		while (true) {
+			const idResult = await c.env.db.prepare(
+				'SELECT email_id FROM email WHERE account_id = ? AND email_id > ? ORDER BY email_id ASC LIMIT ?'
+			).bind(accountId, lastEmailId, pageSize).all();
+			const idRows = idResult?.results || [];
+			if (idRows.length === 0) {
+				break;
+			}
+			await insertEwsTombstones(c, idRows.map(row => row.email_id));
+			lastEmailId = idRows[idRows.length - 1].email_id;
+			if (idRows.length < pageSize) {
+				break;
+			}
+		}
+
 		await orm(c).delete(email).where(eq(email.accountId, accountId)).run();
 	},
 
 	async read(c, params, userId) {
 		const { emailIds } = params;
-		await orm(c).update(email).set({ unread: emailConst.unread.READ }).where(and(eq(email.userId, userId), inArray(email.emailId, emailIds)));
+		// EWS 增量水位：已读状态变化 touch update_time（分片 ≤SQL_BIND_LIMIT，避免超过 D1 绑定参数上限）
+		const now = dayjs().format('YYYY-MM-DD HH:mm:ss');
+		const emailIdList = (emailIds || '').split(',').map(Number).filter(Boolean);
+		for (const chunk of chunkArray(emailIdList, SQL_BIND_LIMIT)) {
+			await orm(c).update(email).set({ unread: emailConst.unread.READ, updateTime: now })
+				.where(and(eq(email.userId, userId), inArray(email.emailId, chunk))).run();
+		}
 	}
 };
 

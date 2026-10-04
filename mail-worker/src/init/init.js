@@ -35,8 +35,60 @@ const dbInit = {
 		await this.v3_1DB(c);
 		await this.v3_2DB(c);
 		await this.v3_3DB(c);
+		await this.v4_4DB(c);
 		await settingService.refresh(c);
 		return c.text('success');
+	},
+
+	// EWS（Thunderbird 接入）：同步水位表 + email.update_time 增量列 + 物理删除 tombstone
+	async v4_4DB(c) {
+		try {
+			await c.env.db.prepare(`
+				CREATE TABLE IF NOT EXISTS ews_sync_state (
+					user_id INTEGER NOT NULL,
+					folder TEXT NOT NULL,
+					sync_state TEXT,
+					update_time INTEGER,
+					PRIMARY KEY (user_id, folder)
+				)
+			`).run();
+		} catch (e) {
+			console.warn(`跳过数据：${e.message}`);
+		}
+
+		try {
+			// 物理删除（附件彻底删除 / 自动清理等）的 tombstone：邮件行已不存在，增量扫描看不到，
+			// 写侧在物理删除前 INSERT OR IGNORE，读侧据此在 SyncFolderItems 里补 Delete 事件
+			await c.env.db.prepare(`
+				CREATE TABLE IF NOT EXISTS ews_tombstone (
+					user_id INTEGER NOT NULL,
+					email_id INTEGER NOT NULL,
+					type INTEGER NOT NULL DEFAULT 0,
+					trash INTEGER NOT NULL DEFAULT 0,
+					del_time TEXT NOT NULL,
+					PRIMARY KEY (user_id, email_id)
+				)
+			`).run();
+		} catch (e) {
+			console.warn(`跳过数据：${e.message}`);
+		}
+
+		try {
+			// 与 create_time 同格式（text 'YYYY-MM-DD HH:mm:ss'，字典序即时间序）
+			const column = await c.env.db.prepare(`SELECT * FROM pragma_table_info('email') WHERE name = 'update_time' limit 1`).first();
+			if (!column) {
+				await c.env.db.prepare(`ALTER TABLE email ADD COLUMN update_time TEXT;`).run();
+			}
+		} catch (e) {
+			console.warn(`跳过字段：${e.message}`);
+		}
+
+		try {
+			// 回填历史行水位：只补 NULL（幂等，不做全表 UPDATE；新行由 email-service 写入时 touch）
+			await c.env.db.prepare(`UPDATE email SET update_time = create_time WHERE update_time IS NULL;`).run();
+		} catch (e) {
+			console.warn(`跳过数据：${e.message}`);
+		}
 	},
 
 	async v3_3DB(c) {
