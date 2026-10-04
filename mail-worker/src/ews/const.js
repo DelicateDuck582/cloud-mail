@@ -45,9 +45,18 @@ export const EWS_HTML_MAX_BYTES = 256 * 1024;
 // 一次请求原始 XML（含 base64 附件）的上限，防超大 body 打爆 Worker 内存（与 /email/send 的 40MB 对齐）
 export const EWS_MAX_REQUEST_BYTES = 40 * 1024 * 1024;
 
+// EWS 发信（CreateItem）解码后的邮件/附件总字节上限：默认 35MB，给 Resend 的 40MB 请求体留余量。
+// 超限在入口直接回中文 Fault，不再等 Resend 返回英文错误。env.EWS_SEND_MAX_BYTES 可调
+export const EWS_SEND_MAX_BYTES = 35 * 1024 * 1024;
+
 export function ewsMaxAttBytes(env) {
 	const value = Number(env?.EWS_MAX_ATT_BYTES);
 	return Number.isFinite(value) && value > 0 ? Math.floor(value) : EWS_DEFAULT_MAX_ATT_BYTES;
+}
+
+export function ewsSendMaxBytes(env) {
+	const value = Number(env?.EWS_SEND_MAX_BYTES);
+	return Number.isFinite(value) && value > 0 ? Math.floor(value) : EWS_SEND_MAX_BYTES;
 }
 
 export function ewsMimeSafeTotal(env) {

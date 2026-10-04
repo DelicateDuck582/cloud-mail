@@ -440,21 +440,25 @@ function normalizeSkippedItems(items) {
 /**
  * 被跳过附件清单（HTML 版）：内嵌图 + 普通附件统一列出（文件名转义、大小人性化），
  * 附在 MIME 正文 HTML 末尾——否则用户只看到图/附件无声消失，无从得知发生了什么。
+ * 安全：清单是纯信息提示，不含任何链接 / 签名 URL——下载必须走 Web 端完整流程
+ * （JWT 认证 → userId 归属过滤 → 每次动态生成的附件签名 URL），
+ * MIME 里的离线链接等于可转发/可提取的凭据，一律不签发。
  */
 export function skippedAttachmentsHtml(items) {
 	const list = normalizeSkippedItems(items);
 	if (list.length === 0) return '';
 	const rows = list.map((item) => `• ${escapeXml(item.filename)}（${humanFileSize(item.size)}）`);
 	return '<p style="border:1px dashed #999;padding:8px;color:#666;">' +
-		'[以下内容过大，此客户端无法加载，请使用网页版查看]<br>' + rows.join('<br>') + '</p>';
+		'[以下内容过大，此客户端无法加载]<br>' + rows.join('<br>') +
+		'<br>请登录网页版查看或下载。</p>';
 }
 
-/** 被跳过附件清单（纯文本版）：text/plain 分支同附一份，纯文本客户端也能看到 */
+/** 被跳过附件清单（纯文本版）：text/plain 分支同附一份，纯文本客户端也能看到；同样不含任何链接 */
 export function skippedAttachmentsText(items) {
 	const list = normalizeSkippedItems(items);
 	if (list.length === 0) return '';
 	const rows = list.map((item) => `• ${item.filename}（${humanFileSize(item.size)}）`);
-	return '[以下内容过大，此客户端无法加载，请使用网页版查看]\n' + rows.join('\n');
+	return '[以下内容过大，此客户端无法加载]\n' + rows.join('\n') + '\n请登录网页版查看或下载。';
 }
 
 /**

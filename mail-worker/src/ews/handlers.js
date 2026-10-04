@@ -42,7 +42,8 @@ import {
 	ewsFolderDef,
 	ewsMaxAttBytes,
 	ewsMaxTotalAttBytes,
-	ewsMimeSafeTotal
+	ewsMimeSafeTotal,
+	ewsSendMaxBytes
 } from './const.js';
 import {
 	asArray,
@@ -1110,6 +1111,12 @@ async function parseMimeContent(mimeContent) {
 	}
 }
 
+/** EWS 发信超限的统一中文提示（带上限，env 调整后文案仍准确） */
+function sendTooLargeMessage(maxBytes) {
+	const mb = Math.max(1, Math.round(maxBytes / (1024 * 1024)));
+	return `邮件过大（含附件超过发送上限约 ${mb}MB），Resend 无法投递，请精简附件后重试`;
+}
+
 async function handleCreateItem(c, payload, user) {
 	const disposition = attr(payload, 'MessageDisposition') || 'SendAndSaveCopy';
 	if (disposition === 'SaveOnly') {
@@ -1134,6 +1141,7 @@ async function handleCreateItem(c, payload, user) {
 
 	const maxAttBytes = ewsMaxAttBytes(c.env);
 	const maxTotalAttBytes = ewsMaxTotalAttBytes(c.env);
+	const sendMaxBytes = ewsSendMaxBytes(c.env);
 
 	const bodyNode = firstChild(message, 'Body');
 	const bodyText = textOf(bodyNode);
@@ -1159,6 +1167,13 @@ async function handleCreateItem(c, payload, user) {
 
 	// 结构化字段为空时按 MIME 解析（TB 也可能直接发 MimeContent）
 	const mimeContent = cleanBase64(textOf(firstChild(message, 'MimeContent')));
+
+	// 发信体量入口护栏（MimeContent 形态）：解码后的整封 MIME 超过发送上限 → 立即打回。
+	// Web 端 /email/send 有 40MB 请求体校验，EWS 直调 emailService.send 会绕过它；
+	// 不在这里拦，超大邮件会一路打到 Resend 才报英文错误。默认 35MB，给 Resend 留余量。
+	if (mimeContent !== '' && base64DecodedSize(mimeContent) > sendMaxBytes) {
+		throw new EwsFault('ErrorInvalidRequest', sendTooLargeMessage(sendMaxBytes));
+	}
 	if (to.length === 0 && cc.length === 0 && bcc.length === 0 && html === '' && text === '' && mimeContent !== '') {
 		const parsed = await parseMimeContent(mimeContent);
 		if (!parsed) {
@@ -1198,6 +1213,10 @@ async function handleCreateItem(c, payload, user) {
 				`Attachment "${item.name}" is too large for EWS (${size} bytes > ${maxAttBytes} bytes). Please send it from the CloudMail web client.`);
 		}
 		totalAttBytes += size;
+	}
+	// 结构化附件（无 MimeContent）：解码后总量同样按发送上限打回（Resend 无法投递）
+	if (totalAttBytes > sendMaxBytes) {
+		throw new EwsFault('ErrorInvalidRequest', sendTooLargeMessage(sendMaxBytes));
 	}
 	if (totalAttBytes > maxTotalAttBytes) {
 		throw new EwsFault('ErrorInvalidRequest',
