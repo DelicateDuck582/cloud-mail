@@ -75,6 +75,7 @@ import {
 	parseAddressList,
 	parseMailbox,
 	parseMailboxList,
+	parseMimeFrom,
 	replaceInlineImagesWithPlaceholder,
 	resolutionSetXml,
 	resolveNameMatches,
@@ -142,6 +143,19 @@ function selectLoginEmailAccount(c, user) {
 async function resolveUserAccount(c, user) {
 	const row = await selectLoginEmailAccount(c, user);
 	return row ? Number(row.accountId) : null;
+}
+
+/**
+ * 按 From 地址在当前用户名下查收件账号（account.email NOCASE 等值，与同名账号查询同一口径）。
+ * 查不到 = 该地址不属于当前用户（含他人账号 / 不存在的地址）→ 返回 null，调用方拒绝发信。
+ */
+function selectOwnedAccountByEmail(c, userId, address) {
+	const id = Number(userId);
+	const value = String(address ?? '').trim();
+	if (!Number.isInteger(id) || id <= 0 || value === '') return Promise.resolve(null);
+	return orm(c).select().from(account)
+		.where(and(eq(account.userId, id), sql`${account.email} COLLATE NOCASE = ${value}`))
+		.get();
 }
 
 /** 该用户名下的全部收件账号（账号文件夹的来源，一个账号一个文件夹）；account_id 升序保证顺序稳定 */
@@ -1060,6 +1074,13 @@ async function handleCreateItem(c, payload, user) {
 		}
 	}
 
+	// From 地址（发件账号路由依据）：结构化 t:From/t:Sender 优先；上面 PostalMime 分支未覆盖时
+	// （结构化字段部分存在、From 只在 MimeContent 里）再从 MIME 头取（TB 发信 From 常在 MimeContent 里）。
+	if (String(from?.address ?? '').trim() === '' && mimeContent !== '') {
+		const mimeFrom = parseMimeFrom(mimeContent);
+		if (mimeFrom !== '') from = { address: mimeFrom, name: '' };
+	}
+
 	// 附件大小护栏（解码后字节）：单文件超限 / 总量超限都提示改用 Web 端
 	let totalAttBytes = 0;
 	for (const item of outgoing) {
@@ -1087,16 +1108,25 @@ async function handleCreateItem(c, payload, user) {
 		throw new EwsFault('ErrorInvalidRequest', 'CreateItem requires at least one recipient (To/Cc/Bcc).');
 	}
 
-	// 发件账号：优先「与登录邮箱同名的收件账号」（与可见域同一口径，EWS 账户 = 该账号）；
-	// 无同名账号时保持原行为：From（必须是本人账号）→ 登录邮箱对应的主账号
-	let accountRow = await selectLoginEmailAccount(c, user);
-	if (!accountRow) {
-		accountRow = from?.address ? await accountService.selectByEmailIncludeDel(c, from.address) : null;
-		if (!accountRow || accountRow.userId !== user.userId) {
-			accountRow = await accountService.selectByEmailIncludeDel(c, user.email);
+	// 发件账号路由：From 地址非空 → 必须是当前用户名下的账号（NOCASE 等值），
+	// 命中则用该账号（含其邮箱 → email-service 按域名取 resendTokens[domain]）发信；
+	// 不属于当前用户 → 拒绝（禁止冒用他人身份 / 用未配置地址发信）。
+	// From 缺失/为空 → 保持原行为：与登录邮箱同名的收件账号，其次登录邮箱账号。
+	const fromAddress = String(from?.address ?? '').trim();
+	let accountRow = null;
+	if (fromAddress !== '') {
+		accountRow = await selectOwnedAccountByEmail(c, user.userId, fromAddress);
+		if (!accountRow) {
+			throw new EwsFault('ErrorInvalidRequest',
+				`发件地址不属于当前账户，无法以该地址发信: ${fromAddress}`);
 		}
-		if (!accountRow || accountRow.userId !== user.userId) {
-			throw new EwsFault('ErrorInvalidRequest', `No sender account available for ${user.email}.`);
+	} else {
+		accountRow = await selectLoginEmailAccount(c, user);
+		if (!accountRow) {
+			accountRow = await accountService.selectByEmailIncludeDel(c, user.email);
+			if (!accountRow || accountRow.userId !== user.userId) {
+				throw new EwsFault('ErrorInvalidRequest', `No sender account available for ${user.email}.`);
+			}
 		}
 	}
 

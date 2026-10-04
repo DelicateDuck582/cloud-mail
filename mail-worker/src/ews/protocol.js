@@ -461,6 +461,39 @@ export function createItemItemsXml(itemId, changeKey = '') {
 		'</t:Message></m:Items>';
 }
 
+/**
+ * 从 base64 MimeContent（可含折行/空白）里取 From 地址，供 CreateItem 发件账号路由：
+ *   base64 解码（atob → TextDecoder UTF-8，非 ASCII 显示名不乱码）→ MIME 头块内的 ^From: 行
+ *   → 第一个含 @ 的 <> 内地址，其次裸地址（简化解析，容错优先，不追求完整 RFC5322）。
+ * 只解析第一个空行之前的头块：正文里出现的 "From:" 文本不当发件地址。
+ * 无 MimeContent / 解不出 / 无 From 头 / 取不到地址 → ''（调用方按「From 缺失」回退登录账号）。
+ */
+export function parseMimeFrom(mimeContent) {
+	const clean = cleanBase64(mimeContent);
+	if (clean === '') return '';
+	let raw = '';
+	try {
+		raw = new TextDecoder('utf-8').decode(base64ToBytes(clean));
+	} catch (e) {
+		return '';
+	}
+	const head = raw.split(/\r?\n\r?\n/)[0];
+	const line = head.match(/^From:[ \t]*(.*)$/im);
+	if (!line) return '';
+	return extractMailboxAddress(line[1]);
+}
+
+/** 头值 → 邮箱地址：含 @ 的 <> 内容优先，其次裸地址，最后退第一个非空 <> 内容 */
+function extractMailboxAddress(value) {
+	const text = String(value ?? '');
+	const angles = [...text.matchAll(/<([^<>]+)>/g)].map((match) => match[1].trim());
+	const angled = angles.find((address) => address.includes('@'));
+	if (angled) return angled;
+	const bare = text.match(/[^\s<>,";:]+@[^\s<>,";:]+/);
+	if (bare) return bare[0];
+	return angles.find((address) => address !== '') ?? '';
+}
+
 export function parseMailbox(node) {
 	if (!node || typeof node !== 'object') return null;
 	const mailbox = firstChild(node, 'Mailbox') ?? node;

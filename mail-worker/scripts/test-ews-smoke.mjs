@@ -71,6 +71,7 @@ import {
 	oversizeInlinePlaceholderHtml,
 	parseAddressList,
 	parseMailboxList,
+	parseMimeFrom,
 	replaceInlineImagesWithPlaceholder,
 	resolveNameMatches,
 	rowRecipients,
@@ -132,14 +133,36 @@ function assertSoapEnvelope(xml, operation) {
 }
 
 /**
+ * email-service 测试桩（data: URL 模块，全局唯一实例）：生产 handlers.js 的 `../service/email-service`
+ * 经 resolve hook 重定向到这里 —— send 被替换为记录「收到的账号参数」并返回固定入库结果，
+ * 其余方法（delete/receive 等）经 Object.create(real) 原型委托给真实 email-service，
+ * 既有 router 级用例（DeleteItem 等）行为不变。真实模块用绝对 file URL import，
+ * 不会命中重定向规则（规则只匹配无扩展名的 '../service/email-service'）。
+ */
+const REAL_EMAIL_SERVICE_URL = new URL('../src/service/email-service.js', import.meta.url).href;
+const EMAIL_SERVICE_STUB_URL = 'data:text/javascript,' + encodeURIComponent(
+	`import real from ${JSON.stringify(REAL_EMAIL_SERVICE_URL)};
+export const sendCalls = [];
+export function resetSendCalls() { sendCalls.length = 0; }
+const stub = Object.create(real);
+stub.send = async (c, params, userId) => {
+	sendCalls.push({ params, userId });
+	return [{ emailId: 4242, createTime: '2026-10-01 10:00:00' }];
+};
+export default stub;`
+);
+
+/**
  * handlers.js / router.js 的传递依赖里大量 import 省略 .js 扩展名（wrangler 打包能解析、node 不能），
  * 注册一次 resolve hook 补后缀，让 node 也能 import 真实模块做断言。
+ * 同一 hook 把 email-service 换成测试桩（必须在 handlers.js 首次 import 前注册）。
  */
 let resolveHookReady = false;
 function ensureNodeResolveHook() {
 	if (resolveHookReady) return;
 	const hook = `export async function resolve(specifier, context, next) {
   if (specifier.startsWith('node:') || specifier.startsWith('file:') || specifier.startsWith('data:')) return next(specifier, context);
+  if (specifier === '../service/email-service') return { url: ${JSON.stringify(EMAIL_SERVICE_STUB_URL)}, shortCircuit: true };
   try { return await next(specifier, context); }
   catch (e) { try { return await next(specifier + '.js', context); } catch (e2) { throw e; } }
 }`;
@@ -2314,6 +2337,147 @@ testCase('34. 超限内嵌图：MIME 里无该图 part、正文显示含阈值�
 	assert.equal(XMLValidator.validate(attXml), true, 'Fault 响应必须良构');
 	assert.ok(attXml.includes('<soap:Fault>') && attXml.includes('ErrorInvalidRequest'), '超限附件 → Fault');
 	assert.ok(attXml.includes('Please download it from the CloudMail web client'), 'Fault 文案指引用户用 Web 端下载');
+});
+
+// ---- 35. CreateItem 发件账号路由：From（MimeContent/结构化）→ 用户名下账号；越权拒绝；缺省回退 ----
+
+testCase('35. CreateItem：From 路由发件账号（MimeContent/结构化/NOCASE）、越权拒绝、缺省回退同名账号', async () => {
+	ensureNodeResolveHook();
+	const { dispatch, EwsFault } = await import('../src/ews/handlers.js');
+	// 生产 handlers.js 里的 email-service 已被 resolve hook 换成桩：sendCalls = 发信调用收到的账号参数
+	const { sendCalls, resetSendCalls } = await import(EMAIL_SERVICE_STUB_URL);
+
+	const user = { userId: 7, email: 'tb-user@example.com' };
+	const db = seedEwsDb();
+	// user 7 名下追加 ciallo.sale 发件账号（account 2 = alias@example.com 用作「本人另一账号」；
+	// account 3 = stranger@example.com 属于 user 8，用作越权样本）
+	db.prepare(`INSERT INTO account (account_id, email, name, user_id) VALUES (4, 'contact@ciallo.sale', 'Ciallo', 7)`).run();
+	const context = { env: { db: sqliteD1(db) } };
+
+	const envelope = (body) => `<?xml version="1.0" encoding="utf-8"?>
+<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"
+               xmlns:m="http://schemas.microsoft.com/exchange/services/2006/messages"
+               xmlns:t="http://schemas.microsoft.com/exchange/services/2006/types">
+  <soap:Body>${body}</soap:Body>
+</soap:Envelope>`;
+
+	const messageWithTo = (extra = '') => '<t:Message>' +
+		'<t:ToRecipients><t:Mailbox><t:EmailAddress>rcpt@example.net</t:EmailAddress></t:Mailbox></t:ToRecipients>' +
+		'<t:Subject>route test</t:Subject>' +
+		'<t:Body BodyType="Text">hello</t:Body>' + extra + '</t:Message>';
+	const mimeMessage = (mime) => `<t:Message><t:MimeContent CharacterSet="UTF-8">${mime}</t:MimeContent></t:Message>`;
+	const createItem = (messageXml, disposition) => envelope(
+		`<m:CreateItem MessageDisposition="${disposition}">` +
+		`<m:Items>${messageXml}</m:Items>` +
+		'</m:CreateItem>');
+
+	/** 发一封 CreateItem（SendOnly），返回响应 XML；sendCalls 记录 stub 收到的账号参数 */
+	async function send(messageXml, disposition = 'SendOnly') {
+		resetSendCalls();
+		const parsed = parseSoapRequest(createItem(messageXml, disposition));
+		assert.equal(parsed.error, undefined, 'CreateItem 请求必须是合法 SOAP');
+		assert.equal(parsed.operation, 'CreateItem');
+		return dispatch(context, parsed, user);
+	}
+
+	// ⓪ 纯函数 parseMimeFrom：base64（含折行）→ MIME 头 From 地址（UTF-8 / 裸地址 / 容错）
+	const mimeB64 = (raw) => base64EncodeBytes(new TextEncoder().encode(raw)).replace(/(.{24})/g, '$1\r\n');
+	assert.equal(parseMimeFrom(mimeB64('From: "Ciallo 中文" <contact@ciallo.sale>\r\nTo: a@b.c\r\nSubject: x\r\n\r\nHi')),
+		'contact@ciallo.sale', 'base64 折行 + 非 ASCII 显示名');
+	assert.equal(parseMimeFrom(mimeB64('From: =?UTF-8?q?Ciallo_=E4=B8=AD=E6=96=87?= <contact@ciallo.sale>\r\n\r\n')),
+		'contact@ciallo.sale', 'RFC2047 显示名');
+	assert.equal(parseMimeFrom(mimeB64('From: contact@ciallo.sale\r\n\r\nbody')), 'contact@ciallo.sale', '裸地址');
+	assert.equal(parseMimeFrom(mimeB64('Subject: no from\r\n\r\nFrom: fake@evil.test')), '', '正文里的 From: 文本不算');
+	assert.equal(parseMimeFrom(mimeB64('From: \r\n\r\n')), '');
+	assert.equal(parseMimeFrom(''), '');
+	assert.equal(parseMimeFrom('!!!not-base64!!!'), '', '非法 base64 容错为空');
+
+	// ① TB 145 形态：仅 t:MimeContent（整封 MIME），From=contact@ciallo.sale → ciallo 账号发信
+	const cialloMime = buildMimeBase64({
+		from: { email: 'contact@ciallo.sale', name: 'Ciallo 中文' },
+		to: [{ email: 'rcpt@example.net' }],
+		subject: 'mime route',
+		dateMs: Date.UTC(2026, 9, 1, 12, 0, 0),
+		text: 'hello from mime'
+	});
+	assert.ok(cialloMime.includes('\r\n'), '前置条件：base64 是 76 列折行形态（cleanBase64 需去空白）');
+	const xml1 = await send(mimeMessage(cialloMime));
+	assert.equal(XMLValidator.validate(xml1), true, 'CreateItem 响应必须良构');
+	assertSoapEnvelope(xml1, 'CreateItem');
+	assert.ok(!xml1.includes('<soap:Fault>'), '不应 Fault');
+	assert.equal(sendCalls.length, 1, 'emailService.send 被调用一次');
+	assert.equal(sendCalls[0].userId, 7);
+	assert.equal(sendCalls[0].params.accountId, 4, 'MimeContent From=contact@ciallo.sale → ciallo 账号（account 4）');
+	assert.deepEqual(sendCalls[0].params.receiveEmail, ['rcpt@example.net'], 'MimeContent 的 To 被解析成收件人');
+	assert.equal(sendCalls[0].params.sendType, 'send');
+	assert.ok(xml1.includes('<t:ItemId Id="4242"'), '响应带 stub 返回的 ItemId');
+
+	// ② MimeContent From=本人另一账号（大小写混写）→ NOCASE 命中 account 2
+	const aliasMime = buildMimeBase64({
+		from: { email: 'Alias@Example.COM', name: 'Alias' },
+		to: [{ email: 'rcpt@example.net' }],
+		subject: 'alias route',
+		dateMs: Date.UTC(2026, 9, 1, 12, 0, 0),
+		text: 'hello alias'
+	});
+	await send(mimeMessage(aliasMime));
+	assert.equal(sendCalls[0].params.accountId, 2, 'MimeContent From=Alias@Example.COM → 名下 alias 账号（NOCASE）');
+
+	// ③ From 不属于当前用户（他人账号 / 不存在地址）→ EwsFault，且绝不调用发信
+	for (const foreign of ['stranger@example.com', 'nobody@not-owned.test']) {
+		const foreignMime = buildMimeBase64({
+			from: { email: foreign },
+			to: [{ email: 'rcpt@example.net' }],
+			subject: 'reject',
+			dateMs: Date.UTC(2026, 9, 1, 12, 0, 0),
+			text: 'reject me'
+		});
+		await assert.rejects(() => send(mimeMessage(foreignMime)), (error) => {
+			assert.ok(error instanceof EwsFault, `From=${foreign} 必须是 EwsFault`);
+			assert.equal(error.responseCode, 'ErrorInvalidRequest');
+			assert.ok(error.message.includes('不属于当前账户'), 'faultstring 说明地址不属于当前账户');
+			return true;
+		});
+		assert.equal(sendCalls.length, 0, `From=${foreign} 不调用 emailService.send（禁止冒用身份）`);
+	}
+
+	// ④ 结构化 t:From / t:Sender（部分客户端形态）→ 同样的路由（含大小写不敏感）
+	const fromXml = await send(messageWithTo(
+		'<t:From><t:Mailbox><t:Name>Ciallo</t:Name><t:EmailAddress>CONTACT@CIALLO.SALE</t:EmailAddress></t:Mailbox></t:From>'));
+	assert.ok(!fromXml.includes('<soap:Fault>'));
+	assert.equal(sendCalls[0].params.accountId, 4, '结构化 t:From（NOCASE）→ ciallo 账号');
+	await send(messageWithTo(
+		'<t:Sender><t:Mailbox><t:EmailAddress>contact@ciallo.sale</t:EmailAddress></t:Mailbox></t:Sender>'));
+	assert.equal(sendCalls[0].params.accountId, 4, 't:Sender 与 t:From 同优先级');
+
+	// ④b 结构化 To/Body 存在（不触发整封 PostalMime 解析）+ From 只在 MimeContent 头里 → parseMimeFrom 兜底
+	const partialXml = await send(messageWithTo(`<t:MimeContent CharacterSet="UTF-8">${cialloMime}</t:MimeContent>`));
+	assert.ok(!partialXml.includes('<soap:Fault>'));
+	assert.equal(sendCalls[0].params.accountId, 4, '结构化字段未覆盖 From 时从 MimeContent 头取（兜底路由）');
+	assert.equal(sendCalls[0].params.text, 'hello', '结构化 Body 保持原样');
+	assert.deepEqual(sendCalls[0].params.receiveEmail, ['rcpt@example.net'], '结构化 To 保持原样');
+
+	// ⑤ From 缺失 → 回退登录邮箱同名账号（现状回归）
+	await send(messageWithTo());
+	assert.equal(sendCalls[0].params.accountId, 1, '无 From → 登录邮箱同名账号（account 1）');
+
+	// ⑤b 登录邮箱名下没有任何账号（ghost）且无 From → 仍按现状报「无可用发件账号」
+	await assert.rejects(
+		() => dispatch(context, parseSoapRequest(createItem(messageWithTo(), 'SendOnly')), { userId: 7, email: 'ghost@example.com' }),
+		(error) => {
+			assert.ok(error instanceof EwsFault);
+			assert.equal(error.responseCode, 'ErrorInvalidRequest');
+			assert.ok(error.message.includes('No sender account available'));
+			return true;
+		});
+
+	// ⑥ SaveOnly 草稿行为保持现状（仍拒绝，不扩展草稿功能）
+	await assert.rejects(() => send(messageWithTo(), 'SaveOnly'), (error) => {
+		assert.ok(error instanceof EwsFault);
+		assert.equal(error.responseCode, 'ErrorInvalidRequest');
+		assert.ok(error.message.includes('Drafts are not supported'));
+		return true;
+	});
 });
 
 // ------------------------------------------------------------------ runner ---
