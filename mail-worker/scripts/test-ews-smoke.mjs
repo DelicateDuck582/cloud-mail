@@ -10,6 +10,7 @@
  * 可见域（Distinguished 文件夹按用户聚合；账号文件夹 acct-<id> 只含该账号的可见收件，
  * 含归属校验与非法 token 拒绝）、
  * 超限内嵌图的正文可见占位（跳过 part + 阈值动态显示，GetAttachment 超限文案指向网页版）、
+ * 防白屏降级阶梯（多图/普通附件跳过进统一占位清单、纯附件无正文时清单即正文（html/text 皆空也始终输出）、HTML 截断、解码后 ≤1.4×预算、构建异常 → 极简 MIME 兜底）、
  * 以及 dispatch 对原型链操作名（toString）返回标准 Fault。
  *
  * 只依赖 fast-xml-parser（package.json dependencies）：
@@ -29,12 +30,16 @@ import { XMLParser, XMLValidator } from 'fast-xml-parser';
 import {
 	EWS_AUTH_CACHE_TTL,
 	EWS_AUTH_FAIL_DELAY_MS,
+	EWS_HTML_MAX_BYTES,
 	EWS_MAX_MIME_ITEM_IDS,
+	EWS_MIME_SAFE_TOTAL,
 	EWS_SYNC_PAGE,
 	accountFolderId,
 	ewsFolderDef,
 	ewsMaxAttBytes,
 	EWS_DEFAULT_MAX_ATT_BYTES,
+	ewsMaxTotalAttBytes,
+	ewsMimeSafeTotal,
 	parseAccountFolder
 } from '../src/ews/const.js';
 import {
@@ -63,6 +68,7 @@ import {
 	decodeSyncState,
 	emptySyncState,
 	encodeSyncState,
+	humanFileSize,
 	isDeletedRow,
 	isInlineAttachment,
 	isUnreadRow,
@@ -76,13 +82,16 @@ import {
 	resolveNameMatches,
 	rowRecipients,
 	selectTombstoneDeletes,
+	skippedAttachmentsHtml,
+	skippedAttachmentsText,
 	splitOutgoingAttachments,
 	stripCidBrackets,
 	toIso,
-	tombstoneFolderToken
+	tombstoneFolderToken,
+	truncateUtf8Bytes
 } from '../src/ews/protocol.js';
 import { parseContentLength, precheckContentLength, readLimitedText } from '../src/ews/request-guard.js';
-import { buildMimeBase64 } from '../src/ews/mime-build.js';
+import { base64Encode, buildMimeBase64 } from '../src/ews/mime-build.js';
 
 const cases = [];
 function testCase(name, fn) {
@@ -2478,6 +2487,265 @@ testCase('35. CreateItem：From 路由发件账号（MimeContent/结构化/NOCAS
 		assert.ok(error.message.includes('Drafts are not supported'));
 		return true;
 	});
+});
+
+// ---- 36. 防白屏降级阶梯：跳过项占位清单 + 总量自查 + 构建异常极简兜底 ----
+
+testCase('36. 防白屏降级阶梯：多图/普通附件跳过进占位清单、MimeContent 解码后 ≤1.4×预算；内部异常仍 Success 极简 MIME', async () => {
+	ensureNodeResolveHook();
+	const { default: ewsApp } = await import('../src/ews/router.js');
+
+	// 先做纯函数断言：清单格式（转义 + 大小人性化）、UTF-8 截断、常量默认值
+	assert.equal(EWS_MIME_SAFE_TOTAL, 1024 * 1024, 'EWS_MIME_SAFE_TOTAL 默认 1MB');
+	assert.equal(EWS_HTML_MAX_BYTES, 256 * 1024, 'HTML 正文截断阈值 256KB');
+	assert.equal(ewsMimeSafeTotal({}), EWS_MIME_SAFE_TOTAL);
+	assert.equal(ewsMimeSafeTotal({ EWS_MIME_SAFE_TOTAL: '524288' }), 524288);
+	assert.equal(ewsMaxTotalAttBytes({}), EWS_MIME_SAFE_TOTAL, '附件账本默认对齐 CPU 安全预算（不再 2×单附件）');
+	assert.equal(ewsMaxTotalAttBytes({ EWS_MAX_TOTAL_ATT_BYTES: '4096' }), 4096, 'env 仍可显式调小/调大');
+	assert.equal(humanFileSize(2202009), '2.1MB');
+	assert.equal(humanFileSize(1024), '1KB');
+	assert.equal(humanFileSize(0), '未知大小');
+	const manifestHtml = skippedAttachmentsHtml([{ filename: 'a<b&c>.png', size: 2202009 }, { filename: 'report.pdf', size: 3.4 * 1024 * 1024 }]);
+	assert.ok(manifestHtml.includes('• a&lt;b&amp;c&gt;.png（2.1MB）'), 'HTML 清单：文件名转义 + 大小 MB');
+	assert.ok(manifestHtml.includes('• report.pdf（3.4MB）'));
+	assert.ok(manifestHtml.startsWith('<p style="border:1px dashed #999;padding:8px;color:#666;">[以下内容过大，此客户端无法加载，请使用网页版查看]<br>'));
+	assert.ok(skippedAttachmentsText([{ filename: 'a<b>.png', size: 1024 }]).includes('• a<b>.png（1KB）'), '纯文本清单不转义');
+	assert.equal(skippedAttachmentsHtml([]), '', '无跳过项不产出清单');
+	const cut = truncateUtf8Bytes('中'.repeat(100), 10);
+	assert.equal(cut.truncated, true);
+	assert.ok(Buffer.byteLength(cut.text, 'utf8') <= 10, '按 UTF-8 字节截断');
+	assert.equal(truncateUtf8Bytes('abc', 10).truncated, false);
+	assert.equal(truncateUtf8Bytes('abc', 2).text, 'ab');
+	assert.equal(truncateUtf8Bytes('a😀b', 5).text, 'a😀', '不截出半个代理对');
+	// 回归：>32KB 的分块 base64 不得在中段出现补位符（曾导致 atob/TB 在 '=' 处截断 → 白屏）
+	const chunked = base64Encode(new Uint8Array(100 * 1024).fill(0x42)).replace(/\s+/g, '');
+	assert.ok(!chunked.slice(0, -2).includes('='), '分块 base64 中段无补位符');
+	assert.equal(Buffer.from(chunked, 'base64').length, 100 * 1024, '分块 base64 解码字节数精确');
+
+	const jwtSecret = 'unit-test-jwt-secret';
+	const password = 'secret-password';
+	const mail = 'tb-user@example.com';
+	const kvStore = new Map();
+	kvStore.set('setting:', JSON.stringify({ emailPrefixFilter: '' }));
+	kvStore.set('ews-auth:' + createHash('sha256').update(`${jwtSecret}:${mail}:${password}`).digest('hex'),
+		JSON.stringify({ userId: 7, email: mail, status: 0, isDel: 0 }));
+	const kv = {
+		get: async (key) => (kvStore.has(key) ? JSON.parse(kvStore.get(key)) : null),
+		put: async () => {},
+		delete: async () => {}
+	};
+
+	// 900KB 内嵌图 ×2（单张 < 1MB 单附件上限；两张累计 1.8MB > 1MB 账本 → 第二张必须跳过）
+	const imgBytes = new Uint8Array(900 * 1024).fill(0x42);
+	const pdfBytes = new Uint8Array(2 * 1024 * 1024).fill(0x25); // 2MB 普通附件 > 单附件上限 → 跳过 + 清单
+	const boomBytes = new Uint8Array(1024).fill(0x7f);           // 正常大小，但 COS 读取抛错 → 极简兜底
+	const objects = new Map([
+		['attachments/i1.png', imgBytes],
+		['attachments/i2.png', imgBytes],
+		['attachments/report.pdf', pdfBytes],
+		['attachments/boom.bin', boomBytes]
+	]);
+	const fetched = [];
+	const r2 = {
+		get: async (key) => {
+			fetched.push(key);
+			if (key === 'attachments/boom.bin') throw new Error('COS read exploded');
+			const bytes = objects.get(key);
+			return bytes ? { arrayBuffer: async () => bytes.buffer } : null;
+		}
+	};
+
+	const db = seedEwsDb();
+	// 301：两张 900KB 内嵌图（正文各引用一次）
+	db.prepare(`INSERT INTO email (email_id, account_id, user_id, type, unread, trash, is_del, subject, send_email, create_time, update_time, content)
+	            VALUES (301, 1, 7, 0, 1, 0, 0, 'two big inline', 'a@x.y', '2026-10-02 08:00:00', '2026-10-02 08:00:00', ?)`)
+		.run('<p>图一：</p><img src="{{domain}}attachments/i1.png"><p>图二：</p><img src="{{domain}}attachments/i2.png">');
+	db.prepare(`INSERT INTO attachments (att_id, user_id, email_id, account_id, key, filename, mime_type, size, type, content_id) VALUES
+	            (11, 7, 301, 1, 'attachments/i1.png', 'i1.png', 'image/png', ?, 1, 'i1@cloud'),
+	            (12, 7, 301, 1, 'attachments/i2.png', 'i2.png', 'image/png', ?, 1, 'i2@cloud')`)
+		.run(imgBytes.length, imgBytes.length);
+	// 302：2MB 普通附件（type=0，之前被静默跳过/卷入，现在必须进占位清单）
+	db.prepare(`INSERT INTO email (email_id, account_id, user_id, type, unread, trash, is_del, subject, send_email, create_time, update_time, content)
+	            VALUES (302, 1, 7, 0, 1, 0, 0, 'big attachment', 'a@x.y', '2026-10-02 08:01:00', '2026-10-02 08:01:00', '<p>见附件</p>')`).run();
+	db.prepare(`INSERT INTO attachments (att_id, user_id, email_id, account_id, key, filename, mime_type, size, type, content_id) VALUES
+	            (13, 7, 302, 1, 'attachments/report.pdf', 'report.pdf', 'application/pdf', ?, 0, '')`)
+		.run(pdfBytes.length);
+	// 303：COS 读取抛错的正常附件（触发 buildMimeForRow 整体 try/catch）
+	db.prepare(`INSERT INTO email (email_id, account_id, user_id, type, unread, trash, is_del, subject, send_email, create_time, update_time, content)
+	            VALUES (303, 1, 7, 0, 1, 0, 0, 'boom attachment', 'a@x.y', '2026-10-02 08:02:00', '2026-10-02 08:02:00', '<p>boom</p>')`).run();
+	db.prepare(`INSERT INTO attachments (att_id, user_id, email_id, account_id, key, filename, mime_type, size, type, content_id) VALUES
+	            (14, 7, 303, 1, 'attachments/boom.bin', 'boom.bin', 'application/octet-stream', ?, 0, '')`)
+		.run(boomBytes.length);
+	// 304：>256KB 的 HTML 正文（截断 + 提示；尾部唯一标记必须被截掉）
+	db.prepare(`INSERT INTO email (email_id, account_id, user_id, type, unread, trash, is_del, subject, send_email, create_time, update_time, content, text)
+	            VALUES (304, 1, 7, 0, 1, 0, 0, 'huge html', 'a@x.y', '2026-10-02 08:03:00', '2026-10-02 08:03:00', ?, 'plain small')`)
+		.run('<p>' + 'x'.repeat(300 * 1024) + 'ZZZ-TAIL-MARKER</p>');
+	// 305：普通小邮件（回归：不受降级阶梯影响）
+	db.prepare(`INSERT INTO email (email_id, account_id, user_id, type, unread, trash, is_del, subject, send_email, create_time, update_time, content, text)
+	            VALUES (305, 1, 7, 0, 1, 0, 0, 'small mail', 'a@x.y', '2026-10-02 08:04:00', '2026-10-02 08:04:00', '<p>hello small</p>', 'plain body')`).run();
+
+	const post = (body, extraEnv = {}) => ewsApp.fetch(new Request('https://mail.example.com/EWS/Exchange.asmx', {
+		method: 'POST',
+		headers: {
+			Authorization: 'Basic ' + Buffer.from(`${mail}:${password}`).toString('base64'),
+			'Content-Type': 'text/xml; charset=utf-8'
+		},
+		body
+	}), { jwt_secret: jwtSecret, kv, db: sqliteD1(db), domain: '["example.com"]', r2, ...extraEnv }, {});
+
+	const envelope = (body) => `<?xml version="1.0" encoding="utf-8"?>
+<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"
+               xmlns:m="http://schemas.microsoft.com/exchange/services/2006/messages"
+               xmlns:t="http://schemas.microsoft.com/exchange/services/2006/types">
+  <soap:Body>${body}</soap:Body>
+</soap:Envelope>`;
+	const getItemWithMime = (id) => envelope('<m:GetItem>' +
+		'<m:ItemShape><t:BaseShape>Default</t:BaseShape><t:IncludeMimeContent>true</t:IncludeMimeContent></m:ItemShape>' +
+		`<m:ItemIds><t:ItemId Id="${id}"/></m:ItemIds>` +
+		'</m:GetItem>');
+
+	const safeRawBytes = Math.floor(EWS_MIME_SAFE_TOTAL * 1.4);
+	// 外层 base64 文本长度上界：解码后 raw ≤ 1.4×预算 ⇒ base64 字符数 ≤ ceil(raw/3)*4（+padding）
+	const maxOuterBase64 = Math.ceil(safeRawBytes / 3) * 4 + 8;
+	const mimeOf = (xml) => {
+		assert.equal(XMLValidator.validate(xml), true, 'GetItem 响应必须良构');
+		assertSoapEnvelope(xml, 'GetItem');
+		assert.ok(!xml.includes('<soap:Fault>'), 'GetItem 不应抛 Fault');
+		assert.ok(xml.includes('ResponseClass="Success"'), 'GetItem 必须 Success（绝不 5xx/Fault）');
+		const message = parseBack.parse(xml).Envelope.Body.GetItemResponse.ResponseMessages.GetItemResponseMessage;
+		const mime = textOf(message.Items.Message.MimeContent);
+		assert.ok(mime.length > 0, 'MimeContent 已重建（降级后也有极简 MIME）');
+		assert.ok(base64DecodedSize(mime) <= safeRawBytes,
+			`MimeContent 解码后 ${base64DecodedSize(mime)} 字节必须 ≤ 1.4×预算 ${safeRawBytes}`);
+		assert.ok(mime.length <= maxOuterBase64, `外层 base64 ${mime.length} 字符必须 ≤ ${maxOuterBase64}`);
+		return Buffer.from(mime, 'base64').toString('utf8');
+	};
+
+	// ① 多图（2×900KB）：第一张进 MIME、第二张超账本被跳过 → 第二张进占位清单（含文件名与大小）
+	const bigRaw = mimeOf(await (await post(getItemWithMime(301))).text());
+	assert.ok(bigRaw.includes('Content-ID: <i1@cloud>'), '第一张 900KB 图在预算内，正常进 MIME');
+	assert.ok(!bigRaw.includes('i2@cloud'), '第二张超累计账本，图 part 不进 MIME');
+	assert.ok(!bigRaw.includes('filename="i2.png"'), '第二张图不作为附件 part 残留');
+	assert.deepEqual(fetched, ['attachments/i1.png'], '第二张在读 COS 前就被跳过（不产生字节读取）');
+	const bigBody = decodeMimeBodies(bigRaw);
+	assert.ok(bigBody.includes('cid:i1@cloud'), '第一张图的 cid 引用照常替换');
+	assert.ok(bigBody.includes('[以下内容过大，此客户端无法加载，请使用网页版查看]'), '正文末尾出现统一占位清单');
+	assert.ok(bigBody.includes('• i2.png（900KB）'), '清单含被跳过内嵌图文件名与人性化大小（<1MB 显示 KB）');
+	assert.ok(bigBody.includes('[图片过大（>1MB）'), '被跳过内嵌图位置仍有可见占位（现状行为保持）');
+
+	// ② 普通附件 2MB（type=0）：超单附件上限 → 跳过并进清单（不再是无声缺失）
+	const pdfRaw = mimeOf(await (await post(getItemWithMime(302))).text());
+	assert.ok(!pdfRaw.includes('filename="report.pdf"'), '超限普通附件不进 MIME part');
+	assert.deepEqual(fetched, ['attachments/i1.png'], '超限普通附件同样在读 COS 前跳过');
+	const pdfBody = decodeMimeBodies(pdfRaw);
+	assert.ok(pdfBody.includes('[以下内容过大，此客户端无法加载，请使用网页版查看]'), '普通附件跳过也有占位清单');
+	assert.ok(pdfBody.includes('• report.pdf（2MB）'), '清单含普通附件文件名与大小');
+
+	// ③ 构建内部异常（COS 抛错）：整体 try/catch → 仍 Success + 极简 text/plain MIME（不白屏）
+	const boomXml = await (await post(getItemWithMime(303))).text();
+	const boomRaw = mimeOf(boomXml);
+	assert.ok(fetched.includes('attachments/boom.bin'), '确实读到了抛错附件（异常路径被触发）');
+	const boomBody = decodeMimeBodies(boomRaw);
+	assert.ok(boomBody.includes('此邮件包含较大内容，无法在当前客户端加载，请使用网页版查看。'), '极简 MIME 含降级说明');
+	assert.ok(boomBody.includes('邮件主题：boom attachment'), '极简 MIME 保留主题');
+	assert.ok(boomBody.includes('邮件日期：2026-10-02 08:02:00'), '极简 MIME 保留日期');
+	assert.ok(!boomRaw.includes('Content-Disposition: attachment'), '极简 MIME 不带任何附件 part');
+
+	// ④ 超长 HTML（>256KB）：截断 + 末尾提示，尾部内容不出现
+	const hugeRaw = mimeOf(await (await post(getItemWithMime(304))).text());
+	const hugeBody = decodeMimeBodies(hugeRaw);
+	assert.ok(hugeBody.includes('（内容过长已截断，请使用网页版查看完整内容）'), '超长正文带截断提示');
+	assert.ok(!hugeBody.includes('ZZZ-TAIL-MARKER'), '超出 256KB 的尾部内容被截掉');
+	assert.ok(hugeBody.includes('plain small'), 'text/plain 正文保留');
+
+	// ⑤ 普通小邮件回归：无清单、无截断、正文完整
+	const smallRaw = mimeOf(await (await post(getItemWithMime(305))).text());
+	const smallBody = decodeMimeBodies(smallRaw);
+	assert.ok(smallBody.includes('hello small') && smallBody.includes('plain body'), '小邮件正文完整');
+	assert.ok(!smallBody.includes('[以下内容过大') && !smallBody.includes('内容过长已截断'), '小邮件不出现任何降级痕迹');
+});
+
+// ---- 37. 纯附件无正文：清单本身就是正文（html/text 皆空也必须输出） ----
+
+testCase('37. 纯附件无正文邮件（html/text 皆空 + 2MB 附件）：MimeContent 始终输出占位清单（HTML + text）', async () => {
+	ensureNodeResolveHook();
+	const { default: ewsApp } = await import('../src/ews/router.js');
+
+	const jwtSecret = 'unit-test-jwt-secret';
+	const password = 'secret-password';
+	const mail = 'tb-user@example.com';
+	const kvStore = new Map();
+	kvStore.set('setting:', JSON.stringify({ emailPrefixFilter: '' }));
+	kvStore.set('ews-auth:' + createHash('sha256').update(`${jwtSecret}:${mail}:${password}`).digest('hex'),
+		JSON.stringify({ userId: 7, email: mail, status: 0, isDel: 0 }));
+	const kv = {
+		get: async (key) => (kvStore.has(key) ? JSON.parse(kvStore.get(key)) : null),
+		put: async () => {},
+		delete: async () => {}
+	};
+
+	// 2MB 普通附件 > 默认单附件上限 1MB → 必须被跳过并进占位清单；
+	// fetched 证明被跳过的附件在读 COS 前就被截住（不产生字节读取）
+	const pdfBytes = new Uint8Array(2 * 1024 * 1024).fill(0x25);
+	const fetched = [];
+	const r2 = {
+		get: async (key) => {
+			fetched.push(key);
+			if (key === 'attachments/pure.pdf') return { arrayBuffer: async () => pdfBytes.buffer };
+			return null;
+		}
+	};
+
+	const db = seedEwsDb();
+	// 306：纯附件邮件，content / text 列均为 NULL（用户实测形态：正文完全为空）
+	db.prepare(`INSERT INTO email (email_id, account_id, user_id, type, unread, trash, is_del, subject, send_email, create_time, update_time)
+	            VALUES (306, 1, 7, 0, 1, 0, 0, 'pure attachment', 'a@x.y', '2026-10-03 08:00:00', '2026-10-03 08:00:00')`).run();
+	db.prepare(`INSERT INTO attachments (att_id, user_id, email_id, account_id, key, filename, mime_type, size, type, content_id) VALUES
+	            (15, 7, 306, 1, 'attachments/pure.pdf', 'pure.pdf', 'application/pdf', ?, 0, '')`)
+		.run(pdfBytes.length);
+
+	const post = (body) => ewsApp.fetch(new Request('https://mail.example.com/EWS/Exchange.asmx', {
+		method: 'POST',
+		headers: {
+			Authorization: 'Basic ' + Buffer.from(`${mail}:${password}`).toString('base64'),
+			'Content-Type': 'text/xml; charset=utf-8'
+		},
+		body
+	}), { jwt_secret: jwtSecret, kv, db: sqliteD1(db), domain: '["example.com"]', r2 }, {});
+
+	const envelope = (body) => `<?xml version="1.0" encoding="utf-8"?>
+<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"
+               xmlns:m="http://schemas.microsoft.com/exchange/services/2006/messages"
+               xmlns:t="http://schemas.microsoft.com/exchange/services/2006/types">
+  <soap:Body>${body}</soap:Body>
+</soap:Envelope>`;
+	const getItemWithMime = (id) => envelope('<m:GetItem>' +
+		'<m:ItemShape><t:BaseShape>Default</t:BaseShape><t:IncludeMimeContent>true</t:IncludeMimeContent></m:ItemShape>' +
+		`<m:ItemIds><t:ItemId Id="${id}"/></m:ItemIds>` +
+		'</m:GetItem>');
+
+	const xml = await (await post(getItemWithMime(306))).text();
+	assert.equal(XMLValidator.validate(xml), true, 'GetItem 响应必须良构');
+	assertSoapEnvelope(xml, 'GetItem');
+	assert.ok(!xml.includes('<soap:Fault>'), 'GetItem 不应抛 Fault');
+	assert.ok(xml.includes('ResponseClass="Success"'), 'GetItem 必须 Success');
+	const message = parseBack.parse(xml).Envelope.Body.GetItemResponse.ResponseMessages.GetItemResponseMessage;
+	const mime = textOf(message.Items.Message.MimeContent);
+	assert.ok(mime.length > 0, 'MimeContent 已重建');
+	const rawMime = Buffer.from(mime, 'base64').toString('utf8');
+	const body = decodeMimeBodies(rawMime);
+
+	// 被跳过的 2MB 附件：MIME 里无它的 part（预期），占位清单是唯一提示
+	assert.ok(!rawMime.includes('filename="pure.pdf"'), '超限附件不作为 MIME part 输出（预期）');
+	assert.deepEqual(fetched, [], '超限附件在读 COS 前就被跳过');
+	assert.ok(body.includes('[以下内容过大，此客户端无法加载，请使用网页版查看]'), 'MimeContent 出现占位清单标题');
+	assert.ok(body.includes('• pure.pdf（2MB）'), '清单含被跳过附件的文件名与人性化大小');
+	// 正文为空时清单本身就是 HTML 正文（含 <p> 标签），TB 的 HTML 渲染路径必须能看到
+	assert.ok(rawMime.includes('Content-Type: multipart/alternative'), '清单同时以 html + text 两种形态输出');
+	assert.ok(rawMime.includes('Content-Type: text/plain') && rawMime.includes('Content-Type: text/html'),
+		'text/plain 与 text/html part 都存在');
+	assert.ok(body.includes('<p style="border:1px dashed #999;padding:8px;color:#666;">') && body.includes('• pure.pdf（2MB）'),
+		'HTML 清单原文可见（文件名与大小）');
 });
 
 // ------------------------------------------------------------------ runner ---

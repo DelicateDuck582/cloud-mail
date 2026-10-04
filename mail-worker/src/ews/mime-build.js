@@ -133,12 +133,16 @@ export function base64Encode(bytes) {
 	const input = toBytes(bytes);
 
 	if (typeof btoa === 'function') {
-		const CHUNK = 0x8000;
+		// 分块长度必须是 3 的倍数：每块都是完整 base64 组、btoa 不产生补位，
+		// 直接拼接即连续合法 base64（仅最后一块可能有尾部补位，位置正确）。
+		// 此前用 0x8000（非 3 倍数）：块尾 '=' 残留在中段，严格解码器（TB/atob）
+		// 在 '=' 处报错/截断，整封 MimeContent（>32KB）损坏 → TB 白屏
+		const CHUNK = 0x7FFE; // 32766 = 3 × 10922
 		let raw = '';
 		for (let i = 0; i < input.length; i += CHUNK) {
 			raw += btoa(String.fromCharCode.apply(null, input.subarray(i, i + CHUNK)));
 		}
-		return fold76(raw.replace(/\n/g, ''));
+		return fold76(raw);
 	}
 
 	return base64EncodeJs(input);

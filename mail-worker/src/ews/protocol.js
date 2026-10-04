@@ -21,6 +21,8 @@ const IS_DEL_DELETE = 1;
 // ../const/entity-const：emailConst.type（0=收件，1=发件）
 const TYPE_SEND = 1;
 
+const UTF8_ENCODER = new TextEncoder();
+
 // ---------------------------------------------------------------- 通用 ----
 
 /** 'YYYY-MM-DD HH:mm:ss'（UTC）→ EWS 的 xs:dateTime */
@@ -411,6 +413,68 @@ export function replaceInlineImagesWithPlaceholder(html, refs, maxAttBytes) {
 		const src = (match?.[1] ?? match?.[2] ?? match?.[3] ?? '').trim();
 		return src !== '' && refs.has(src) ? placeholder : tag;
 	});
+}
+
+/**
+ * 人类可读文件大小：≥1MB → `2.1MB`，≥1KB → `512KB`，否则 `800B`；
+ * 大小未知（<=0 / 非数字）→ `未知大小`（老数据 size 未回填时不撒谎显示 0B）。
+ */
+export function humanFileSize(bytes) {
+	const value = Number(bytes);
+	if (!Number.isFinite(value) || value <= 0) return '未知大小';
+	if (value >= 1024 * 1024) return Math.round((value / (1024 * 1024)) * 10) / 10 + 'MB';
+	if (value >= 1024) return Math.round(value / 1024) + 'KB';
+	return Math.round(value) + 'B';
+}
+
+/** 被跳过项列表规范化：filename 取非空字符串，size 取有限数；无文件名的项丢弃 */
+function normalizeSkippedItems(items) {
+	return (Array.isArray(items) ? items : [])
+		.map((item) => ({
+			filename: String(item?.filename ?? '').trim(),
+			size: Number(item?.size) || 0
+		}))
+		.filter((item) => item.filename !== '');
+}
+
+/**
+ * 被跳过附件清单（HTML 版）：内嵌图 + 普通附件统一列出（文件名转义、大小人性化），
+ * 附在 MIME 正文 HTML 末尾——否则用户只看到图/附件无声消失，无从得知发生了什么。
+ */
+export function skippedAttachmentsHtml(items) {
+	const list = normalizeSkippedItems(items);
+	if (list.length === 0) return '';
+	const rows = list.map((item) => `• ${escapeXml(item.filename)}（${humanFileSize(item.size)}）`);
+	return '<p style="border:1px dashed #999;padding:8px;color:#666;">' +
+		'[以下内容过大，此客户端无法加载，请使用网页版查看]<br>' + rows.join('<br>') + '</p>';
+}
+
+/** 被跳过附件清单（纯文本版）：text/plain 分支同附一份，纯文本客户端也能看到 */
+export function skippedAttachmentsText(items) {
+	const list = normalizeSkippedItems(items);
+	if (list.length === 0) return '';
+	const rows = list.map((item) => `• ${item.filename}（${humanFileSize(item.size)}）`);
+	return '[以下内容过大，此客户端无法加载，请使用网页版查看]\n' + rows.join('\n');
+}
+
+/**
+ * 按 UTF-8 字节数截断字符串（不会截出半个代理对：切点落在高位代理后则回退一字符）。
+ * 返回 { text, truncated }；maxBytes 非法或未超限时原样返回。用于超长 HTML/纯文本正文降级。
+ */
+export function truncateUtf8Bytes(text, maxBytes) {
+	const source = typeof text === 'string' ? text : '';
+	const limit = Math.floor(Number(maxBytes));
+	if (!Number.isFinite(limit) || limit <= 0 || source === '') return { text: source, truncated: false };
+	if (UTF8_ENCODER.encode(source).length <= limit) return { text: source, truncated: false };
+	let lo = 0;
+	let hi = source.length;
+	while (lo < hi) {
+		const mid = (lo + hi + 1) >> 1;
+		if (UTF8_ENCODER.encode(source.slice(0, mid)).length <= limit) lo = mid;
+		else hi = mid - 1;
+	}
+	if (lo > 0 && /[\uD800-\uDBFF]/.test(source[lo - 1])) lo -= 1;
+	return { text: source.slice(0, lo), truncated: true };
 }
 
 /**

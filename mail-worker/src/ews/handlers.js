@@ -34,13 +34,15 @@ import { attConst, emailConst, isDel } from '../const/entity-const';
 import BizError from '../error/biz-error';
 import { buildMimeBase64 } from './mime-build.js';
 import {
+	EWS_HTML_MAX_BYTES,
 	EWS_MAX_MIME_ITEM_IDS,
 	EWS_ROOT_CHILDREN,
 	EWS_SYNC_PAGE,
 	accountFolderId,
 	ewsFolderDef,
 	ewsMaxAttBytes,
-	ewsMaxTotalAttBytes
+	ewsMaxTotalAttBytes,
+	ewsMimeSafeTotal
 } from './const.js';
 import {
 	asArray,
@@ -80,10 +82,13 @@ import {
 	resolutionSetXml,
 	resolveNameMatches,
 	selectTombstoneDeletes,
+	skippedAttachmentsHtml,
+	skippedAttachmentsText,
 	splitOutgoingAttachments,
 	stripCidBrackets,
 	timeZoneDefinitionsXml,
-	toDateMs
+	toDateMs,
+	truncateUtf8Bytes
 } from './protocol.js';
 
 /** EWS 业务错误：由 router 统一转成 SOAP Fault */
@@ -379,17 +384,23 @@ async function attachmentRows(c, emailId, userId) {
 }
 
 /**
- * 本次响应「已重建附件字节」账本：跨本次响应内多封邮件累计（呼应 EWS_MAX_TOTAL_ATT_BYTES）。
- * 超过 limit 后剩余附件走「跳过」路径（与单附件超限同一处理），避免一次响应重建过多附件打爆内存。
+ * 本次响应「已重建附件字节」账本：跨本次响应内多封邮件累计。
+ * 上限取 EWS_MAX_TOTAL_ATT_BYTES（env 可调小/调大）与 EWS_MIME_SAFE_TOTAL
+ * （CPU 硬预算）的较小者：附件解码字节被压在安全预算内，base64 输出才有 ≤1.4× 预算的可能。
+ * 超过 limit 后剩余附件走「跳过」路径（与单附件超限同一处理），避免一次响应重建过多附件打爆内存/CPU。
  */
 function newAttBudget(c) {
-	return { total: 0, limit: ewsMaxTotalAttBytes(c.env), warned: false };
+	return {
+		total: 0,
+		limit: Math.min(ewsMaxTotalAttBytes(c.env), ewsMimeSafeTotal(c.env)),
+		warned: false
+	};
 }
 
 /**
  * 记录被跳过的内嵌图在正文里的引用形态：`cid:<contentId>`（成功替换后的形态）
  * 与 `{{domain}}<key>`（库内正文的原始形态），供循环后把 <img ...> 整段换成可见占位。
- * 普通附件（非内嵌图）被跳过时不记录：正文里没有它的引用。
+ * 普通附件（非内嵌图）被跳过时不记录引用，但会进统一占位清单（skippedItems）。
  */
 function collectSkippedInlineRef(refs, attRow) {
 	if (!isInlineAttachment(attRow)) return;
@@ -399,36 +410,94 @@ function collectSkippedInlineRef(refs, attRow) {
 	if (key !== '') refs.add(`{{domain}}${key}`);
 }
 
-/** 用 COS 附件 + 库内正文重建完整 MIME（base64），供 EWS MimeContent */
+/** 附件在占位清单里的展示名：filename 缺失回落 key，再缺给固定文案 */
+function attachmentDisplayName(attRow) {
+	return String(attRow?.filename ?? '').trim() || String(attRow?.key ?? '').trim() || '未命名附件';
+}
+
+/**
+ * 极简降级 MIME：只回一段 text/plain（主题/日期仍可见），用于重建异常或极端超限。
+ * 绝不抛错：连极简 MIME 都构建失败时返回 ''（TB 侧只剩元数据，同样不会白屏）。
+ */
+function minimalMimeForRow(row) {
+	try {
+		const dateMs = toDateMs(row?.createTime);
+		return buildMimeBase64({
+			from: { email: row?.sendEmail, name: row?.name },
+			to: rowRecipientsForMime(row),
+			subject: row?.subject,
+			dateMs: Number.isFinite(dateMs) ? dateMs : Date.now(),
+			messageId: row?.messageId,
+			text: '此邮件包含较大内容，无法在当前客户端加载，请使用网页版查看。'
+				+ `\n邮件主题：${String(row?.subject ?? '')}`
+				+ `\n邮件日期：${String(row?.createTime ?? '')}`
+		});
+	} catch (error) {
+		console.warn(`[ews] minimal fallback MIME failed for email ${row?.emailId}: ${String(error?.message || error)}`);
+		return '';
+	}
+}
+
+/**
+ * 用 COS 附件 + 库内正文重建完整 MIME（base64），供 EWS MimeContent。
+ *
+ * 防白屏降级阶梯（Free 计划 10ms CPU：base64 编码约 130KB/ms，任何一步都不能让输出失控）：
+ *   ① 正文：text 保留；html > EWS_HTML_MAX_BYTES 截断 + 末尾提示用网页版；
+ *   ② 内嵌图 / 普通附件统一护栏：单个 > EWS_MAX_ATT_BYTES 跳过；本次响应累计超账本跳过；
+ *   ③ 所有被跳过项（内嵌图 + 普通附件）进统一占位清单，附在正文 HTML / text 末尾；
+ *      正文为空（纯附件邮件）时清单本身就是正文——清单始终输出，绝不静默；
+ *   ④ 构建后自查：解码后的原始 MIME 字节 ≤ EWS_MIME_SAFE_TOTAL × 1.4，超了先砍 html、再砍 text（附件已受账本约束）；
+ *      两级降级都把占位清单保留为 text/html 正文，避免降级后连「附件被跳过」的提示都丢掉；
+ *   ⑤ 整体 try/catch：任何异常 → 极简 text/plain 降级 MIME，绝不向上抛错（GetItem 永远 200/Success）。
+ */
 async function buildMimeForRow(c, row, maxAttBytes, budget) {
+	try {
+		return await buildMimeWithinSafeBudget(c, row, maxAttBytes, budget);
+	} catch (error) {
+		// 兜底阶梯：DB/COS/组装任何一步抛错都不上抛——上抛 = TB 白屏/收信中断
+		console.warn(`[ews] MimeContent rebuild failed for email ${row?.emailId}; using minimal fallback MIME: ${String(error?.message || error)}`);
+		return minimalMimeForRow(row);
+	}
+}
+
+/** buildMimeForRow 的正常路径（异常由外层统一兜底） */
+async function buildMimeWithinSafeBudget(c, row, maxAttBytes, budget) {
+	const safeTotal = ewsMimeSafeTotal(c.env);
+	const ledger = budget ?? { total: 0, limit: 0, warned: false };
 	const rows = await attachmentRows(c, row.emailId, row.userId);
 	let html = row.content || '';
+	let text = row.text || '';
 	const inlineImages = [];
 	const attachments = [];
 	// 被跳过的内嵌图引用：循环后统一把正文里的 <img> 换成文字占位（图片无声消失用户无从得知）
 	const skippedInlineRefs = new Set();
+	// 被跳过的项（内嵌图 + 普通附件）：统一进正文末尾的占位清单
+	const skippedItems = [];
 
 	for (const attRow of rows) {
-		// 超限附件不进 MIME（TB 侧表现为该附件缺失，正文与其它附件仍可见）
+		const inline = isInlineAttachment(attRow);
+		// ① 单附件超限：不进 MIME（读 COS 前就跳过，不产生字节读取），进占位清单
 		if ((Number(attRow.size) || 0) > maxAttBytes) {
 			collectSkippedInlineRef(skippedInlineRefs, attRow);
+			skippedItems.push({ filename: attachmentDisplayName(attRow), size: attRow.size });
 			continue;
 		}
-		// 本次响应累计护栏：多封邮件累计超出 ewsMaxTotalAttBytes 后，剩余附件同样跳过
-		if (!attBudgetAllows(budget, attRow.size)) {
-			if (!budget.warned) {
-				budget.warned = true;
-				console.warn(`[ews] rebuilding MimeContent hit the total attachment budget (${budget.limit} bytes): remaining attachments are skipped in this response.`);
+		// ② 本次响应累计护栏：多封邮件累计超出账本后，剩余附件同样跳过（普通附件不再静默卷入重建）
+		if (!attBudgetAllows(ledger, attRow.size)) {
+			if (!ledger.warned) {
+				ledger.warned = true;
+				console.warn(`[ews] rebuilding MimeContent hit the total attachment budget (${ledger.limit} bytes): remaining attachments are skipped in this response.`);
 			}
 			collectSkippedInlineRef(skippedInlineRefs, attRow);
+			skippedItems.push({ filename: attachmentDisplayName(attRow), size: attRow.size });
 			continue;
 		}
 		const object = await r2Service.getObj(c, attRow.key);
 		if (!object) continue;
 		const data = new Uint8Array(await object.arrayBuffer());
-		budget.total += data.length;
+		ledger.total += data.length;
 
-		if (isInlineAttachment(attRow)) {
+		if (inline) {
 			// 库内正文引用 {{domain}}attachments/<key>，mime-build 需要 cid:<contentId>
 			const contentId = stripCidBrackets(attRow.contentId) || stripCidBrackets(attRow.key);
 			html = html.split(`{{domain}}${attRow.key}`).join(`cid:${contentId}`);
@@ -447,8 +516,19 @@ async function buildMimeForRow(c, row, maxAttBytes, budget) {
 	// 成功重建的内嵌图此刻已是 cid: 形态、不受影响
 	html = replaceInlineImagesWithPlaceholder(html, skippedInlineRefs, maxAttBytes);
 
+	// ① 正文 HTML 超 EWS_HTML_MAX_BYTES → 截断 + 末尾提示（占位清单在截断之后追加，不会被截掉）
+	const cut = truncateUtf8Bytes(html, EWS_HTML_MAX_BYTES);
+	if (cut.truncated) html = `${cut.text}（内容过长已截断，请使用网页版查看完整内容）`;
+
+	// ③ 被跳过项统一清单：HTML 正文末尾一份、text/plain 末尾一份。
+	//    清单始终输出：正文为空（纯附件邮件）时清单本身就是正文，否则用户既看不到附件也看不到任何提示。
+	const manifestHtml = skippedAttachmentsHtml(skippedItems);
+	const manifestText = skippedAttachmentsText(skippedItems);
+	if (manifestHtml !== '') html = html !== '' ? html + manifestHtml : manifestHtml;
+	if (manifestText !== '') text = text !== '' ? text + '\n' + manifestText : manifestText;
+
 	const dateMs = toDateMs(row.createTime);
-	return buildMimeBase64({
+	const input = {
 		from: { email: row.sendEmail, name: row.name },
 		to: rowRecipientsForMime(row),
 		// cc/bcc 列是 JSON 字符串（[{address,name}]），必须解析成数组再交给 mime-build
@@ -459,11 +539,39 @@ async function buildMimeForRow(c, row, maxAttBytes, budget) {
 		messageId: row.messageId,
 		inReplyTo: row.inReplyTo,
 		references: row.relation,
-		text: row.text,
+		text,
 		html,
 		inlineImages,
 		attachments
-	});
+	};
+
+	// ④ 构建后自查：MimeContent 解码后的原始 MIME 字节 ≤ EWS_MIME_SAFE_TOTAL × 1.4。
+	//    口径说明：附件/正文在 MIME 内层已 base64 过一次（×4/3），EWS 的 MimeContent 再对整封
+	//    base64 一次；1.4× 覆盖内层膨胀 + boundary/头，外层编码量正比于此、由 ④ 兜底。
+	//    超了继续降级：先砍正文 html（只留占位清单 + text），仍超再砍 text（清单极小，始终保留为正文；
+	//    附件已受账本约束，理论上到不了再砍清单这步）
+	const safeRawBytes = Math.floor(safeTotal * 1.4);
+	let mime = buildMimeBase64(input);
+	if (base64DecodedSize(mime) > safeRawBytes) {
+		console.warn(`[ews] MimeContent raw size exceeds the safe budget (email ${row.emailId}), dropping html body.`);
+		// 砍原 html 正文，但占位清单不能丢：它是被跳过附件在客户端的唯一提示，且只有 <p> 一小段
+		input.html = manifestHtml;
+		if (input.text === '' && manifestText !== '') input.text = manifestText;
+		mime = buildMimeBase64(input);
+	}
+	if (base64DecodedSize(mime) > safeRawBytes) {
+		console.warn(`[ews] MimeContent raw size still exceeds the safe budget after dropping html (email ${row.emailId}), dropping text body.`);
+		input.text = '';
+		// 有清单时视为非空正文，保留为 text/html 单体（mime-build 对 text/html 皆空会输出空 text/plain，清单会被丢）
+		input.html = manifestHtml;
+		mime = buildMimeBase64(input);
+	}
+	if (base64DecodedSize(mime) > safeRawBytes) {
+		// 附件账本 ≤ EWS_MIME_SAFE_TOTAL 时数学上不应到达：真到了就整封走极简降级，绝不输出超大响应
+		console.warn(`[ews] MimeContent raw size exceeds the safe budget even without bodies (email ${row.emailId}); minimal fallback.`);
+		return minimalMimeForRow(row);
+	}
+	return mime;
 }
 
 /** MimeContent 侧的收件人：recipient（JSON）优先，缺失回落 toEmail */

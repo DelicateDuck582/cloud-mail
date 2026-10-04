@@ -33,6 +33,15 @@ export const EWS_MAX_MIME_ITEM_IDS = 20;
 // Free 计划 10ms CPU 下 base64 编解码的保守值，可用 env.EWS_MAX_ATT_BYTES 调整（付费计划可放大）
 export const EWS_DEFAULT_MAX_ATT_BYTES = 1024 * 1024;
 
+// 整个 MimeContent 输出的 CPU 安全预算（base64 编码 ≈8ms + 组装余量）：
+// Free 计划单请求 10ms CPU 红线下的保守值，可用 env.EWS_MIME_SAFE_TOTAL 调整（付费计划可放大）。
+// 超预算的正文/附件在构建时按降级阶梯裁剪（见 handlers.js buildMimeForRow），保证 GetItem 永不 5xx
+export const EWS_MIME_SAFE_TOTAL = 1024 * 1024;
+
+// 重建 MIME 时正文 HTML 的字节上限：超过即截断并追加「请使用网页版查看」提示，
+// 防止超大正文的 base64 编码单独吃掉 CPU 预算
+export const EWS_HTML_MAX_BYTES = 256 * 1024;
+
 // 一次请求原始 XML（含 base64 附件）的上限，防超大 body 打爆 Worker 内存（与 /email/send 的 40MB 对齐）
 export const EWS_MAX_REQUEST_BYTES = 40 * 1024 * 1024;
 
@@ -41,10 +50,16 @@ export function ewsMaxAttBytes(env) {
 	return Number.isFinite(value) && value > 0 ? Math.floor(value) : EWS_DEFAULT_MAX_ATT_BYTES;
 }
 
-// 单封邮件经 EWS 发送/重建时附件 + 内嵌图的解码后总量上限
+export function ewsMimeSafeTotal(env) {
+	const value = Number(env?.EWS_MIME_SAFE_TOTAL);
+	return Number.isFinite(value) && value > 0 ? Math.floor(value) : EWS_MIME_SAFE_TOTAL;
+}
+
+// 单封邮件经 EWS 发送/重建时附件 + 内嵌图的解码后总量上限：
+// 默认对齐 EWS_MIME_SAFE_TOTAL（不再用 2×单附件——那样 base64 后可到 2.7MB，必然超 10ms CPU）
 export function ewsMaxTotalAttBytes(env) {
 	const value = Number(env?.EWS_MAX_TOTAL_ATT_BYTES);
-	return Number.isFinite(value) && value > 0 ? Math.floor(value) : ewsMaxAttBytes(env) * 2;
+	return Number.isFinite(value) && value > 0 ? Math.floor(value) : ewsMimeSafeTotal(env);
 }
 
 // 文件夹：token 即返回给客户端的 FolderId/@Id，客户端回传后按 token 解析
