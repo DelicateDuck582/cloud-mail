@@ -8,7 +8,9 @@ import permService from '../service/perm-service';
 import { t } from '../i18n/i18n'
 import app from '../hono/hono';
 
-const exclude = [
+// 免鉴权路径白名单：精确匹配（path 必须完全相等）
+// 安全：不再用 startsWith 前缀放行，避免 /oauth/bindUser、/public/* 等被前缀误放行
+const exclude = new Set([
 	'/login',
 	'/register',
 	'/oss',
@@ -16,9 +18,17 @@ const exclude = [
 	'/webhooks',
 	'/init',
 	'/public/genToken',
-	'/telegram',
-	'/test',
-	'/oauth'
+	'/oauth/linuxDo/login',
+	'/oauth/github/login',
+	'/oauth/google/login'
+]);
+
+// 免鉴权路径：显式通配（前缀匹配），仅限路由本身带子路径的情况
+//   /oss/*                     —— r2-api 对象存储读写
+//   /telegram/getEmail/<token> —— TG 快捷取信链接（token 自带鉴权）
+const excludePrefixes = [
+	'/oss/',
+	'/telegram/getEmail/'
 ];
 
 const requirePerms = [
@@ -93,11 +103,10 @@ app.use('*', async (c, next) => {
 
 	const path = c.req.path;
 
-	const index = exclude.findIndex(item => {
-		return path.startsWith(item);
-	});
+	// 免鉴权路径：精确匹配 + 显式通配白名单（见文件顶部 exclude / excludePrefixes）
+	const excluded = exclude.has(path) || excludePrefixes.some(prefix => path.startsWith(prefix));
 
-	if (index > -1) {
+	if (excluded) {
 		return await next();
 	}
 

@@ -1,0 +1,14 @@
+{
+  "schemaVersion": "mimosa-hook-status/v1",
+  "recordedAt": "2026-10-04T14:49:55.284Z",
+  "sessionId": "sess_c453bb24-9ed9-4728-b090-1c7ae71c8592",
+  "event": "PostToolUse",
+  "toolName": "Edit",
+  "file": "C:/Users/27088/.zcode/cli/memories/projects/cloud-mail-82ba90840ed06e12/memory/ews-thunderbird-deploy-state.md",
+  "outcome": "clear",
+  "coverage": "complete",
+  "findingCount": 0,
+  "durationMs": 3,
+  "hostState": "hook_complete",
+  "reportHint": ".mimosa/reports/"
+}

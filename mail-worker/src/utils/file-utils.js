@@ -1,8 +1,14 @@
 const fileUtils = {
+	// 扩展名白名单化：只允许 `.` + 1~10 位字母数字，其余一律返回 ''
+	// 该返回值会拼进 COS key，必须阻断 `/`、引号、控制字符、`..` 等注入
 	getExtFileName(filename) {
 		try {
 			const index = filename.lastIndexOf('.');
-			return index !== -1 ? filename.slice(index) : '';
+			if (index === -1) {
+				return '';
+			}
+			const ext = filename.slice(index);
+			return /^\.[A-Za-z0-9]{1,10}$/.test(ext) ? ext : '';
 		} catch (e) {
 			return ''
 		}

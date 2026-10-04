@@ -256,6 +256,9 @@ const emailService = {
 			conditions.push(sql`${email.subject} COLLATE NOCASE LIKE ${subject + '%'}`);
 		}
 
+		// 安全/一致性：正在入库（SAVING）的邮件不对外展示，避免暴露未完成邮件
+		conditions.push(ne(email.status, emailConst.status.SAVING));
+
 		if (withCursor && emailId) {
 			conditions.push(timeSort ? gt(email.emailId, emailId) : lt(email.emailId, emailId));
 		}

@@ -1,0 +1,662 @@
+{
+  "schema_version": "mimosa-task-review/v2",
+  "run_id": "20261004T135727503Z-24932-8c5df1ae820e",
+  "run_status": "inconclusive",
+  "errors": [
+    {
+      "stage": "candidate-select",
+      "target": "src/security/security.js",
+      "reason": "candidate_limit_exceeded: 16 changed reviewable file(s) were not scanned because the limit is 20"
+    }
+  ],
+  "coverage": {
+    "schema_version": "mimosa-hook-coverage/v1",
+    "status": "partial",
+    "scope": "hook_observed_diff",
+    "baseline": {
+      "complete": true,
+      "captured_files": 134,
+      "candidate_limit": 5000,
+      "truncated": false,
+      "enumeration_error_count": 0,
+      "snapshot_error_count": 0,
+      "compensated_target_count": 36
+    },
+    "change_tracking": {
+      "touched_observed": 0,
+      "touched_retained": 0,
+      "truncated": false,
+      "bash_mutation": true,
+      "bash_discovered": 36,
+      "bash_discovery_limit": 80,
+      "bash_discovery_truncated": false
+    },
+    "candidates": {
+      "eligible_files": 36,
+      "selected_files": 20,
+      "limit": 20,
+      "truncated": true
+    },
+    "scanning": {
+      "required_files": 18,
+      "scanned_files": 18,
+      "skipped_files": 0,
+      "failed_files": 0,
+      "project_checks_required": 1,
+      "project_checks_completed": 1
+    },
+    "notification": {
+      "eligible_findings": 0,
+      "detailed_findings": 0,
+      "detail_limit": 3,
+      "truncated": false
+    },
+    "reason_counts": {
+      "candidate_limit_exceeded": 1,
+      "project_check_failed": 1
+    },
+    "reasons": [
+      {
+        "code": "candidate_limit_exceeded",
+        "stage": "candidate-select",
+        "target": "src/security/security.js",
+        "detail": "16 changed reviewable file(s) were not scanned because the limit is 20",
+        "affects_completion": true
+      },
+      {
+        "code": "project_check_failed",
+        "stage": "candidate-select",
+        "target": "src/security/security.js",
+        "detail": "candidate_limit_exceeded: 16 changed reviewable file(s) were not scanned because the limit is 20",
+        "affects_completion": true
+      }
+    ],
+    "reasons_truncated": false
+  },
+  "generated_at": "2026-10-04T13:57:27.503Z",
+  "session_id": "sess_c453bb24-9ed9-4728-b090-1c7ae71c8592",
+  "target": ".",
+  "revision": "04644e801d67fc187399c17a757f517fb8d14eae",
+  "rules_version": "unavailable",
+  "diff_hash": "11e24f7e423f2c1e78b11a1f7766481aa95a8553571213510954b0e25a4c84e9",
+  "diff": {
+    "algorithm": "sha256",
+    "changed_file_count": 20,
+    "changed_files": [
+      {
+        "file": "package.json",
+        "ranges": [
+          {
+            "start": 22,
+            "end": 22
+          }
+        ],
+        "before_hash": "699ab79d0e432926d07a4809e254b32e4750159ccfda151430cf2c4a65299802",
+        "after_hash": "d6d224c942923b12606baad52f85f4ad32fac8ad1e367e279913fbea49f612be"
+      },
+      {
+        "file": "pnpm-lock.yaml",
+        "ranges": [
+          {
+            "start": 27,
+            "end": 28
+          },
+          {
+            "start": 1570,
+            "end": 1571
+          },
+          {
+            "start": 3202,
+            "end": 3202
+          }
+        ],
+        "before_hash": "633104e9f9e036fd2f00cd1151974c8d2a5af57ad09255c510c118a2209b2562",
+        "after_hash": "6268e55fd8587eaeb29361fcaab7509d41f729aa5756accbc2c0a67f0071db07"
+      },
+      {
+        "file": "src/index.js",
+        "ranges": [
+          {
+            "start": 29,
+            "end": 29
+          },
+          {
+            "start": 31,
+            "end": 31
+          },
+          {
+            "start": 46,
+            "end": 46
+          }
+        ],
+        "before_hash": "c9f7c3b7223e1cc0e0fbfa94c8bbb8c04c476b6c8a7bb70275ada130d824aa89",
+        "after_hash": "218b1721396794c8a8a147a2cafa35e68a356e5c73a0ba652ea3052d765350a6"
+      },
+      {
+        "file": "src/service/account-service.js",
+        "ranges": [
+          {
+            "start": 195,
+            "end": 195
+          },
+          {
+            "start": 199,
+            "end": 209
+          }
+        ],
+        "before_hash": "56e8ab90b76ea6a23c164489ff39dea04b534b39dce9ce9deab0976ee107f8cd",
+        "after_hash": "0794173c55e48c9b62ab3268e428afcdf87388fb6fc0ca6f62edff98e9d7ff71"
+      },
+      {
+        "file": "src/service/att-service.js",
+        "ranges": [
+          {
+            "start": 3,
+            "end": 3
+          },
+          {
+            "start": 7,
+            "end": 7
+          },
+          {
+            "start": 19,
+            "end": 20
+          },
+          {
+            "start": 23,
+            "end": 26
+          },
+          {
+            "start": 37,
+            "end": 37
+          },
+          {
+            "start": 40,
+            "end": 40
+          },
+          {
+            "start": 84,
+            "end": 85
+          },
+          {
+            "start": 92,
+            "end": 93
+          },
+          {
+            "start": 96,
+            "end": 97
+          },
+          {
+            "start": 116,
+            "end": 116
+          },
+          {
+            "start": 118,
+            "end": 118
+          },
+          {
+            "start": 160,
+            "end": 160
+          },
+          {
+            "start": 169,
+            "end": 170
+          },
+          {
+            "start": 187,
+            "end": 187
+          },
+          {
+            "start": 189,
+            "end": 189
+          },
+          {
+            "start": 206,
+            "end": 212
+          },
+          {
+            "start": 217,
+            "end": 217
+          },
+          {
+            "start": 219,
+            "end": 219
+          },
+          {
+            "start": 221,
+            "end": 221
+          },
+          {
+            "start": 223,
+            "end": 233
+          },
+          {
+            "start": 235,
+            "end": 235
+          },
+          {
+            "start": 237,
+            "end": 237
+          },
+          {
+            "start": 239,
+            "end": 239
+          },
+          {
+            "start": 241,
+            "end": 241
+          },
+          {
+            "start": 243,
+            "end": 243
+          },
+          {
+            "start": 245,
+            "end": 245
+          },
+          {
+            "start": 269,
+            "end": 269
+          },
+          {
+            "start": 273,
+            "end": 273
+          }
+        ],
+        "before_hash": "63ffa036f96e55908cd5d6b63cd50987bc440a434b0f980cbae75840128068cb",
+        "after_hash": "c21ce7268d8fc97090eb76351a60d73f0acd38170fdb154bb658a2f7fc130740"
+      },
+      {
+        "file": "src/service/email-service.js",
+        "ranges": [
+          {
+            "start": 5,
+            "end": 5
+          },
+          {
+            "start": 15,
+            "end": 15
+          },
+          {
+            "start": 28,
+            "end": 28
+          },
+          {
+            "start": 41,
+            "end": 42
+          },
+          {
+            "start": 54,
+            "end": 54
+          },
+          {
+            "start": 63,
+            "end": 65
+          },
+          {
+            "start": 272,
+            "end": 277
+          },
+          {
+            "start": 282,
+            "end": 282
+          },
+          {
+            "start": 284,
+            "end": 288
+          },
+          {
+            "start": 317,
+            "end": 317
+          },
+          {
+            "start": 697,
+            "end": 698
+          },
+          {
+            "start": 712,
+            "end": 713
+          },
+          {
+            "start": 799,
+            "end": 799
+          },
+          {
+            "start": 861,
+            "end": 862
+          },
+          {
+            "start": 871,
+            "end": 871
+          },
+          {
+            "start": 911,
+            "end": 913
+          },
+          {
+            "start": 924,
+            "end": 924
+          },
+          {
+            "start": 929,
+            "end": 929
+          },
+          {
+            "start": 941,
+            "end": 953
+          },
+          {
+            "start": 1053,
+            "end": 1055
+          },
+          {
+            "start": 1075,
+            "end": 1077
+          },
+          {
+            "start": 1118,
+            "end": 1123
+          },
+          {
+            "start": 1129,
+            "end": 1133
+          },
+          {
+            "start": 1135,
+            "end": 1135
+          },
+          {
+            "start": 1137,
+            "end": 1137
+          },
+          {
+            "start": 1145,
+            "end": 1146
+          },
+          {
+            "start": 1230,
+            "end": 1230
+          }
+        ],
+        "before_hash": "c358321c58cd0e597ef09d9b205ac3e7c12f3326628eacefb2f0273569874d2a",
+        "after_hash": "97ef8e5c92b6abb0f6ab9344c4e580d170a7f83cad55cf0ce69e52c09997f552"
+      },
+      {
+        "file": "src/service/oauth-service.js",
+        "ranges": [
+          {
+            "start": 58,
+            "end": 58
+          },
+          {
+            "start": 258,
+            "end": 258
+          }
+        ],
+        "before_hash": "4f3a57872d518423683ea22774ccd2c89bf699e8420b8f2f08644fde37b85c5a",
+        "after_hash": "1e34ab436f3ae4c3a970535efc24613303de9763e935ccdd5b80812dceaffd94"
+      },
+      {
+        "file": "src/service/r2-service.js",
+        "ranges": [
+          {
+            "start": 12,
+            "end": 13
+          },
+          {
+            "start": 37,
+            "end": 37
+          },
+          {
+            "start": 47,
+            "end": 47
+          },
+          {
+            "start": 54,
+            "end": 54
+          },
+          {
+            "start": 64,
+            "end": 64
+          },
+          {
+            "start": 71,
+            "end": 71
+          }
+        ],
+        "before_hash": "16523562dd7f885111aadb7f906c834d6a1fb93e6ac835b0aba74be9b68e3793",
+        "after_hash": "43b440194cb16de2e2b7308a3520a1fa9441bc3def197829a8834c5ed5e6d164"
+      },
+      {
+        "file": "src/service/reg-key-service.js",
+        "ranges": [
+          {
+            "start": 47,
+            "end": 47
+          }
+        ],
+        "before_hash": "f949bf06e265f6ce8ea7c2b26a105947628b26f09bbec1993964c59e3891243d",
+        "after_hash": "bb9621afd8c949c10bc337edbed41ef4e53cfe75c80ff8e3f563907a04a5a4b4"
+      },
+      {
+        "file": "src/service/resend-service.js",
+        "ranges": [
+          {
+            "start": 43,
+            "end": 43
+          },
+          {
+            "start": 64,
+            "end": 64
+          },
+          {
+            "start": 67,
+            "end": 69
+          },
+          {
+            "start": 78,
+            "end": 79
+          },
+          {
+            "start": 85,
+            "end": 85
+          }
+        ],
+        "before_hash": "4c5ee5122323718bfcbcef4bbdff2f1589f63bfb71a92534227a0acdd13a2bf3",
+        "after_hash": "96ecc495413833614b1328175e7a3be7ba8e9cfe8e13adaf3705024c672446d8"
+      },
+      {
+        "file": "src/service/role-service.js",
+        "ranges": [
+          {
+            "start": 139,
+            "end": 143
+          },
+          {
+            "start": 178,
+            "end": 178
+          },
+          {
+            "start": 184,
+            "end": 184
+          }
+        ],
+        "before_hash": "04f451c0e16cdc49baa73f1216b02797cd9f4362b174b73b558960ed2019fe99",
+        "after_hash": "e622c1df2c1655ba8224a576bc2933434289b2c547d577ebf6bc17477f8274ac"
+      },
+      {
+        "file": "src/service/s3-service.js",
+        "ranges": [
+          {
+            "start": 1,
+            "end": 1
+          }
+        ],
+        "before_hash": "e09f7646c5f894ccdb057b62707a549ff6787079a43c73f86cb084f5f469f32a",
+        "after_hash": "4617a279b0ba76c17822a6d8b8da63f6150225a45d698e4c2c5ea71bd203294e"
+      },
+      {
+        "file": "src/service/setting-service.js",
+        "ranges": [
+          {
+            "start": 71,
+            "end": 71
+          }
+        ],
+        "before_hash": "cb3d42934fcc44d21ef51c1b6c6877e712ab5e8ef17af6b57d655dbf1496e143",
+        "after_hash": "d20c5d5d3e9a2e8d884b07446f6cdd064c16aac3939224b3b27e8aa9d2091f54"
+      },
+      {
+        "file": "src/service/star-service.js",
+        "ranges": [
+          {
+            "start": 83,
+            "end": 83
+          },
+          {
+            "start": 87,
+            "end": 87
+          }
+        ],
+        "before_hash": "9b9ff865c40434d32dab8479d44a177d92ad1c451321e4f5b36498c541d1a661",
+        "after_hash": "500540df4ec9442fa565ace3b2bbd3fd88a420e9c0c37d1c9bd97196b1a73ab4"
+      },
+      {
+        "file": "src/service/turnstile-service.js",
+        "ranges": [
+          {
+            "start": 20,
+            "end": 24
+          }
+        ],
+        "before_hash": "2d3174b2977c1b23fd78385bb1a835e2aa8391da87b0f059b911af32c551b39a",
+        "after_hash": "31f02c6bdf772819b4f92dad99d46ad85a07a1a4cacbfca1cf5bc5520f575846"
+      },
+      {
+        "file": "src/service/user-service.js",
+        "ranges": [
+          {
+            "start": 116,
+            "end": 116
+          },
+          {
+            "start": 374,
+            "end": 374
+          }
+        ],
+        "before_hash": "37a4dd2c8a173b55ea167a199da3d1be407e8b668a392162ef98f7597b4f0161",
+        "after_hash": "0a4bfebe27e0856ea71bd25e6e23df9433dac7a9e01712b7b54205bee455fcbe"
+      },
+      {
+        "file": "src/utils/crypto-utils.js",
+        "ranges": [
+          {
+            "start": 32,
+            "end": 33
+          },
+          {
+            "start": 35,
+            "end": 36
+          }
+        ],
+        "before_hash": "d3807fec79e99ec563edd138c803cad8ff044c2c98f4a1dacf5408f447840551",
+        "after_hash": "a564bb576eace876580d1f017701449676db07e5255783b54bc83b08c5a1245d"
+      },
+      {
+        "file": "src/utils/file-utils.js",
+        "ranges": [
+          {
+            "start": 5,
+            "end": 5
+          }
+        ],
+        "before_hash": "227f4f39ffd2f3f2f8da5b256a360af39938d4c3104ace21b99a2feaa03f4438",
+        "after_hash": "d4f3810e75994ff20a1ca5ae88f34a9f87320f3b700c37439cfcf3ddf9e7e8de"
+      },
+      {
+        "file": "src/utils/html-sanitize.js",
+        "ranges": [
+          {
+            "start": 65,
+            "end": 77
+          },
+          {
+            "start": 81,
+            "end": 82
+          },
+          {
+            "start": 88,
+            "end": 88
+          }
+        ],
+        "before_hash": "d11ebba467dd4df75b6d09509e1cec0d60a94c581dfaf0f094c60a2758e9fc61",
+        "after_hash": "b81ad6676e1167b5848b29bd69dd5b9202fea54fb1f893e8215b2ebb082398e7"
+      },
+      {
+        "file": "src/utils/jwt-utils.js",
+        "ranges": [
+          {
+            "start": 23,
+            "end": 23
+          },
+          {
+            "start": 28,
+            "end": 28
+          }
+        ],
+        "before_hash": "03b4722aea88a9b7cc1113c9fb41d965237d81a249b9c38134924e7ea91020e1",
+        "after_hash": "07791e53916133512f880528e1a9257b2efb4967eee98bd0ae3c999448950516"
+      }
+    ]
+  },
+  "timing": {
+    "started_at": "2026-10-04T13:57:25.331Z",
+    "completed_at": "2026-10-04T13:57:27.503Z",
+    "duration_ms": 2172,
+    "measurement": "hook_wall_clock"
+  },
+  "tokens": {
+    "input": 0,
+    "output": 0,
+    "total": 0,
+    "model_calls": 0,
+    "measurement": "known-zero"
+  },
+  "telemetry": {
+    "schemaVersion": "mimosa-gate-telemetry/v1",
+    "profile": "gate",
+    "operation": "Stop",
+    "outcome": "partial/INCONCLUSIVE",
+    "latencyMs": 2172,
+    "peakMemoryBytes": 154304512,
+    "memoryMeasurement": "max-observed-process-rss",
+    "scannedFiles": 18,
+    "cache": {
+      "hits": 0,
+      "misses": 0,
+      "measurement": "not-applicable"
+    },
+    "denyCount": 0,
+    "tokens": {
+      "input": 0,
+      "output": 0,
+      "total": 0,
+      "modelCalls": 0,
+      "measurement": "known-zero"
+    }
+  },
+  "finding_count": 0,
+  "rewake_finding_count": 0,
+  "evidence_boundary": {
+    "scan": "candidate",
+    "static_fix_verification": "observed_static_only",
+    "runtime_verification": "not_performed"
+  },
+  "finding_events": [],
+  "findings": [],
+  "artifacts": {
+    "immutable_report": ".mimosa/reports/task-review-sess_c453bb24-9ed9-4728-b090-1c7ae71c8592-20261004T135727503Z-24932-8c5df1ae820e.json",
+    "latest_report": ".mimosa/reports/task-review-sess_c453bb24-9ed9-4728-b090-1c7ae71c8592.json",
+    "history_summary": ".mimosa/history/run-20261004T135727503Z-24932-8c5df1ae820e.json"
+  }
+}

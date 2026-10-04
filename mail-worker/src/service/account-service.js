@@ -13,6 +13,17 @@ import roleService from './role-service';
 import { t } from '../i18n/i18n';
 import verifyRecordService from './verify-record-service';
 
+// D1 单条语句最多 100 个绑定参数，inArray 统一按 90 分片，留安全余量
+const SQL_BIND_LIMIT = 90;
+
+const chunkArray = (list, size) => {
+	const chunks = [];
+	for (let i = 0; i < list.length; i += size) {
+		chunks.push(list.slice(i, i + size));
+	}
+	return chunks;
+};
+
 const accountService = {
 
 	async add(c, params, userId) {
@@ -192,21 +203,29 @@ const accountService = {
 
 	async physicsDeleteByUserIds(c, userIds) {
 		await emailService.physicsDeleteUserIds(c, userIds);
-		await orm(c).delete(account).where(inArray(account.userId,userIds)).run();
+		// 入参 userIds 数量不限，按 D1 绑定参数上限分片删除
+		for (const chunk of chunkArray(userIds, SQL_BIND_LIMIT)) {
+			await orm(c).delete(account).where(inArray(account.userId, chunk)).run();
+		}
 	},
 
+	// 统计查询：按 ≤90 分片执行，累积各批结果后合并返回（分片互斥，无重复计数）
 	async selectUserAccountCountList(c, userIds, del = isDel.NORMAL) {
-		const result = await orm(c)
-			.select({
-				userId: account.userId,
-				count: count(account.accountId)
-			})
-			.from(account)
-			.where(and(
-				inArray(account.userId, userIds),
-				eq(account.isDel, del)
-			))
-			.groupBy(account.userId)
+		const result = [];
+		for (const chunk of chunkArray([...new Set(userIds || [])], SQL_BIND_LIMIT)) {
+			const part = await orm(c)
+				.select({
+					userId: account.userId,
+					count: count(account.accountId)
+				})
+				.from(account)
+				.where(and(
+					inArray(account.userId, chunk),
+					eq(account.isDel, del)
+				))
+				.groupBy(account.userId)
+			result.push(...part);
+		}
 		return result;
 	},
 

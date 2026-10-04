@@ -8,6 +8,18 @@ import { emailListColumns, emailBriefColumns } from '../lib/email-list-columns';
 import { isDel } from '../const/entity-const';
 import attService from "./att-service";
 import { t } from '../i18n/i18n'
+
+// D1 单条语句最多 100 个绑定参数，inArray 统一按 90 分片，留安全余量
+const SQL_BIND_LIMIT = 90;
+
+const chunkArray = (list, size) => {
+	const chunks = [];
+	for (let i = 0; i < list.length; i += size) {
+		chunks.push(list.slice(i, i + size));
+	}
+	return chunks;
+};
+
 const starService = {
 
 	async add(c, params, userId) {
@@ -79,12 +91,17 @@ const starService = {
 
 		return { list };
 	},
+	// 数组来自调用方（邮件/用户批量删除），可能超过 D1 绑定参数上限，按 90 分片逐批删除
 	async removeByEmailIds(c, emailIds) {
-		await orm(c).delete(star).where(inArray(star.emailId, emailIds)).run();
+		for (const chunk of chunkArray(emailIds, SQL_BIND_LIMIT)) {
+			await orm(c).delete(star).where(inArray(star.emailId, chunk)).run();
+		}
 	},
 
 	async removeByUserIds(c, userIds) {
-		await orm(c).delete(star).where(inArray(star.userId, userIds)).run();
+		for (const chunk of chunkArray(userIds, SQL_BIND_LIMIT)) {
+			await orm(c).delete(star).where(inArray(star.userId, chunk)).run();
+		}
 	}
 };
 

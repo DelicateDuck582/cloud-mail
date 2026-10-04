@@ -61,31 +61,53 @@ const SAFE_ATTRS = {
 // 需要校验 URL 协议的属性
 const URL_ATTRS = new Set(['href', 'src', 'poster', 'cite', 'longdesc', 'usemap']);
 
-export function isSafeUrl(value) {
-	const url = String(value || '').trim();
-	if (!url) return true;
+// URL 解析基址：仅用于把相对路径解析成绝对 URL，不产生任何网络请求
+const URL_BASE = 'https://example.invalid/';
 
-	// 带协议时仅允许白名单协议
-	if (/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(url)) {
-		const scheme = url.split(':')[0].toLowerCase();
-		if (scheme === 'http' || scheme === 'https' || scheme === 'mailto' || scheme === 'tel' || scheme === 'cid') {
-			return true;
-		}
-		if (scheme === 'data') {
-			// 仅允许图片 data URL（svg 可携带脚本，排除）
-			return /^data:image\/(png|jpe?g|gif|webp|bmp|avif)(;|,)/i.test(url);
-		}
+// 允许的协议（含冒号）
+const SAFE_SCHEMES = new Set(['http:', 'https:', 'mailto:', 'tel:', 'cid:']);
+
+// 仅允许图片 data URL（svg 可携带脚本，排除）
+const SAFE_DATA_URL = /^data:image\/(png|jpe?g|gif|webp|bmp|avif)(;|,)/i;
+
+export function isSafeUrl(value) {
+	// 安全：浏览器解析 URL 前会移除 TAB/LF/CR 等控制字符与空白，
+	// 例如 "java\tscript:alert(1)" 实际会被解析为 "javascript:"。
+	// 因此先按同等规则剥离 \u0000-\u0020 与 \u007f 控制字符，再交给 URL 解析做协议判定，
+	// 避免空白/控制字符混淆绕过（旧实现的正则 ^[a-zA-Z][a-zA-Z0-9+.-]*: 会被此类输入骗过）
+	const norm = String(value == null ? '' : value).replace(/[\u0000-\u0020\u007f]+/g, '').trim();
+	if (!norm) return true;
+
+	let parsed;
+	try {
+		parsed = new URL(norm, URL_BASE);
+	} catch (e) {
+		// 解析失败（畸形 URL）一律视为不安全
 		return false;
 	}
 
-	// 相对路径 / {{domain}}xxx / attachments/xxx / //cdn.com 均放行
-	return true;
+	const protocol = parsed.protocol.toLowerCase();
+
+	// 相对路径 / {{domain}}xxx / attachments/xxx / //cdn.com 经基址解析后为 http(s)
+	if (SAFE_SCHEMES.has(protocol)) {
+		return true;
+	}
+
+	if (protocol === 'data:') {
+		return SAFE_DATA_URL.test(norm);
+	}
+
+	// 其余协议（javascript:、vbscript:、blob: 等）与无法识别的形式一律拒绝
+	return false;
 }
 
 function isSafeSrcset(value) {
 	const candidates = String(value || '').split(',');
 	for (const cand of candidates) {
-		const url = cand.trim().split(/\s+/)[0];
+		// 浏览器按空白把候选拆成「URL + 描述符」且会剥离控制字符，
+		// 这里先剥控制字符再取第一个空白分隔片段，与新 isSafeUrl 的判定保持一致
+		const cleaned = cand.replace(/[\u0000-\u001f\u007f]/g, '');
+		const url = cleaned.trim().split(/\s+/)[0];
 		if (url && !isSafeUrl(url)) {
 			return false;
 		}
@@ -96,6 +118,10 @@ function isSafeSrcset(value) {
 export function sanitizeCss(css) {
 	if (!css) return '';
 	let out = String(css);
+
+	// 安全：CSS 转义（反斜杠）可改写关键字字面量（如 url(\6a avascript:...)）绕过下方黑名单，
+	// 现代浏览器已不据此执行脚本，仍按纵深防御一律清空
+	if (/\\/.test(out)) return '';
 
 	// 绝对禁止的危险关键字
 	if (/expression\s*\(|javascript\s*:|vbscript\s*:|-moz-binding|behavior\s*:|@import|@charset|@namespace/i.test(out)) {
@@ -189,6 +215,14 @@ export function sanitizeDocument(document) {
 				}
 				continue;
 			}
+		}
+
+		// 安全：新窗口打开的链接补 rel="noopener noreferrer"，防反向 Tab 劫持
+		if (tag === 'a' && (el.getAttribute('target') || '').toLowerCase() === '_blank') {
+			const rel = (el.getAttribute('rel') || '').split(/\s+/).filter(Boolean);
+			if (!rel.includes('noopener')) rel.push('noopener');
+			if (!rel.includes('noreferrer')) rel.push('noreferrer');
+			el.setAttribute('rel', rel.join(' '));
 		}
 	}
 }

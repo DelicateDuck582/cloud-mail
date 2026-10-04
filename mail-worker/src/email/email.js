@@ -44,7 +44,16 @@ export async function email(message, env, ctx) {
 		}
 
 		const MAX_RAW_SIZE = 25 * 1024 * 1024; // 入站邮件原始大小上限 25MB，防超大邮件耗尽 Worker 内存
+
+		// 读流之前先按 rawSize 预检（存在该属性时），超限直接拒收
+		if (typeof message.rawSize === 'number' && message.rawSize > MAX_RAW_SIZE) {
+			message.setReject('Message too large');
+			return;
+		}
+
 		const reader = message.raw.getReader();
+		// 单例 decoder：跨 chunk 保持状态，避免多字节字符（UTF-8 汉字/emoji）被 chunk 边界截断损坏
+		const decoder = new TextDecoder();
 		let content = '';
 		let rawSize = 0;
 
@@ -56,8 +65,11 @@ export async function email(message, env, ctx) {
 				message.setReject('Message too large');
 				return;
 			}
-			content += new TextDecoder().decode(value);
+			content += decoder.decode(value, { stream: true });
 		}
+
+		// flush 尾部残留字节
+		content += decoder.decode();
 
 		const email = await PostalMime.parse(content);
 

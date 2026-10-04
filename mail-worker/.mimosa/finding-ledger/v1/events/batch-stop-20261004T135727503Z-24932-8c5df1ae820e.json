@@ -1,0 +1,146 @@
+{
+  "schemaVersion": "mimosa-finding-ledger-batch/v1",
+  "batchId": "stop-20261004T135727503Z-24932-8c5df1ae820e",
+  "runId": "20261004T135727503Z-24932-8c5df1ae820e",
+  "runStatus": "inconclusive",
+  "coverage": {
+    "status": "partial",
+    "reasons": [
+      {
+        "code": "candidate_limit_exceeded",
+        "stage": "candidate-select",
+        "target": "src/security/security.js",
+        "detail": "16 changed reviewable file(s) were not scanned because the limit is 20",
+        "affectsCompletion": true
+      },
+      {
+        "code": "project_check_failed",
+        "stage": "candidate-select",
+        "target": "src/security/security.js",
+        "detail": "candidate_limit_exceeded: 16 changed reviewable file(s) were not scanned because the limit is 20",
+        "affectsCompletion": true
+      }
+    ]
+  },
+  "source": {
+    "component": "zcode-hook",
+    "operationId": "Stop"
+  },
+  "revision": "04644e801d67fc187399c17a757f517fb8d14eae",
+  "diffHash": "11e24f7e423f2c1e78b11a1f7766481aa95a8553571213510954b0e25a4c84e9",
+  "rulesVersion": "unavailable",
+  "sessionHash": "b40912850f3c8133dbb00bf6cc6cc01fc6698e93d43760d4f298726426e97d8d",
+  "reportRef": ".mimosa/reports/task-review-sess_c453bb24-9ed9-4728-b090-1c7ae71c8592-20261004T135727503Z-24932-8c5df1ae820e.json",
+  "events": [],
+  "observedFindingIds": [
+    "mimosa-6b90bdc6d753bf2761227cdf",
+    "mimosa-de0aad10917e431491c4bc5e",
+    "mimosa-bfecb12ae18abfc7912dd301",
+    "mimosa-a228f8e22864a9fa8bff3509",
+    "mimosa-07c23d32b5a6b051ea6973b4",
+    "mimosa-35f3315c67087fd4a18b240d",
+    "mimosa-28d3186c80ab9c7c9530b70d",
+    "mimosa-c4ad50cd279a23a5a56b19c7",
+    "mimosa-fd944ef73f60d57034192315",
+    "mimosa-3ef295c7956d8bc873f279a9",
+    "mimosa-327aced49fb2e19daa371273",
+    "mimosa-5cebe9da9b2cf1319f53b447",
+    "mimosa-50d347fe0b8b76e6e9136c05",
+    "mimosa-889121d9d2acf005795aed52",
+    "mimosa-4b3cef1dd321066f17c22f12",
+    "mimosa-e1848fd091c36dba17a317a9"
+  ],
+  "verifiedFiles": [
+    {
+      "file": "src/index.js",
+      "direct": "complete",
+      "projectContext": "partial"
+    },
+    {
+      "file": "src/utils/crypto-utils.js",
+      "direct": "complete",
+      "projectContext": "partial"
+    },
+    {
+      "file": "src/utils/file-utils.js",
+      "direct": "complete",
+      "projectContext": "partial"
+    },
+    {
+      "file": "src/utils/html-sanitize.js",
+      "direct": "complete",
+      "projectContext": "partial"
+    },
+    {
+      "file": "src/utils/jwt-utils.js",
+      "direct": "complete",
+      "projectContext": "partial"
+    },
+    {
+      "file": "src/service/account-service.js",
+      "direct": "complete",
+      "projectContext": "partial"
+    },
+    {
+      "file": "src/service/att-service.js",
+      "direct": "complete",
+      "projectContext": "partial"
+    },
+    {
+      "file": "src/service/email-service.js",
+      "direct": "complete",
+      "projectContext": "partial"
+    },
+    {
+      "file": "src/service/oauth-service.js",
+      "direct": "complete",
+      "projectContext": "partial"
+    },
+    {
+      "file": "src/service/r2-service.js",
+      "direct": "complete",
+      "projectContext": "partial"
+    },
+    {
+      "file": "src/service/reg-key-service.js",
+      "direct": "complete",
+      "projectContext": "partial"
+    },
+    {
+      "file": "src/service/resend-service.js",
+      "direct": "complete",
+      "projectContext": "partial"
+    },
+    {
+      "file": "src/service/role-service.js",
+      "direct": "complete",
+      "projectContext": "partial"
+    },
+    {
+      "file": "src/service/s3-service.js",
+      "direct": "complete",
+      "projectContext": "partial"
+    },
+    {
+      "file": "src/service/setting-service.js",
+      "direct": "complete",
+      "projectContext": "partial"
+    },
+    {
+      "file": "src/service/star-service.js",
+      "direct": "complete",
+      "projectContext": "partial"
+    },
+    {
+      "file": "src/service/turnstile-service.js",
+      "direct": "complete",
+      "projectContext": "partial"
+    },
+    {
+      "file": "src/service/user-service.js",
+      "direct": "complete",
+      "projectContext": "partial"
+    }
+  ],
+  "recordedAt": "2026-10-04T13:57:27.858Z"
+}

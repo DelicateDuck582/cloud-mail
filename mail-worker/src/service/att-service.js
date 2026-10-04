@@ -10,22 +10,86 @@ import { v4 as uuidv4 } from 'uuid';
 import domainUtils from '../utils/domain-uitls';
 import settingService from "./setting-service";
 
+const MIME_OCTET_STREAM = 'application/octet-stream';
+// 允许内联展示的 MIME 白名单：image/svg+xml、text/html 等可执行内容永不入内
+const MIME_WHITELIST = new Set([
+	'image/png', 'image/jpeg', 'image/gif', 'image/webp', 'image/avif', 'image/bmp',
+	'application/pdf', 'text/plain'
+]);
+// 子类型的合法性（阻断 CRLF / 路径字符等注入到对象元数据与响应头）
+const MIME_SUBTYPE_RE = /^[a-z0-9][a-z0-9.+-]{0,30}$/;
+
+// MIME 归一：白名单之外（含 image/svg+xml、text/html）统一落 application/octet-stream
+function normalizeMimeType(rawMime) {
+	const mime = String(rawMime ?? '').split(';')[0].trim().toLowerCase();
+	if (!mime) {
+		return MIME_OCTET_STREAM;
+	}
+	if (mime === 'image/svg+xml' || mime === 'text/html' || mime === 'application/xhtml+xml') {
+		return MIME_OCTET_STREAM;
+	}
+	const [type, subtype] = mime.split('/');
+	if (!type || !subtype || !MIME_SUBTYPE_RE.test(subtype)) {
+		return MIME_OCTET_STREAM;
+	}
+	if (type === 'video' || type === 'audio') {
+		return mime;
+	}
+	return MIME_WHITELIST.has(mime) ? mime : MIME_OCTET_STREAM;
+}
+
+// 文件名清洗：剥离控制字符（CR/LF 等）与引号 / 反斜杠，防响应头注入
+function sanitizeFilename(rawFilename) {
+	const name = String(rawFilename ?? '')
+		.replace(/[\r\n\t\x00-\x1f\x7f]/g, '')
+		.replace(/["\\]/g, '_')
+		.trim()
+		.slice(0, 200);
+	return name || 'file';
+}
+
+// 构造 Content-Disposition：双引号包裹 + ASCII fallback + RFC 5987 filename*，防头注入
+function buildContentDisposition(kind, rawFilename) {
+	const filename = sanitizeFilename(rawFilename);
+	const asciiFallback = filename.replace(/[^\x20-\x7e]/g, '_').replace(/["\\]/g, '_') || 'file';
+	const encoded = encodeURIComponent(filename).replace(/['()*]/g, ch => '%' + ch.charCodeAt(0).toString(16).toUpperCase());
+	return `${kind === 'inline' ? 'inline' : 'attachment'}; filename="${asciiFallback}"; filename*=UTF-8''${encoded}`;
+}
+
+// 附件元数据统一归一（入库 / 入 COS 共用）：MIME 白名单化 + 文件名清洗 + disposition 清洗
+// inline 仅在 MIME 归一后属于白名单时才允许，其余一律强制 attachment
+function normalizeAttMetadata(rawMime, rawFilename, inline) {
+	const contentType = normalizeMimeType(rawMime);
+	const filename = sanitizeFilename(rawFilename);
+	const allowInline = !!inline && contentType !== MIME_OCTET_STREAM;
+	return {
+		contentType,
+		filename,
+		contentDisposition: buildContentDisposition(allowInline ? 'inline' : 'attachment', filename)
+	};
+}
+
 const attService = {
 
 	async addAtt(c, attachments) {
 
 		for (let attachment of attachments) {
 
-			let metadate = {
-				contentType: attachment.mimeType,
+			// 入库 / 入 COS 前统一归一：MIME 白名单（SVG/HTML 强制 octet-stream）+ disposition 清洗
+			const meta = normalizeAttMetadata(attachment.mimeType, attachment.filename, !!attachment.contentId);
+
+			const metadate = {
+				contentType: meta.contentType,
+				contentDisposition: meta.contentDisposition
 			}
 
-			if (!attachment.contentId) {
-				metadate.contentDisposition = `attachment;filename=${attachment.filename}`
-			} else {
-				metadate.contentDisposition = `inline;filename=${attachment.filename}`
+			if (attachment.contentId) {
 				metadate.cacheControl = `max-age=259200`
 			}
+
+			// 数据库元数据与 COS 对象元数据保持一致（归一后的 MIME / 清洗后的文件名）
+			attachment.mimeType = meta.contentType;
+			attachment.filename = meta.filename;
 
 			await r2Service.putObj(c, attachment.key, attachment.content, metadate);
 
@@ -151,13 +215,17 @@ const attService = {
 		const attDataList = [];
 
 		for (let att of attList) {
+			// 用户可控的 MIME / 文件名：先归一再做 key 与入库，非白名单类型强制 octet-stream + attachment
+			const meta = normalizeAttMetadata(att.type, att.filename, false);
+			att.mimeType = meta.contentType;
+			att.filename = meta.filename;
 			att.buff = fileUtils.base64ToUint8Array(att.content);
 			att.key = constant.ATTACHMENT_PREFIX + await fileUtils.getBuffHash(att.buff) + fileUtils.getExtFileName(att.filename);
 			const attData = { userId, accountId, emailId };
 			attData.key = att.key;
 			attData.size = att.buff.length;
 			attData.filename = att.filename;
-			attData.mimeType = att.type;
+			attData.mimeType = meta.contentType;
 			attData.type = attConst.type.ATT;
 			attDataList.push(attData);
 		}
@@ -166,8 +234,8 @@ const attService = {
 
 		for (let att of attList) {
 			await r2Service.putObj(c, att.key, att.buff, {
-				contentType: att.type,
-				contentDisposition: `attachment;filename=${att.filename}`
+				contentType: att.mimeType,
+				contentDisposition: buildContentDisposition('attachment', att.filename)
 			});
 		}
 
@@ -183,10 +251,14 @@ const attService = {
 			if (!attData.buff) {
 				continue;
 			}
+			// 内嵌图同样归一：只有白名单类型允许 inline，其余强制 octet-stream + attachment
+			const meta = normalizeAttMetadata(attData.mimeType, attData.filename, true);
+			attData.mimeType = meta.contentType;
+			attData.filename = meta.filename;
 			await r2Service.putObj(c, attData.key, attData.buff, {
-				contentType: attData.mimeType,
+				contentType: meta.contentType,
 				cacheControl: `max-age=259200`,
-				contentDisposition: `inline;filename=${attData.filename}`
+				contentDisposition: meta.contentDisposition
 			});
 			delete attData.buff;
 		}
